@@ -173,6 +173,14 @@ pub(super) fn color_plane(desc: &D3D12_RESOURCE_DESC) -> Result<Plane> {
         let volume = Desc { dimension: 3, alignment: 0, ..layout };
         return Plane::compute_4k_volume(&volume).map_err(|status| HRESULT(status).into());
     }
+    if matches!(desc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        && desc.Layout.0 == 0x10a && matches!(desc.Alignment, 0 | 65536) && desc.Flags.0 & !0x300004 == 0 {
+        // 64 KiB display swizzle (mode 10) with a mip chain, as XG lays it out
+        // for 2D arrays. A volume is laid out as a full-depth array, which
+        // over-allocates its lower mips but never under-allocates.
+        let tiled = Desc { dimension: 3, alignment: 0, flags: 0, ..layout };
+        return Plane::compute_sparse_64k(&tiled).map_err(|status| HRESULT(status).into());
+    }
     Plane::compute(&layout).or_else(|_| Plane::compute_64k_color(&layout)).map_err(|status| HRESULT(status).into())
 }
 
