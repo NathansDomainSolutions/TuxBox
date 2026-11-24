@@ -626,7 +626,7 @@ unsafe extern "system" fn create_resource<const EXTENDED: bool>(
     if primary.is_some()
         && (flags != D3D12_HEAP_FLAG_NONE
             || heap.Type != D3D12_HEAP_TYPE_DEFAULT
-            || initial.contains(D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+            || (format::is_depth(desc) && initial.contains(D3D12_RESOURCE_STATE_UNORDERED_ACCESS)))
     {
         return E_NOTIMPL;
     }

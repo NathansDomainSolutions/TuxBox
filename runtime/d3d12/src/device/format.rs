@@ -59,8 +59,11 @@ pub(crate) fn is_depth(guest: &D3D12_RESOURCE_DESC) -> bool {
 /// Host description for a guest image in a substitute format family.
 pub(super) fn substitute(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DESC> {
     let flags = desc.Flags.0 & HOST_FLAGS;
+    // A committed console-tiled (0x101) shared-exponent image is created with
+    // a host-chosen layout, so the substitute applies to it as well.
     let image = matches!(desc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-        && desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        && (desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
+            || (desc.Layout.0 == 0x101 && desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP));
     let (format, flags) = match desc.Format {
         // Typeless storage lets the depth, stencil and SRV plane views share it.
         // Desktop depth images cannot also allow unordered access.
@@ -85,7 +88,9 @@ pub(super) fn substitute(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DE
         }
         _ => return None,
     };
-    image.then_some(D3D12_RESOURCE_DESC { Format: format, Flags: D3D12_RESOURCE_FLAGS(flags), ..*desc })
+    image.then_some(D3D12_RESOURCE_DESC {
+        Format: format, Flags: D3D12_RESOURCE_FLAGS(flags), Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN, ..*desc
+    })
 }
 
 /// Host format for a guest-placed (console-layout) colour image whose format
