@@ -96,6 +96,9 @@ pub struct ShaderExtract {
     pub gs_info: Option<psv::GsInfo>,
     pub mesh_info: Option<psv::MeshInfo>,
     pub root_sig: Option<rootsig::RootSig>,
+    /// Static samplers of the pipeline root signature that the runtime attaches
+    /// (as a `TBSS` chunk holding RTS0 bytes) to a root-less program.
+    pub pipeline_samplers: Vec<[u32; 13]>,
 }
 
 struct NativeProgram {
@@ -251,5 +254,9 @@ pub fn extract(bytes: &[u8]) -> Result<ShaderExtract, String> {
         mesh_info: validation.and_then(psv::parse_mesh_info),
         has_root_sig: root.is_some(),
         root_sig: root.map(rootsig::parse_rts0).transpose()?,
+        pipeline_samplers: match (root, part(b"TBSS")) {
+            (None, Some(pipeline)) => rootsig::parse_rts0(pipeline)?.static_samplers,
+            _ => Vec::new(),
+        },
     })
 }

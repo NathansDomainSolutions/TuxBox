@@ -485,6 +485,14 @@ fn stage_program(bytes: &[u8], stage: u32) -> Option<(Vec<u8>, Vec<[u32; 4]>)> {
     Some((program, resources))
 }
 
+/// Sampler bindings (resource type 1) a program's PSV0 declares.
+pub fn psv_samplers(shader: &[u8]) -> Option<usize> {
+    let container = crate::Dxbc::parse(shader).ok()?;
+    let psv = container.chunk(b"PSV0")?;
+    let rows = psv_resources(shader.get(psv.offset..psv.offset + psv.size)?)?;
+    Some(rows.iter().filter(|row| row[0] == 1).count())
+}
+
 fn psv_resources(psv: &[u8]) -> Option<Vec<[u32; 4]>> {
     let table = psv.get(4 + word(psv, 0)? as usize..)?;
     let count = word(table, 0)? as usize;

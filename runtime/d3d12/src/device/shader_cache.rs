@@ -260,10 +260,25 @@ pub(super) fn raster_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     with_root(shader, root)
 }
 
+/// A root-less raster stage that the pipeline runs under the guest root
+/// unchanged: attach that root's static samplers (RTS0 bytes, tag `TBSS`) so
+/// the translator can resolve inline sampler words. The request key changes.
+pub(super) fn raster_with_samplers(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
+    let (Stage::Pixel | Stage::Vertex, ShaderCode::Xbox) = shader_code(shader)? else { return None };
+    // One declared sampler is already bound without the root; keep its key.
+    if tuxbox_dxbc::compute_table::psv_samplers(shader)? < 2 { return None; }
+    if tuxbox_dxbc::rootsig::parse_rts0(root).ok()?.static_samplers.is_empty() { return None; }
+    with_chunk(shader, b"TBSS", root)
+}
+
 fn with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
+    with_chunk(shader, b"RTS0", root)
+}
+
+fn with_chunk(shader: &[u8], tag: &[u8; 4], root: &[u8]) -> Option<Vec<u8>> {
     use tuxbox_dxbc::Dxbc;
     let dxbc = Dxbc::parse(shader).ok()?;
-    if dxbc.chunk(b"RTS0").is_some() || root.is_empty() { return None; }
+    if dxbc.chunk(b"RTS0").is_some() || dxbc.chunk(tag).is_some() || root.is_empty() { return None; }
     let count = dxbc.chunks.len();
     let end = 32 + count * 4;
     let root_offset = (shader.len() + 4).next_multiple_of(4);
@@ -280,7 +295,7 @@ fn with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     input.extend_from_slice(&(root_offset as u32).to_le_bytes());
     input.extend_from_slice(&shader[end..]);
     input.resize(root_offset, 0);
-    input.extend_from_slice(b"RTS0");
+    input.extend_from_slice(tag);
     input.extend_from_slice(&(root.len() as u32).to_le_bytes());
     input.extend_from_slice(root);
     Some(input)

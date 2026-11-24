@@ -1489,6 +1489,7 @@ pub fn translate_valu_probe(words: &[u32], nvgprs: u32) -> Result<String, String
         mesh_info: None,
         primitive_sig: vec![],
         root_sig: None,
+        pipeline_samplers: Vec::new(),
     };
     let insns = disassemble(&ex.isa);
     let mut em = Emitter::new(&ex, insns.clone());
@@ -1588,6 +1589,7 @@ pub fn translate_mem_probe(words: &[u32], nvgprs: u32) -> Result<(String, MemPro
         primitive_sig: vec![],
         // Root parameters 0, 1, 2 arrive in s4, s5, s6 (compute user-data base 4).
         root_sig: Some(RootSig { version: 1, flags: 0, params: vec![table(0), table(3), table(1)], num_static_samplers: 0, static_samplers: vec![] }),
+        pipeline_samplers: Vec::new(),
     };
     let insns = disassemble(&ex.isa);
     let mut em = Emitter::new(&ex, insns.clone());
