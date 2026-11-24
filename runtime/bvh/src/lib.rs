@@ -30,6 +30,14 @@ unsafe fn slot(object: Object, index: usize) -> *const c_void {
     unsafe { *(*object.cast::<*const *const c_void>()).add(index) }
 }
 
+// Device11 graphics lists insert two methods at 68, moving every later slot by
+// two. Both layouts expose CopyTextureRegionX twice (base 83 and 85), so the
+// pair's position identifies the layout without depending on d3d12_xs exports.
+unsafe fn list_slot(list: Object, base: usize) -> *const c_void {
+    let shifted = unsafe { slot(list, 85) == slot(list, 87) && slot(list, 83) != slot(list, 85) };
+    unsafe { slot(list, if shifted { base + 2 } else { base }) }
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "system" fn tuxbox_bvh_construct(
     this: *mut Builder,
@@ -88,7 +96,7 @@ unsafe extern "system" fn tuxbox_bvh_build(
     post: *const Post,
 ) {
     let record: unsafe extern "system" fn(Object, *const Build, u32, *const Post) =
-        unsafe { core::mem::transmute(slot(list, 117)) };
+        unsafe { core::mem::transmute(list_slot(list, 117)) };
     unsafe { record(list, desc, count, post) };
 }
 
@@ -128,7 +136,7 @@ unsafe extern "system" fn tuxbox_bvh_copy(
         u64,
         u64,
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
-    ) = unsafe { core::mem::transmute(slot(list, 119)) };
+    ) = unsafe { core::mem::transmute(list_slot(list, 119)) };
     unsafe { record(list, dst, src, mode) };
 }
 

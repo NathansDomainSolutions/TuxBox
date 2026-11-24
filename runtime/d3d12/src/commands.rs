@@ -1104,15 +1104,6 @@ unsafe extern "system" fn unknown_61(_list: &List, a: usize, b: u32, c: usize, d
     }
 }
 
-// LOCAL: Xbox list slot 129 (title 0x14555e799 tail call) takes (n, 1, 1)
-// like a dispatch. Not identified as compute or mesh yet; log and skip.
-unsafe extern "system" fn unknown_129(_list: &List, x: u32, y: u32, z: u32) {
-    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        crate::diagnostics::log_once(&std::sync::Once::new(), || format!("list slot 129 skipped: ({x}, {y}, {z})"));
-    }
-}
-
 // LOCAL: Xbox list slot 101 is a (kind, enable) state toggle with 25 title
 // call sites (e.g. 0x50a6651 sets (2, 1), 0x50a666a clears (2, 0)). Unknown
 // state; log the kinds seen and ignore.
@@ -1240,8 +1231,6 @@ static LIST_SLOTS: Slots<149> = {
     slots[121] = crate::slot!(ray_dispatch::dispatch);
     slots[126] = crate::slot!(graphics::shading_rate);
     slots[127] = crate::slot!(graphics::dispatch_mesh);
-    slots[101] = crate::slot!(toggle_101);
-    slots[129] = crate::slot!(unknown_129);
     slots[131] = crate::slot!(build_raytracing::batch);
     slots[139] = crate::slot!(reset_extended);
     slots[146] = crate::slot!(enhanced::barrier);
@@ -1255,10 +1244,32 @@ unsafe extern "system" fn reset_extended(list: &List, allocator: *mut c_void, in
 
 // Device11 titles use the new raster-state slots even when requesting the
 // base graphics-list IID. The List6-only cache barriers remain separate.
+// The Device11 graphics list inserts two methods at 68, so every base slot
+// from 68 up moves by two (depth bounds 68 -> 70, copy_resource 84 -> 86,
+// dispatch_mesh 127 -> 129, enhanced barrier 146 -> 148). Unmapped slots keep
+// stubs that report their own Device11 number.
+// Keep in step with the LIST_SLOTS entries at 68 and above.
+const BASE_HIGH_SLOTS: [usize; 18] = [
+    68, 71, 72, 74, 83, 84, 85, 96, 117, 118, 119, 120, 121, 126, 127, 131, 139, 146,
+];
 static DEVICE11_LIST_SLOTS: Slots<149> = {
-    let mut slots = LIST_SLOTS;
+    let mut slots = child_slots::<ID3D12GraphicsCommandList, ListData, 149>();
+    let mut i = 0;
+    while i < 68 {
+        slots[i] = LIST_SLOTS[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < BASE_HIGH_SLOTS.len() {
+        let base = BASE_HIGH_SLOTS[j];
+        if base + 2 < 149 {
+            slots[base + 2] = LIST_SLOTS[base];
+        }
+        j += 1;
+    }
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
+    slots[101] = crate::slot!(toggle_101);
     slots[142] = crate::slot!(graphics::sample_mask);
     slots
 };
