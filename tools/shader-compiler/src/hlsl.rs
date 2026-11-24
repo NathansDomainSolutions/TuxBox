@@ -2790,6 +2790,20 @@ impl<'a> Emitter<'a> {
                 // `v_readfirstlane sBase, v` and `s_load [sBase]` is a constant-table lookup
                 // with a run-time index (ColorDeficiencyMain, cc45bda725a0f774). VGPRs are
                 // tracked under keys 2000+ for exactly this.
+                // A copy of, or a per-lane select between, heap byte offsets is still one.
+                Enc::Vop1 | Enc::Vop2 | Enc::Vop3
+                    if self.compute_heap
+                        && matches!(ins.mnemonic.as_str(), "v_mov_b32" | "v_cndmask_b32")
+                        && matches!(ins.dst.first(), Some(Opnd::Vgpr(_)))
+                        && {
+                            let n = if ins.mnemonic == "v_mov_b32" { 1 } else { 2 };
+                            ins.src.len() >= n && ins.src[..n].iter().all(|o| matches!(o, Opnd::Vgpr(v) if sym.get(&(2000 + *v as u16)) == Some(&Sym::HeapOffset)))
+                        } =>
+                {
+                    if let Some(Opnd::Vgpr(v)) = ins.dst.first() {
+                        sym.insert(2000 + *v as u16, Sym::HeapOffset);
+                    }
+                }
                 Enc::Vop2 | Enc::Vop3
                     if self.compute_heap && ins.mnemonic == "v_lshlrev_b32" && ins.src.first() == Some(&Opnd::ConstInt(5)) =>
                 {
@@ -2872,7 +2886,12 @@ impl<'a> Emitter<'a> {
                     };
                     if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
                         let soff = (ins.raw[1] >> 25) as u16;
-                        if self.resource_heap_base == Some(table) && matches!(n, 4 | 8) && ins.aux.imm == 0 && sym.get(&soff) == Some(&Sym::HeapOffset) {
+                        // In compute the heap pointer itself is verified (the one FSSM class-5
+                        // user record), so any descriptor-sized load from it at a run-time
+                        // SOFFSET is a heap fetch, however the byte offset was computed.
+                        let heap_offset = sym.get(&soff) == Some(&Sym::HeapOffset)
+                            || (self.compute_heap && soff < 106 && written.contains(&soff));
+                        if self.resource_heap_base == Some(table) && matches!(n, 4 | 8) && ins.aux.imm == 0 && heap_offset {
                             for k in 0..n as u16 {
                                 sym.remove(&(d + k));
                                 written.insert(d + k);
