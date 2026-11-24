@@ -1244,33 +1244,20 @@ unsafe extern "system" fn reset_extended(list: &List, allocator: *mut c_void, in
 
 // Device11 titles use the new raster-state slots even when requesting the
 // base graphics-list IID. The List6-only cache barriers remain separate.
-// The Device11 graphics list inserts two methods at 68, so every base slot
-// from 68 up moves by two (depth bounds 68 -> 70, copy_resource 84 -> 86,
-// dispatch_mesh 127 -> 129, enhanced barrier 146 -> 148). Unmapped slots keep
-// stubs that report their own Device11 number.
-// Keep in step with the LIST_SLOTS entries at 68 and above.
-const BASE_HIGH_SLOTS: [usize; 18] = [
-    68, 71, 72, 74, 83, 84, 85, 96, 117, 118, 119, 120, 121, 126, 127, 131, 139, 146,
-];
+// Device11 titles use the new raster-state slots even when requesting the
+// base graphics-list IID. The List6-only cache barriers remain separate.
+// GTA VI (Device11) also calls copy_resource at 86, dispatch_mesh at 129 and
+// the enhanced barrier at 148 (two above their base slots), while reset at 139
+// stays in place, so only the observed slots are added.
 static DEVICE11_LIST_SLOTS: Slots<149> = {
-    let mut slots = child_slots::<ID3D12GraphicsCommandList, ListData, 149>();
-    let mut i = 0;
-    while i < 68 {
-        slots[i] = LIST_SLOTS[i];
-        i += 1;
-    }
-    let mut j = 0;
-    while j < BASE_HIGH_SLOTS.len() {
-        let base = BASE_HIGH_SLOTS[j];
-        if base + 2 < 149 {
-            slots[base + 2] = LIST_SLOTS[base];
-        }
-        j += 1;
-    }
+    let mut slots = LIST_SLOTS;
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
+    slots[86] = crate::slot!(copy_resource);
     slots[101] = crate::slot!(toggle_101);
+    slots[129] = crate::slot!(graphics::dispatch_mesh);
     slots[142] = crate::slot!(graphics::sample_mask);
+    slots[148] = crate::slot!(enhanced::barrier);
     slots
 };
 
