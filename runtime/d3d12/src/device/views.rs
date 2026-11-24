@@ -52,13 +52,30 @@ pub(super) unsafe extern "system" fn cbv(
     let mut aligned = unsafe { desc.as_ref() }.copied();
     let mut owner = None;
     if let Some(value) = &mut aligned {
+        let guest_size = value.SizeInBytes;
         if value.SizeInBytes <= D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 {
             value.SizeInBytes = value.SizeInBytes.next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
         }
         let address = value.BufferLocation;
         if address != 0 && value.SizeInBytes != 0 {
-            owner = buffer_at(device, address, u64::from(value.SizeInBytes), 1, false)
-                .unwrap_or_else(|e| fail_call(format_args!("CBV buffer {address:#x}, {} bytes: {:?}", value.SizeInBytes, e.code())));
+            // Rounding up to 256 bytes can carry the range past the end of the
+            // guest allocation (e.g. 0x...ff70 + 256 crosses a 64 KiB page).
+            // Fall back to the guest's own length, then to a null view.
+            let found = buffer_at(device, address, u64::from(value.SizeInBytes), 1, false).or_else(|error| {
+                if guest_size != 0 && guest_size < value.SizeInBytes {
+                    buffer_at(device, address, u64::from(guest_size), 1, false)
+                } else { Err(error) }
+            });
+            match found {
+                Ok(buffer) => owner = buffer,
+                Err(error) => {
+                    static UNMAPPED: std::sync::Once = std::sync::Once::new();
+                    crate::diagnostics::log_once(&UNMAPPED, || format!(
+                        "CBV buffer {address:#x}, {guest_size} bytes unavailable ({:?}); writing a null view", error.code()));
+                    value.BufferLocation = 0;
+                    value.SizeInBytes = 0;
+                }
+            }
             if let Some(buffer) = &owner {
                 value.BufferLocation = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
             }
