@@ -359,6 +359,17 @@ pub(super) unsafe extern "system" fn package_register_progress(
     OK
 }
 
+/// XPackageEnumeratePackages(kind, scope, context, callback). Offline there is
+/// no installed DLC or related package to report; the title enumerates
+/// Content/ThisOnly and an empty, successful enumeration means "none owned".
+pub(super) extern "system" fn package_enumerate(
+    _: &Object, kind: u32, scope: u32, _context: *mut c_void, callback: *mut c_void,
+) -> i32 {
+    super::report(format_args!("called package_enumerate kind {kind} scope {scope}"));
+    if callback.is_null() { return POINTER; }
+    OK
+}
+
 /// XUserGetGamertag(user, component, size, buffer, used) on interface cef4fac0.
 pub(super) unsafe extern "system" fn user_gamertag(
     _: &Object, user: *mut c_void, _component: u32, size: usize, buffer: *mut u8, used: *mut usize,
