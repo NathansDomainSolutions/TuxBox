@@ -56,6 +56,7 @@ mod classify_materials;
 mod int16;
 mod int32;
 mod float64;
+mod norm16;
 mod indexed_lane;
 mod particle_sort;
 mod persistent;
@@ -6323,25 +6324,33 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let (a, b, acc) = (r(&s[0])?, r(&s[1])?, r(&d)?);
             return self.wv(&d, &format!("tb_fmac_half({a}, {b}, {acc}) | (tb_fmac_half({a} >> 16, {b} >> 16, {acc} >> 16) << 16)"));
         }
-        if m == "v_cvt_pknorm_u16_f32" {
+        if let Some(signed) = norm16::signed(&m) {
+            let kind = if signed { "SNORM16" } else { "UNORM16" };
             if ins.raw[0] & 0xfc00 != 0 || ins.raw[1] & 0x98000000 != 0 {
-                return Err("unsupported UNORM16 pack modifiers".into());
+                return Err(format!("unsupported {kind} pack modifiers"));
             }
             if self.ex.stage == Stage::Pixel {
-                // The direct two-channel export is used for R16G16_UNORM. Until
-                // additional export formats have provenance, reject a skipped or
-                // indirect pack instead of reinterpreting the bits as FP16.
-                let e = self.insns.get(self.cur_idx + 1).ok_or("UNORM16 pack without export")?;
+                // The direct two-channel export is used for R16G16_UNORM and
+                // R16G16_SNORM. Until additional export formats have provenance,
+                // reject a skipped or indirect pack instead of reinterpreting the
+                // bits as FP16.
+                let e = self.insns.get(self.cur_idx + 1).ok_or_else(|| format!("{kind} pack without export"))?;
                 if e.enc != Enc::Exp || e.aux.imm != 0 || e.aux.mask != 3 || e.aux.imm2 & 1 == 0
                     || e.src.first() != Some(&d) || self.insns.iter().any(|i| i.enc == Enc::Sopp
                         && Self::branch_cond(i.op).is_some() && i.offset as i64 + 4 + 4*i.aux.imm == e.offset as i64)
                 {
-                    return Err("unresolved packed UNORM16 pixel export".into());
+                    return Err(format!("unresolved packed {kind} pixel export"));
                 }
             }
-            let lo = self.fm(ins, 0)?;
-            let hi = self.fm(ins, 1)?;
-            return self.wv(&d, &format!("((uint)round(saturate({lo}) * 65535.0) | ((uint)round(saturate({hi}) * 65535.0) << 16))"));
+            let (lo, hi) = (self.fm(ins, 0)?, self.fm(ins, 1)?);
+            if !signed {
+                return self.wv(&d, &norm16::pack(false, &lo, &hi));
+            }
+            // The signed form reads each source twice (NaN test and value).
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("float t{t}lo = {lo}; float t{t}hi = {hi};"));
+            return self.wv(&d, &norm16::pack(true, &format!("t{t}lo"), &format!("t{t}hi")));
         }
         if m == "v_cvt_pk_u8_f32" {
             if ins.aux.mask & !9 != 0 || ins.raw[0] & 0xf800 != 0 || ins.aux.imm2 != 0 {
@@ -8634,12 +8643,12 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let on = (en >> (i / 2 * 2)) & 1 != 0 || (en >> i) & 1 != 0;
                 comp.push(if on {
                     let word = format!("(({} >> {}) & 0xffffu)", r(src)?, (i % 2) * 16);
-                    if self.cur_idx.checked_sub(1).and_then(|idx| self.insns.get(idx))
-                        .is_some_and(|prior| prior.mnemonic == "v_cvt_pknorm_u16_f32" && prior.dst.first() == Some(src))
-                    {
-                        format!("((float){word} / 65535.0)")
-                    } else {
-                        format!("f16tof32({word})")
+                    let norm = self.cur_idx.checked_sub(1).and_then(|idx| self.insns.get(idx))
+                        .filter(|prior| prior.dst.first() == Some(src))
+                        .and_then(|prior| norm16::signed(&prior.mnemonic));
+                    match norm {
+                        Some(signed) => norm16::export(signed, &word),
+                        None => format!("f16tof32({word})"),
                     }
                 } else {
                     "0.0".into()
