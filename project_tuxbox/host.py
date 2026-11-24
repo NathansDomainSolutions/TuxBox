@@ -90,6 +90,37 @@ def restore_package_drive(prefix, report):
         report(f"Could not restore the prefix's G: drive from {record_path}: {exc}")
 
 
+def configure_nvidia_shader_cache(env, report=None):
+    """Keep this prefix's compiled GPU pipelines for the next launch.
+
+    NVIDIA stores them under ~/.cache/nvidia/GLCache. Every Wine process shares
+    one application bucket there, and the driver drops that bucket once it
+    passes a small size. vkd3d can reuse its SPIR-V while the driver compiles
+    the same pipelines again. A prefix-local directory is the cache Steam gives
+    each title. An explicit path or a disabled disk cache is left alone.
+    """
+    if env.get("__GL_SHADER_DISK_CACHE") == "0" or env.get("__GL_SHADER_DISK_CACHE_PATH"):
+        return
+    prefix = env.get("WINEPREFIX")
+    if not prefix:
+        return
+    cache = Path(prefix) / "shadercache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if report:
+            report(f"NVIDIA shader cache stays in the default directory: {exc}")
+        return
+    env["__GL_SHADER_DISK_CACHE"] = "1"
+    env["__GL_SHADER_DISK_CACHE_PATH"] = str(cache)
+    env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
+    # The default cap is about 128MB for the whole shared bucket. One Scarlett
+    # boot writes more than that, so give this directory room of its own.
+    env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(8 << 30))
+    if report:
+        report(f"NVIDIA shader cache: {cache}")
+
+
 class Host:
     def __init__(self, backend, proton, prefix, offline=False):
         if platform.machine().lower() not in {"amd64", "x86_64"}:
@@ -197,6 +228,8 @@ class Host:
                     drive = prefix / "dosdevices/g:"
                     log.status(f"The package is not mapped to G: because {drive} is not a drive link")
         try:
+            if self.backend in ("proton", "wine"):
+                configure_nvidia_shader_cache(env, log.status)
             if "-nullrhi" not in (arg.lower() for arg in arguments):
                 configure_console_cbv(self.backend, env, executable, log.status)
             capture = performance_capture(self.backend, env, executable, log) if mangohud else nullcontext()

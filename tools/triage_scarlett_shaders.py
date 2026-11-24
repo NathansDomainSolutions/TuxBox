@@ -67,7 +67,10 @@ def command(xshader, source, work):
         cooked = source / "producer.dxbc"
         flags = ["--link-pixel", source / "pixel.dxbc", "--pixel-order", source / "pixel.cso"]
     elif source.suffix == ".stencil":
-        flags = ["--stencil-target", source.stem.rsplit("_rt", 1)[1]]
+        stem, sep, target = source.stem.rpartition("_rt")
+        if not sep:
+            raise ValueError(f"stencil request without a render-target suffix: {source.name}")
+        flags = ["--stencil-target", target]
     return [xshader, cooked, *flags, "--hlsl-out", work / "shader.hlsl", "--profile-out", work / "profile"]
 
 
@@ -78,7 +81,7 @@ def probe(xshader, source, timeout):
                                  errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             return source, "failed", f"timed out after {timeout:g}s"
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             return source, "failed", str(exc)
     if run.returncode == 0:
         return source, "translated", None
@@ -149,6 +152,8 @@ def main(argv=None):
     parser.add_argument("--json", type=Path, help="write the full report here")
     args = parser.parse_args(argv)
 
+    if args.limit < 0:
+        parser.error("--limit must be 0 (all) or positive")
     if not args.requests.is_dir():
         parser.error(f"not a directory: {args.requests}")
     sources = requests(args.requests)[:args.limit or None]

@@ -163,7 +163,33 @@ class RuntimeShaderLinks(unittest.TestCase):
         with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
         self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxc", "dxv"])
+        dxc_calls = [call for call in compiler.call_args_list if call.args[0][0] == "dxc"]
+        self.assertEqual([call.kwargs["timeout"] for call in dxc_calls], [15, 15])
+        self.assertNotIn("-O0", dxc_calls[0].args[0])
+        self.assertIn("-O0", dxc_calls[1].args[0])
         self.assertEqual((self.session / (key + ".cso")).read_bytes(), dxil)
+
+    def test_cs_6_6_skips_the_optimiser(self):
+        program = b"Xbox compute shader"
+        key = hashlib.sha256(program).hexdigest()
+        source = self.requests / (key + ".dxbc")
+        source.write_bytes(program)
+        dxil = portable_program(5, b"compute")
+
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("compute shader")
+                args[args.index("--profile-out") + 1].write_text("cs_6_6")
+            elif args[0] == "dxc":
+                self.assertIn("-O0", args)
+                self.assertEqual(timeout, 15)
+                args[args.index("-Fo") + 1].write_bytes(dxil)
+            else:
+                self.assertEqual(args[0], "dxv")
+
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
+            self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
+        self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxv"])
 
     def test_scarlett_replays_exact_recorded_requests_before_launch(self):
         directory = self.session.parent

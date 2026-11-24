@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import Host, claim_package_drive, proton_installation
+from project_tuxbox.host import Host, claim_package_drive, configure_nvidia_shader_cache, proton_installation
 
 
 class SelectProton(unittest.TestCase):
@@ -306,3 +306,32 @@ class ConsoleConstantBuffers(unittest.TestCase):
             os.utime(sources / "layer.c", (30, 30))
             console_cbv_layer(env)
             build.assert_called_once_with([script, layer], env=env, check=True)
+
+
+class NvidiaShaderCache(unittest.TestCase):
+    def test_prefix_gets_its_own_driver_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            env = {"WINEPREFIX": str(prefix)}
+            configure_nvidia_shader_cache(env)
+            cache = prefix / "shadercache"
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE"], "1")
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], str(cache))
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1")
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(8 << 30))
+            self.assertTrue(cache.is_dir())
+
+    def test_explicit_path_and_disabled_cache_stay(self):
+        env = {"WINEPREFIX": "/unused", "__GL_SHADER_DISK_CACHE_PATH": "/games/nv",
+               "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "0"}
+        configure_nvidia_shader_cache(env)
+        self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], "/games/nv")
+        self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "0")
+        disabled = {"WINEPREFIX": "/unused", "__GL_SHADER_DISK_CACHE": "0"}
+        configure_nvidia_shader_cache(disabled)
+        self.assertEqual(list(disabled), ["WINEPREFIX", "__GL_SHADER_DISK_CACHE"])
+
+    def test_launch_without_a_prefix_leaves_the_default_cache(self):
+        env = {}
+        configure_nvidia_shader_cache(env)
+        self.assertEqual(env, {})

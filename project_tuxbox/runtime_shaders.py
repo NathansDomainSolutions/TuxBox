@@ -149,14 +149,18 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         if not re.fullmatch(profiles, target):
             raise ValueError(f"unsupported compiler profile {target!r}")
         entry = [] if target == "lib_6_3" else ["-E", "main"]
-        try:
-            run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=50)
-        except subprocess.TimeoutExpired:
-            # Large skinning and edge-emit programs spend minutes in DXC's
-            # optimiser. Unoptimised DXIL compiles in seconds, and the driver
-            # optimises it again when it builds the pipeline.
-            output.unlink(missing_ok=True)
+        # cs_6_6 programs from this boot either finish default optimisation in
+        # under a second or sit in it until the cap. The ones that sit there
+        # compile at -O0 in a few seconds, and the driver optimises that DXIL
+        # again when it builds the pipeline.
+        if target == "cs_6_6":
             run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
+        else:
+            try:
+                run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
+            except subprocess.TimeoutExpired:
+                output.unlink(missing_ok=True)
+                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
         run_tool([dxv, output], timeout=10)
         if not has_dxil_container(output.read_bytes()):
             raise ValueError("compiler returned an invalid DXIL container")

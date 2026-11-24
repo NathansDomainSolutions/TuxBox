@@ -54,8 +54,13 @@ def run_game(args, exe, host, package_dir, profile=None):
         if host.offline:
             log.status("Network: offline. The game cannot reach servers or upload crash reports.")
         try:
-            if args.prepare_only or (not args.no_shader_prep and os.environ.get("TUXBOX_SHADER_PREP") != "0"
-                                     and "-nullrhi" not in (arg.lower() for arg in args.arguments)):
+            # Project Scarlett's recorded archive blocks launch for many minutes.
+            # The runtime worker still compiles requests. --prepare-only keeps the archive pass.
+            scarlett = exe.name.casefold() == "game_scarlett_master.exe"
+            automatic = (not args.no_shader_prep and os.environ.get("TUXBOX_SHADER_PREP") != "0"
+                         and "-nullrhi" not in (arg.lower() for arg in args.arguments)
+                         and not scarlett)
+            if args.prepare_only or automatic:
                 try:
                     with redirect_stderr(log):
                         supported = prepare_for_launch(exe, host)

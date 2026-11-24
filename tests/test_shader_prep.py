@@ -299,16 +299,16 @@ class ShaderPreparation(unittest.TestCase):
 
 
 class ShaderLaunch(unittest.TestCase):
-    def run_cli(self, flags, *, prepare=True, game_arguments=(), env=None):
+    def run_cli(self, flags, *, prepare=True, game_arguments=(), env=None, exe="game.exe"):
         import os
         from types import SimpleNamespace
         import tuxbox
 
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO), \
              patch("sys.argv", ["tuxbox", "run", "--log-file", str(Path(tmp) / "run.log"),
-                                *flags, "game.exe", *game_arguments]), \
+                                *flags, exe, *game_arguments]), \
              patch.dict(os.environ, {"TUXBOX_SHADER_PREP": "1", **(env or {})}), \
-             patch("tuxbox.launch_target", return_value=Path("game.exe")), \
+             patch("tuxbox.launch_target", return_value=Path(exe)), \
              patch("tuxbox.Host") as host, patch("tuxbox.prepare_for_launch") as prepare_fn:
             host.return_value.backend = "native"
             host.return_value.version = "test"
@@ -332,3 +332,9 @@ class ShaderLaunch(unittest.TestCase):
         self.assertEqual(self.run_cli(["--no-shader-prep"]), (19, 0, 1))
         self.assertEqual(self.run_cli([], game_arguments=["-NullRHI"]), (19, 0, 1))
         self.assertEqual(self.run_cli([], env={"TUXBOX_SHADER_PREP": "0"}), (19, 0, 1))
+
+    def test_scarlett_skips_pregame_compilation(self):
+        exe = "game_scarlett_master.exe"
+        self.assertEqual(self.run_cli([], exe=exe), (19, 0, 1))
+        self.assertEqual(self.run_cli(["--prepare-only"], exe=exe), (0, 1, 0))
+        self.assertEqual(self.run_cli(["--no-shader-prep"], exe=exe), (19, 0, 1))

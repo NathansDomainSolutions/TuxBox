@@ -6,8 +6,9 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+import unittest.mock
 
-from tools.triage_scarlett_shaders import command, construct, main, normalize, requests
+from tools.triage_scarlett_shaders import command, construct, main, normalize, probe, requests
 
 KEY = "ab" * 32
 
@@ -45,6 +46,16 @@ class TriageScarlettShaders(unittest.TestCase):
         self.assertEqual(command("x", link, work)[1:6],
                          [link / "producer.dxbc", "--link-pixel", link / "pixel.dxbc", "--pixel-order", link / "pixel.cso"])
         self.assertIn("--hlsl-out", command("x", self.cache / f"{KEY}.dxbc", work))
+
+    def test_stencil_without_target_is_a_failure_not_a_crash(self):
+        source, status, reason = probe("x", self.cache / f"{KEY}.stencil", 1)
+        self.assertEqual(status, "failed")
+        self.assertIn("render-target suffix", reason)
+
+    def test_rejects_negative_limit(self):
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit), \
+                unittest.mock.patch("sys.stderr", io.StringIO()):
+            main([str(self.cache), "--limit", "-1"])
 
     def test_lists_only_recorded_requests(self):
         for name in (f"{KEY}.dxbc", f"{KEY}_rt1.stencil", "notes.dxbc", f"{KEY}.cso"):
