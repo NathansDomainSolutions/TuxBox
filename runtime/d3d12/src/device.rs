@@ -83,6 +83,7 @@ impl ResourceState {
         match &self.backing {
             Backing::Translated(guest) | Backing::Addressed(_, guest)
                 if !depth::paired(guest) && format::substitute(guest).is_some() => Some(guest),
+            Backing::Placed(texture) if format::placed_host_format(&texture.desc).is_some() => Some(&texture.desc),
             _ => None,
         }
     }

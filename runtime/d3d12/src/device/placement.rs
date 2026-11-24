@@ -226,6 +226,7 @@ impl Texture {
         // A simultaneous-access texture implicitly promotes on first use and
         // decays to COMMON after ExecuteCommandLists, including copy-queue uploads.
         let host = D3D12_RESOURCE_DESC {
+            Format: super::format::placed_host_format(desc).unwrap_or(desc.Format),
             Alignment: 0,
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS

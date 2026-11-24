@@ -88,6 +88,14 @@ pub(super) fn substitute(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DE
     image.then_some(D3D12_RESOURCE_DESC { Format: format, Flags: D3D12_RESOURCE_FLAGS(flags), ..*desc })
 }
 
+/// Host format for a guest-placed (console-layout) colour image whose format
+/// the desktop cannot render to or write as a UAV.
+pub(crate) fn placed_host_format(desc: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+    (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && desc.Flags.0
+        & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0)
+        .then_some(DXGI_FORMAT_R11G11B10_FLOAT)
+}
+
 /// True when the guest asked for a depth image with unordered access that the
 /// host creates without it (everything except the paired float depth plane).
 fn unbacked_uav(desc: &D3D12_RESOURCE_DESC) -> bool {
