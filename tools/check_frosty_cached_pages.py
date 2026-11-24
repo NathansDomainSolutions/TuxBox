@@ -7,8 +7,9 @@ from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 
-from check_frosty_page_list import ROOT, Host, Toolchain, global_archive, decompress, containers, digest
-from build import find_dxc
+from check_frosty_shaders import ROOT, global_archive, decompress, containers, digest
+from build import Toolchain, find_dxc
+from project_tuxbox.host import Host
 from project_tuxbox.shader_inventory import decoder
 
 ENTRY = 1228
