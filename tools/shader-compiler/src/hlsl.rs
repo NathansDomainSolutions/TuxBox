@@ -1647,7 +1647,22 @@ impl<'a> Emitter<'a> {
                 .and_then(|r| {
                     let recovered = tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 })?;
                     (recovered.descriptors == r.static_samplers).then_some(recovered.sites)
-                }).unwrap_or_default(),
+                })
+                // Root-less programs that declare several samplers: the literal words cannot
+                // be matched to the title's registers here, so use the private slots that
+                // inline_sampler::sites derives from the ISA alone (space 32765). The runtime
+                // appends the same descriptors to the host root signature.
+                .or_else(|| ((ex.root_sig.is_none()
+                    && ex.resources.iter().filter(|r| r.res_type == 1).count() > 1)
+                    // A root with no static samplers: the runtime recovers the private ones
+                    // (compute_table.rs, inline_sampler::private) from the same sites.
+                    || (matches!(ex.stage, Stage::Compute | Stage::Pixel)
+                        && ex.root_sig.as_ref().is_some_and(|r| r.static_samplers.is_empty())
+                        && ex.resources.iter().any(|r| r.res_type == 1)))
+                    .then(|| tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 }))
+                    .flatten()
+                    .map(|recovered| recovered.sites))
+                .unwrap_or_default(),
             binding_spaces: BTreeMap::new(),
             mesh_bindings: None,
             compute_derivatives: false,
@@ -1808,6 +1823,14 @@ impl<'a> Emitter<'a> {
             if let Some((kind, register, space)) = self.uncovered_fssm_descriptor(sgpr, offset) {
                 return Ok((Some(kind), register, space));
             }
+            // Raster roots can omit console table slots entirely (PS_Composite reads s9 +
+            // 0x540 past a 7-range table). Name the register the FSSM row and PSV agree on;
+            // the runtime builds the host table from the same rows.
+            if self.ex.stage != Stage::Compute {
+                if let Some(found) = self.fssm_descriptor(sgpr, offset, stride) {
+                    return Ok(found);
+                }
+            }
         }
         Err(format!("unmapped descriptor at s{sgpr} + {offset:#x}"))
     }
@@ -1818,7 +1841,14 @@ impl<'a> Emitter<'a> {
     /// load only when exactly one row sits at this SGPR and offset and exactly one PSV
     /// binding of the matching class names its register.
     fn rootless_fssm_descriptor(&self, sgpr: u8, offset: u32, stride: u32) -> Option<(Option<u32>, u32, u32)> {
-        if self.ex.root_sig.is_some() || stride != 32 || offset % 32 != 0 {
+        if self.ex.root_sig.is_some() {
+            return None;
+        }
+        self.fssm_descriptor(sgpr, offset, stride)
+    }
+
+    fn fssm_descriptor(&self, sgpr: u8, offset: u32, stride: u32) -> Option<(Option<u32>, u32, u32)> {
+        if stride != 32 || offset % 32 != 0 {
             return None;
         }
         let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?.filter(|&[class, pos, _, _, loc]| {
@@ -2462,6 +2492,25 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Raw SRV behind a root descriptor whose GPU address arrives in user SGPR `sgpr`.
+    fn root_raw_srv(&mut self, sgpr: u8) -> Option<Res> {
+        let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?
+            .filter(|&[class, _, _, _, loc]| class == 0x100 && (loc >> 8) & 0xff == u32::from(sgpr));
+        let [_, _, register, _, _] = rows.next()?;
+        if rows.next().is_some() {
+            return None;
+        }
+        let mut raw = self.ex.resources.iter().filter(|p| p.res_type == 4 && p.lower == register && p.upper == register);
+        let space = raw.next()?.space;
+        if raw.next().is_some() {
+            return None;
+        }
+        if self.binding_spaces.insert((0, register), space).is_some_and(|old| old != space) {
+            return None;
+        }
+        self.raw_binding(register, false)
+    }
+
     fn raw_binding(&mut self, slot: u32, is_uav: bool) -> Option<Res> {
         let ty = if is_uav { 7 } else { 4 };
         if self.ex.resources.iter().any(|p| p.res_type == ty && p.space == self.binding_spaces.get(&(u32::from(is_uav), slot)).copied().unwrap_or(0) && p.lower <= slot && slot <= p.upper) {
@@ -2611,6 +2660,8 @@ impl<'a> Emitter<'a> {
         let block_start = range.start;
         let inline_samplers = self.resource_heap_base.is_some()
             || (self.ex.root_sig.is_none() && self.ex.resources.iter().any(|r| r.res_type == 1))
+            // Literal sampler words can name any static sampler with identical state.
+            || self.ex.root_sig.as_ref().is_some_and(|r| !r.static_samplers.is_empty())
             || (self.ex.stage == Stage::Compute && self.ex.root_sig.as_ref().is_some_and(|r| !r.static_samplers.is_empty())
                 && self.ex.resources.iter().filter(|r| r.res_type == 1).count() > 1);
         for idx in range {
@@ -2944,6 +2995,16 @@ impl<'a> Emitter<'a> {
                         for k in d..d+n as u16 { sym.remove(&k); written.insert(k); }
                         continue;
                     }
+                    // A V# built inline from a root descriptor's GPU address (FSSM class 0x100
+                    // row at that user SGPR, e.g. VS_LinearDepth's s[11:12]) reads the raw SRV
+                    // that PSV declares at the row's register.
+                    if let Some(Sym::Table(t)) = sym.get(&b).copied() {
+                        if let Some(raw) = self.root_raw_srv(t) {
+                            self.res.insert(idx, vec![raw]);
+                            for k in d..d+n as u16 { sym.remove(&k); written.insert(k); }
+                            continue;
+                        }
+                    }
                     // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table offset
                     // 0x20 in MainOnePassPointLightPS).
                     let cands = self.desc_candidates(sym.get(&b)).ok_or_else(|| {
@@ -2994,8 +3055,15 @@ impl<'a> Emitter<'a> {
                         self.res.insert(idx, vec![Res::HeapRaw(rs)]);
                         continue;
                     }
-                    let raw = self.mesh_raw_descriptor(sym, rs)?
-                        .ok_or("typed buffer load requires a verified linear root SRV")?;
+                    let root_raw = match sym.get(&rs).copied() {
+                        Some(Sym::Table(t)) if self.mesh_bindings.is_none() => self.root_raw_srv(t),
+                        _ => None,
+                    };
+                    let raw = match root_raw {
+                        Some(raw) => raw,
+                        None => self.mesh_raw_descriptor(sym, rs)?
+                            .ok_or("typed buffer load requires a verified linear root SRV")?,
+                    };
                     self.res.insert(idx, vec![raw]);
                 }
                 // buffer_gl0_inv / buffer_gl1_inv (MUBUF 0x71 / 0x72) have no resource operands.
@@ -3013,6 +3081,12 @@ impl<'a> Emitter<'a> {
                     if self.compute_heap && sym.get(&rs) == Some(&Sym::HeapDescriptor(4)) {
                         self.res.insert(idx, vec![Res::HeapRaw(rs)]);
                         continue;
+                    }
+                    if let Some(Sym::Table(t)) = sym.get(&rs).copied() {
+                        if let Some(raw) = self.root_raw_srv(t) {
+                            self.res.insert(idx, vec![raw]);
+                            continue;
+                        }
                     }
                     let cands = self.desc_candidates(sym.get(&rs)).ok_or_else(|| {
                         format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({:?})", ins.offset, sym.get(&rs))
@@ -3095,6 +3169,7 @@ impl<'a> Emitter<'a> {
                                 (self.ex.stage == Stage::Compute).then(|| sampler_heap::guarded_words(insns, idx, ss as u8, compute_group(self.ex))).flatten()
                             });
                             words.and_then(|w| sampler_heap::inline_sampler(self.ex, w, ins.op & 8 != 0))
+                                .or_else(|| self.static_sampler())
                         } else { self.static_sampler() } {
                             if self.binding_spaces.insert((3, slot), space).is_some_and(|old| old != space) {
                                 return Err(format!("static sampler s{slot} overlaps another space"));
@@ -6369,9 +6444,18 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         // Address = element index (IDXEN: first address register) * stride + byte offset
         // (OFFEN: the next address register, or the first when there is no index) + imm.
         let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-        if !self.zero_buffer_offset(ins) {
-            return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
-        }
+        // SOFFSET is one more byte term of the address (buffer base + soffset + voffset +
+        // index * stride + imm); fold a non-zero one into the run-time byte offset.
+        let soff = if self.zero_buffer_offset(ins) {
+            None
+        } else {
+            let o = ins.src.get(2).copied().ok_or("missing MUBUF SOFFSET")?;
+            if !matches!(o, Opnd::Sgpr(_) | Opnd::ConstInt(_)) {
+                return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
+            }
+            self.touch(&o);
+            Some(r(&o)?)
+        };
         let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
         let a0 = ins.src[0];
         let a1 = match a0 {
@@ -6386,6 +6470,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.touch(&a1);
                 Some(r(&a1)?)
             }
+        };
+        let voff = match (voff, soff) {
+            (Some(v), Some(s)) => Some(format!("({v}) + ({s})")),
+            (v, None) => v,
+            (None, s) => s,
         };
         let w0 = ins.aux.imm as u32 / 4;
         let vd = match ins.dst[0] {
@@ -7476,6 +7565,18 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         out
     }
 
+    /// Samplers indexed statically from the sampler descriptor heap. HLSL only
+    /// allows SamplerDescriptorHeap inside a function, so these are locals of main.
+    fn heap_sampler_locals(&self, h: &mut String) {
+        for slot in &self.heap_sampler_slots {
+            if self.samp_cmp.contains(slot) {
+                let _ = writeln!(h, "    SamplerComparisonState scmp{slot} = SamplerDescriptorHeap[{slot}];");
+            } else {
+                let _ = writeln!(h, "    SamplerState samp{slot} = SamplerDescriptorHeap[{slot}];");
+            }
+        }
+    }
+
     /// HLSL declarations of every resource the shader uses (constant buffers, textures,
     /// samplers, buffers, UAVs, the embedded code table and LDS).
     fn resource_decls(&self) -> Result<String, String> {
@@ -7652,14 +7753,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let active = if self.resolve_wave32 { "0xffffffffu".to_owned() }
                 else if padded { format!("uint(gtid.y < {ty_}u)") } else { "1u".to_owned() };
             let _ = writeln!(h, "    uint exec_lo = {active}, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
-            // Samplers indexed statically from the sampler descriptor heap.
-            for slot in &self.heap_sampler_slots {
-                if self.samp_cmp.contains(slot) {
-                    let _ = writeln!(h, "    SamplerComparisonState scmp{slot} = SamplerDescriptorHeap[{slot}];");
-                } else {
-                    let _ = writeln!(h, "    SamplerState samp{slot} = SamplerDescriptorHeap[{slot}];");
-                }
-            }
+            self.heap_sampler_locals(&mut h);
             for r in ["v0", "v1", "v2"] {
                 self.regs.insert(r.to_string());
             }
@@ -7795,6 +7889,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(h, "SOut main(SIn i) {{\n    SOut o = (SOut)0;");
         }
         let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+        self.heap_sampler_locals(&mut h);
         // Vertex attributes arrive after the fetch call in consecutive groups of four VGPRs
         // from v4, one group per input register the shader reads. A register none of whose
         // elements is read (read mask 0 in the input signature) gets no group: in the skinned
@@ -8014,10 +8109,14 @@ fn mesh_heap_base(ex: &ShaderExtract) -> Option<u8> {
     u8::try_from(loc & 0xff).ok()?.checked_add(8)
 }
 
-/// Compute shaders that index the resource descriptor heap receive its base in
-/// the user SGPR named by FSSM user-data class 5 (class 6 is the sampler heap).
+/// Compute and vertex shaders that index the resource descriptor heap receive
+/// its base in the user SGPR named by FSSM user-data class 5 (class 6 is the
+/// sampler heap). RAGE's skinning and VfxVBuffer vertex shaders fetch
+/// `ResourceDescriptorHeap[root constant]` from s18 this way, behind three
+/// descriptor tables, a root SRV and five root constants: the same form as
+/// compute, rather than the pixel layout `sampler_heap::resource_base` checks.
 fn compute_heap_base(ex: &ShaderExtract) -> Option<u8> {
-    if ex.stage != Stage::Compute || ex.required_features? & (1 << 25) == 0 {
+    if !matches!(ex.stage, Stage::Compute | Stage::Vertex) || ex.required_features? & (1 << 25) == 0 {
         return None;
     }
     if ex.root_sig.as_ref().is_some_and(|root| root.flags & 0x400 == 0) {
