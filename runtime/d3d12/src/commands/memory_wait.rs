@@ -70,6 +70,7 @@ impl Prefix {
 struct Word {
     resource: ID3D12Resource,
     mapped: usize,
+    guest: u64,
 }
 
 impl Drop for Word {
@@ -102,6 +103,7 @@ impl Word {
         Ok(Self {
             resource,
             mapped: base.addr() + offset,
+            guest: address,
         })
     }
 
@@ -201,9 +203,19 @@ impl Worker {
                 for job in jobs {
                     let result = (|| -> Result<()> {
                         unsafe { job.fence.SetEventOnCompletion(1, HANDLE::default())? };
+                        let started = std::time::Instant::now();
+                        let mut reported = false;
                         while !job.segment.word.reached(job.segment.target) {
                             unsafe {
                                 job.device.GetDeviceRemovedReason()?;
+                            }
+                            if !reported && started.elapsed() > Duration::from_secs(5) {
+                                reported = true;
+                                let word = &job.segment.word;
+                                let current = unsafe { AtomicU64::from_ptr(word.mapped as *mut u64).load(Ordering::Acquire) };
+                                let line = format!("GPU memory wait stalled 5 s: guest {:#x} value {current:#x} < target {:#x}",
+                                    word.guest, job.segment.target);
+                                crate::diagnostics::log_once(&std::sync::Once::new(), || line);
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }

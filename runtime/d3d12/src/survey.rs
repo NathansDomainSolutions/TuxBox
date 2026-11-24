@@ -121,15 +121,23 @@ fn sample_busy_threads() {
             let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
             let mut stack = [0u64; 512];
             let mut read = 0usize;
+            let mut waited = [0u64; 1];
             if got {
-                let _ = unsafe { ReadProcessMemory(GetCurrentProcess(), ctx.Rsp as *const _, stack.as_mut_ptr().cast(), size_of_val(&stack), Some(&mut read)) };
+                for chunk in 0..stack.len() / 8 {
+                    let mut n = 0usize;
+                    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), (ctx.Rsp as usize + chunk * 64) as *const _,
+                        stack[chunk * 8..].as_mut_ptr().cast(), 64, Some(&mut n)) }.is_ok();
+                    if !ok || n != 64 { break; }
+                    read += 64;
+                }
+                let _ = unsafe { ReadProcessMemory(GetCurrentProcess(), ctx.Rdi as *const _, waited.as_mut_ptr().cast(), 8, None) };
             }
             let _ = unsafe { ResumeThread(h) };
             if !got { break; }
             let rel = |v: u64| if (start as u64..end as u64).contains(&v) { format!("+{:#x}", v - start as u64) } else { format!("{v:#x}") };
             let returns: Vec<String> = stack[..read / 8].iter().filter(|&&v| (start as u64..end as u64).contains(&v)).take(14).map(|&v| rel(v)).collect();
-            let line = format!("sampler: tid {tid} cpu {}ms round {round}: rip {} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} stack [{}]",
-                cpu / 10_000, rel(ctx.Rip), ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, returns.join(" "));
+            let line = format!("sampler: tid {tid} cpu {}ms round {round}: rip {} rdi={:#x} [rdi]={:#x} rsi={:#x} rax={:#x} rcx={:#x} rdx={:#x} stack [{}]",
+                cpu / 10_000, rel(ctx.Rip), ctx.Rdi, waited[0], ctx.Rsi, ctx.Rax, ctx.Rcx, ctx.Rdx, returns.join(" "));
             crate::diagnostics::log_once(&Once::new(), || line);
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
