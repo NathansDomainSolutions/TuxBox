@@ -79,17 +79,19 @@ unsafe extern "system" fn QueryApiImpl(
         return unsafe { query(&SYSTEM_OBJECT, iid, out) };
     }
     if !same(class, &THREADING) {
-        report(format_args!("unsupported API class {} (interface {})", guid_text(class), guid_text(iid)));
         let by_interface = probe::CLASSES.iter().position(|(c, _)| same(c, iid))
             .filter(|&i| i == probe::GAMERTAG);
         if let Some(index) = by_interface.or_else(|| probe::CLASSES.iter().position(|(c, _)| same(c, class)))
             && probe::available(index)
         {
+            // report() dedups, so each served class is logged once.
+            report(format_args!("serving {} (interface {})", probe::CLASSES[index].1, guid_text(iid)));
             let object = &probe::OBJECTS[index];
             add_ref(unsafe { &*ptr::from_ref(object).cast::<Object>() });
             unsafe { out.write(ptr::from_ref(object).cast_mut().cast()) };
             return OK;
         }
+        report(format_args!("unsupported API class {} (interface {})", guid_text(class), guid_text(iid)));
         return NO_INTERFACE;
     }
     unsafe { query(&THREAD_OBJECT, iid, out) }
@@ -179,8 +181,9 @@ macro_rules! unsupported_methods {
 }
 
 fn guid_text(g: &GUID) -> String {
-    format!("{:08x}-{:04x}-{:04x}-{}", g.data1, g.data2, g.data3,
-        g.data4.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    let d = g.data4;
+    format!("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        g.data1, g.data2, g.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7])
 }
 
 /// Report each distinct unsupported request once (bounded).
@@ -264,3 +267,4 @@ static SYSTEM_OBJECT: Object = Object {
     vtable: &SYSTEM_TABLE,
     references: AtomicU32::new(0),
 };
+
