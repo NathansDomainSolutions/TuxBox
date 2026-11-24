@@ -938,6 +938,7 @@ static DEVICE: Slots<160> = {
     slots[67] = crate::slot!(compute::deserialize_pipeline_x);
     slots[69] = crate::slot!(set_driver_hint);
     slots[70] = crate::slot!(views::address_srv);
+    slots[71] = crate::slot!(views::address_uav);
     slots[73] = crate::slot!(create_list_x);
     slots[74] = crate::slot!(heap::register_pages);
     slots[75] = crate::slot!(heap::unregister_pages);

@@ -352,6 +352,62 @@ pub(super) unsafe extern "system" fn address_srv(
     }
 }
 
+#[repr(C)]
+pub(super) struct AddressUav {
+    view: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    address: u64,
+}
+const _: () = assert!(std::mem::offset_of!(AddressUav, address) == 40);
+
+// Device slot 71 (title RVA 0x511f267): the UAV counterpart of address_srv.
+// The title passes a buffer resource description, a UAV description followed
+// by the guest GPU address, and the destination descriptor.
+pub(super) unsafe extern "system" fn address_uav(
+    device: &Device,
+    resource_desc: &D3D12_RESOURCE_DESC,
+    desc: &AddressUav,
+    mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    check_destination(handle);
+    crate::diagnostics::display::texture_view(handle.ptr, None, None);
+    device.state.placements.views.set(handle.ptr, None, false);
+    device.state.blas.views.store(handle.ptr, None);
+    let mut view = desc.view;
+    let null = |view: &D3D12_UNORDERED_ACCESS_VIEW_DESC, why: &str| {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&ONCE, || format!(
+            "address UAV at {:#x} written as null ({why}): dim={} width={} format={} view_dim={}",
+            desc.address, resource_desc.Dimension.0, resource_desc.Width, view.Format.0, view.ViewDimension.0));
+        device.state.imported_views.store(handle.ptr, None);
+        unsafe { device.native.CreateUnorderedAccessView(None, None, Some(view), handle) };
+    };
+    if desc.address == 0 || resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return null(&view, "not an addressed buffer");
+    }
+    if crate::commands::page_mapping::GPU_APERTURE.wait(desc.address, 1).is_err() {
+        return null(&view, "pending GPU mapping failed");
+    }
+    let buffer = unsafe { view.Anonymous.Buffer };
+    let Some(stride) = element_stride(view.Format.0, buffer.StructureByteStride) else {
+        return null(&view, "unsupported format");
+    };
+    let entry = match buffer_at(device, desc.address, resource_desc.Width, stride, true) {
+        Ok(Some(entry)) => entry,
+        _ => return null(&view, "import failed"),
+    };
+    let offset = entry.offset(desc.address);
+    if !offset.is_multiple_of(u64::from(stride)) {
+        return null(&view, "offset is not a whole element");
+    }
+    view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
+    view.Anonymous.Buffer.CounterOffsetInBytes = 0;
+    let native = entry.native.clone();
+    device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::Registered { _address: entry }));
+    unsafe { device.native.CreateUnorderedAccessView(&native, None, Some(&view), handle) };
+}
+
 pub(super) unsafe extern "system" fn srv(
     device: &Device,
     object: *mut c_void,
