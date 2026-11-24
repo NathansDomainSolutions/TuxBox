@@ -127,6 +127,8 @@ pub(super) unsafe extern "system" fn wait_value64(
     target: u64,
     flags: u32,
 ) {
+    super::probe_write("wait_value64", address, format_args!("target={target:#x} comparison={comparison} flags={flags} type={}",
+        unsafe { list.native.GetType() }.0));
     let mut state = recording(list);
     if !state.ensure_open(&list.native) {
         return;

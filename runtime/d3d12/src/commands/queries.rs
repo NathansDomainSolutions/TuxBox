@@ -66,6 +66,7 @@ pub(super) unsafe extern "system" fn resolve(
 // A Series timestamp packet writes the queue clock directly to title memory.
 // Desktop D3D12 exposes the same clock through a timestamp query and resolve.
 pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg: u32, flags: u32, mode: u32) {
+    super::probe_write("timestamp_at", address, format_args!("arg={arg} flags={flags:#x} mode={mode}"));
     const SLOTS: u32 = 256;
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }

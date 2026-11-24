@@ -1100,11 +1100,22 @@ unsafe extern "system" fn execute_indirect(
     }
 }
 
+// LOCAL diagnostic: report GPU writes aimed at the guest words a stalled
+// memory wait watches (around 0x4f8f000 in GTA VI 1.0.2.1).
+pub(super) fn probe_write(kind: &str, address: u64, detail: std::fmt::Arguments<'_>) {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if (0x4f80000..0x4fa0000).contains(&address) && COUNT.fetch_add(1, Ordering::Relaxed) < 48 {
+        let line = format!("probe: {kind} at {address:#x} {detail}");
+        crate::diagnostics::log_once(&std::sync::Once::new(), || line);
+    }
+}
+
 // LOCAL: Xbox list slot 61 (title RVA 0x248cbc1) is not identified yet. The
 // title passes (resource, 1, pointer, u32, 16 zero bytes). Log the first calls
 // and record nothing, so the title keeps running.
 unsafe extern "system" fn unknown_61(_list: &List, a: usize, b: u32, c: usize, d: u64, e: u64, f: u64) {
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    for v in [a as u64, c as u64, d, e, f] { probe_write("slot61", v, format_args!("a={a:#x} b={b} c={c:#x} d={d:#x}")); }
     if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
         crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
             "list slot 61 ignored: a={a:#x} b={b:#x} c={c:#x} d={d:#x} e={e:#x} f={f:#x}"));
@@ -1130,6 +1141,8 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
     static FIRST: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&FIRST, || format!(
         "list slot 62 write_bytes source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
+    probe_write("write_bytes", address, format_args!("bytes={bytes} first={:#x}",
+        if source.is_null() || bytes < 8 { 0 } else { unsafe { source.cast::<u64>().read_unaligned() } }));
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
     if bytes == 0 { return; }
@@ -1159,6 +1172,7 @@ unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u
 
 // Record the title's four-byte progress marker at the requested GPU address.
 unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, flags: u32, reserved: u32) {
+    probe_write("write_marker", address, format_args!("value={value:#x} flags={flags:#x}"));
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
     if address == 0 || !address.is_multiple_of(4) || flags != 0 || reserved != 0 {
