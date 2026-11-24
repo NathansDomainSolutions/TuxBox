@@ -7727,6 +7727,18 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         out
     }
 
+    /// Samplers indexed statically from the sampler descriptor heap. HLSL only
+    /// allows SamplerDescriptorHeap inside a function, so these are locals of main.
+    fn heap_sampler_locals(&self, h: &mut String) {
+        for slot in &self.heap_sampler_slots {
+            if self.samp_cmp.contains(slot) {
+                let _ = writeln!(h, "    SamplerComparisonState scmp{slot} = SamplerDescriptorHeap[{slot}];");
+            } else {
+                let _ = writeln!(h, "    SamplerState samp{slot} = SamplerDescriptorHeap[{slot}];");
+            }
+        }
+    }
+
     /// HLSL declarations of every resource the shader uses (constant buffers, textures,
     /// samplers, buffers, UAVs, the embedded code table and LDS).
     fn resource_decls(&self) -> Result<String, String> {
@@ -7903,14 +7915,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let active = if self.resolve_wave32 { "0xffffffffu".to_owned() }
                 else if padded { format!("uint(gtid.y < {ty_}u)") } else { "1u".to_owned() };
             let _ = writeln!(h, "    uint exec_lo = {active}, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
-            // Samplers indexed statically from the sampler descriptor heap.
-            for slot in &self.heap_sampler_slots {
-                if self.samp_cmp.contains(slot) {
-                    let _ = writeln!(h, "    SamplerComparisonState scmp{slot} = SamplerDescriptorHeap[{slot}];");
-                } else {
-                    let _ = writeln!(h, "    SamplerState samp{slot} = SamplerDescriptorHeap[{slot}];");
-                }
-            }
+            self.heap_sampler_locals(&mut h);
             for r in ["v0", "v1", "v2"] {
                 self.regs.insert(r.to_string());
             }
@@ -8047,6 +8052,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
             let _ = writeln!(h, "SOut main(SIn i) {{\n    SOut o = (SOut)0;");
         }
         let _ = writeln!(h, "    uint exec_lo = 1u, exec_hi = 0u, vcc_lo = 0u, vcc_hi = 0u, scc = 0u, m0 = 0u, nul = 0u;");
+        self.heap_sampler_locals(&mut h);
         // Vertex attributes arrive after the fetch call in consecutive groups of four VGPRs
         // from v4, one group per input register the shader reads. A register none of whose
         // elements is read (read mask 0 in the input signature) gets no group: in the skinned
@@ -8267,10 +8273,14 @@ fn mesh_heap_base(ex: &ShaderExtract) -> Option<u8> {
     u8::try_from(loc & 0xff).ok()?.checked_add(8)
 }
 
-/// Compute shaders that index the resource descriptor heap receive its base in
-/// the user SGPR named by FSSM user-data class 5 (class 6 is the sampler heap).
+/// Compute and vertex shaders that index the resource descriptor heap receive
+/// its base in the user SGPR named by FSSM user-data class 5 (class 6 is the
+/// sampler heap). RAGE's skinning and VfxVBuffer vertex shaders fetch
+/// `ResourceDescriptorHeap[root constant]` from s18 this way, behind three
+/// descriptor tables, a root SRV and five root constants: the same form as
+/// compute, rather than the pixel layout `sampler_heap::resource_base` checks.
 fn compute_heap_base(ex: &ShaderExtract) -> Option<u8> {
-    if ex.stage != Stage::Compute || ex.required_features? & (1 << 25) == 0 {
+    if !matches!(ex.stage, Stage::Compute | Stage::Vertex) || ex.required_features? & (1 << 25) == 0 {
         return None;
     }
     if ex.root_sig.as_ref().is_some_and(|root| root.flags & 0x400 == 0) {
