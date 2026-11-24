@@ -136,7 +136,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if !(start..end).contains(&rip) {
         return CONTINUE_SEARCH;
     }
-    if !enabled() && run_count_overflow(start, end, rip, context) {
+    if run_count_overflow(start, end, rip, context) {
         let hits = record(&ASSERTS, rip - start);
         if hits.is_power_of_two() {
             crate::diagnostics::log_once(&Once::new(), || {
