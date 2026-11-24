@@ -1775,7 +1775,12 @@ impl<'a> Emitter<'a> {
             return Ok((Some(binding.kind), binding.register, binding.space));
         }
         let index = offset / stride;
-        let Some(ranges) = self.root_table(sgpr) else { return Ok((None, index, 0)); };
+        let Some(ranges) = self.root_table(sgpr) else {
+            if let Some(found) = self.rootless_fssm_descriptor(sgpr, offset, stride) {
+                return Ok(found);
+            }
+            return Ok((None, index, 0));
+        };
         // Existing FSSM single-range layouts may address beyond the declared range.
         if let [range] = ranges {
             if range.base_register == 0 && range.space == 0 && matches!(range.offset_in_table, 0 | u32::MAX) {
@@ -1805,6 +1810,37 @@ impl<'a> Emitter<'a> {
             }
         }
         Err(format!("unmapped descriptor at s{sgpr} + {offset:#x}"))
+    }
+
+    /// Root-less programs (most RAGE shaders) carry no RTS0, so no root table names their
+    /// descriptors. FSSM used-resource rows still give each descriptor's table SGPR
+    /// (location bits 8..16), dword offset and register; PSV gives its space. Accept a
+    /// load only when exactly one row sits at this SGPR and offset and exactly one PSV
+    /// binding of the matching class names its register.
+    fn rootless_fssm_descriptor(&self, sgpr: u8, offset: u32, stride: u32) -> Option<(Option<u32>, u32, u32)> {
+        if self.ex.root_sig.is_some() || stride != 32 || offset % 32 != 0 {
+            return None;
+        }
+        let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?.filter(|&[class, pos, _, _, loc]| {
+            matches!(class, 0x300 | 0x302 | 0x303) && (loc >> 8) & 0xff == u32::from(sgpr) && pos.checked_mul(4) == Some(offset)
+        });
+        let [class, _, register, _, _] = rows.next()?;
+        if rows.next().is_some() {
+            return None;
+        }
+        let (kind, types): (u32, &[u32]) = match class {
+            0x300 => (0, &[3, 4, 5]),
+            0x303 => (1, &[6, 7, 8]),
+            _ => (2, &[2]),
+        };
+        let mut spaces = self.ex.resources.iter()
+            .filter(|p| types.contains(&p.res_type) && p.lower <= register && register <= p.upper)
+            .map(|p| p.space);
+        let space = spaces.next()?;
+        if spaces.next().is_some() {
+            return None;
+        }
+        Some((Some(kind), register, space))
     }
 
     fn uncovered_fssm_descriptor(&self, sgpr: u8, offset: u32) -> Option<(u32, u32, u32)> {
