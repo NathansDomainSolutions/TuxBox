@@ -134,7 +134,10 @@ class Host:
         unshare = shutil.which("unshare")
         if not unshare:
             raise ValueError("Install util-linux unshare to launch with --offline")
-        wrapper = [unshare, "--user", "--map-current-user", "--net", "--"]
+        # Keep loopback: titles talk to themselves over 127.0.0.1. Bring it up
+        # with the namespace's capabilities, then drop them before the launch.
+        wrapper = [unshare, "--user", "--map-current-user", "--keep-caps", "--net", "--", "sh", "-c",
+                   'ip link set lo up && exec setpriv --inh-caps=-all --ambient-caps=-all -- "$@"', "sh"]
         probe = subprocess.run([*wrapper, "true"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if probe.returncode:
             reason = probe.stderr.strip() or f"exit code {probe.returncode}"

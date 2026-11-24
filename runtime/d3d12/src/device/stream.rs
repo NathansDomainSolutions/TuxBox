@@ -241,6 +241,11 @@ unsafe fn create(
         super::compute_table::capture_stage_root(pixel, root);
     }
     let mut rooted = [None, None];
+    if let Some(root) = guest_root && original[0].is_some() && original[1].is_some()
+        && (root_record.is_none() || original[2..].iter().any(Option::is_some))
+    {
+        raster_root_diagnostic(root.payload(), if root_record.is_none() { "no root record" } else { "extra stages" });
+    }
     if let (Some(root), Some((vertex, _)), Some((pixel, _)), Some(field)) =
         (guest_root, original[0], original[1], root_record)
         && original[2..].iter().all(Option::is_none)
@@ -255,7 +260,11 @@ unsafe fn create(
                 unsafe { field.write(table.native.as_raw()) };
                 Some(&pipeline.raster_table.insert(table).layout)
             }
-            TableLayout::Unsupported => None,
+            TableLayout::Unsupported => {
+                raster_root_diagnostic(root.payload(), "unsupported table layout");
+                // Experimental: translate against the guest root unchanged.
+                std::env::var_os("TUXBOX_RASTER_ROOT_FALLBACK").map(|_| root)
+            }
         };
         // A native root table can combine descriptors from both raster stages.
         if let Some(root) = root {
@@ -345,7 +354,7 @@ unsafe fn create(
     };
     // SAFETY: the stream storage, translated shaders, and guest-owned inputs
     // all stay alive throughout this synchronous call on the desktop Device2.
-    let initial = unsafe { host.CreatePipelineState(&native_desc) };
+    let initial = crate::big_stack::run(|| unsafe { host.CreatePipelineState(&native_desc) });
     let Err(error) = &initial else {
         if rectangles {
             static FIRST_RECTANGLE: std::sync::Once = std::sync::Once::new();
@@ -426,7 +435,7 @@ unsafe fn create(
             linked_rectangle = unsafe { rectangle::geometry(&*field, &pixel_bytecode())? };
             unsafe { geometry_record.write(rectangle::bytecode(&linked_rectangle)) };
         }
-        let retry = unsafe { host.CreatePipelineState(&native_desc) };
+        let retry = crate::big_stack::run(|| unsafe { host.CreatePipelineState(&native_desc) });
         match &retry {
             Ok(_) => {
                 static VERTEX: std::sync::Once = std::sync::Once::new();
@@ -510,4 +519,23 @@ pub(super) unsafe extern "system" fn create_pipeline(
         native.as_ref().err().map(|e| e.code().0),
     );
     unsafe { wrap_pageable(native, &compute::PIPELINE, device, state, out) }
+}
+
+/// With TUXBOX_TRACE_RASTER_ROOTS=1, describe each distinct raster root
+/// signature that does not reach a rooted shader translation.
+fn raster_root_diagnostic(payload: &[u8], reason: &str) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_TRACE_RASTER_ROOTS").is_some());
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    if !*ON { return; }
+    let summary = match tuxbox_dxbc::rootsig::parse_rts0(payload) {
+        Ok(sig) => format!("v{} flags={:#x} static_samplers={} params={:?}", sig.version, sig.flags, sig.static_samplers.len(), sig.params.iter().map(|p| &p.kind).collect::<Vec<_>>()),
+        Err(e) => format!("unparsed ({e})"),
+    };
+    let line = format!("raster root without translation ({reason}): {summary}");
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 40 && seen.insert(line.clone()) {
+        crate::diagnostics::log_once(&std::sync::Once::new(), || line);
+    }
 }

@@ -318,6 +318,7 @@ pub(crate) mod sampler {
         buffer: ID3D12Resource,
         layout: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         index: u64,
+        source: usize,
     }
 
     /// Record a copy of subresource 0 into a readback buffer, after
@@ -378,7 +379,7 @@ pub(crate) mod sampler {
             std::mem::ManuallyDrop::drop(&mut dst.pResource);
             std::mem::ManuallyDrop::drop(&mut src.pResource);
         }
-        Some(Sample { buffer, layout, index: INDEX.fetch_add(1, Ordering::Relaxed) })
+        Some(Sample { buffer, layout, index: INDEX.fetch_add(1, Ordering::Relaxed), source: windows::core::Interface::as_raw(source) as usize })
     }
 
     impl Sample {
@@ -405,8 +406,8 @@ pub(crate) mod sampler {
             let cells: Vec<String> = grid.iter().map(|row| row.iter()
                 .map(|&v| format!("{:3}", v / (n / 16).max(1) / 3)).collect::<Vec<_>>().join(" ")).collect();
             unsafe { self.buffer.Unmap(0, None) };
-            let line = format!("{name} sample #{} {}x{} format={} lit={:.3} mean=({},{},{}) grid=[{}]",
-                self.index, w, h, f.Format.0, lit as f64 / n as f64, sum[0] / n, sum[1] / n, sum[2] / n, cells.join(" | "));
+            let line = format!("{name} sample #{} res={:#x} {}x{} format={} lit={:.3} mean=({},{},{}) grid=[{}]",
+                self.index, self.source, w, h, f.Format.0, lit as f64 / n as f64, sum[0] / n, sum[1] / n, sum[2] / n, cells.join(" | "));
             crate::diagnostics::log_once(&std::sync::Once::new(), || line);
             if name == "present" {
                 let summary = crate::diagnostics::display::summary();
