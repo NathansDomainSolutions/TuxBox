@@ -54,6 +54,27 @@ fn recoverable(start: usize, end: usize, at: usize) -> bool {
     })
 }
 
+/// ProjectScarlett 1.0.2.1, RVA 0x51d251e: the tile-run counter at 0x51d2470
+/// asserts when the bytes still to cover outlast the heap's page-run table.
+/// Its own continue path reads past the table, so instead count the remainder
+/// as one more run and return, as the loop would for a final partial run.
+const RUN_COUNT: (usize, usize, [u8; 9]) =
+    (0x51d251e, 0x51d250e, [0xcc, 0xeb, 0xc5, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc]);
+
+fn run_count_overflow(start: usize, end: usize, at: usize, context: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    let (rva, ret, bytes) = RUN_COUNT;
+    if at != start + rva || at + bytes.len() > end
+        // SAFETY: the range lies within the mapped title image.
+        || unsafe { core::slice::from_raw_parts(at as *const u8, bytes.len()) } != bytes
+        || unsafe { *((start + ret) as *const u8) } != 0xc3
+    {
+        return false;
+    }
+    context.Rax = u64::from((context.Rax as u32).wrapping_add(1));
+    context.Rip = (start + ret) as u64;
+    true
+}
+
 fn log(line: String) {
     crate::diagnostics::log_once(&Once::new(), || line);
 }
@@ -105,6 +126,15 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rip = context.Rip as usize;
     if !(start..end).contains(&rip) {
         return CONTINUE_SEARCH;
+    }
+    if !enabled() && run_count_overflow(start, end, rip, context) {
+        let hits = record(&ASSERTS, rip - start);
+        if hits.is_power_of_two() {
+            crate::diagnostics::log_once(&Once::new(), || {
+                format!("closed tile-run count past the page table at RVA {:#x} (hit {hits})", rip - start)
+            });
+        }
+        return CONTINUE_EXECUTION;
     }
     if !enabled() {
         if !recoverable(start, end, rip) {
