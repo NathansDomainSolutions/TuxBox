@@ -1647,7 +1647,17 @@ impl<'a> Emitter<'a> {
                 .and_then(|r| {
                     let recovered = tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 })?;
                     (recovered.descriptors == r.static_samplers).then_some(recovered.sites)
-                }).unwrap_or_default(),
+                })
+                // Root-less programs that declare several samplers: the literal words cannot
+                // be matched to the title's registers here, so use the private slots that
+                // inline_sampler::sites derives from the ISA alone (space 32765). The runtime
+                // appends the same descriptors to the host root signature.
+                .or_else(|| (ex.root_sig.is_none()
+                    && ex.resources.iter().filter(|r| r.res_type == 1).count() > 1)
+                    .then(|| tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 }))
+                    .flatten()
+                    .map(|recovered| recovered.sites))
+                .unwrap_or_default(),
             binding_spaces: BTreeMap::new(),
             mesh_bindings: None,
             compute_derivatives: false,
@@ -1808,6 +1818,14 @@ impl<'a> Emitter<'a> {
             if let Some((kind, register, space)) = self.uncovered_fssm_descriptor(sgpr, offset) {
                 return Ok((Some(kind), register, space));
             }
+            // Raster roots can omit console table slots entirely (PS_Composite reads s9 +
+            // 0x540 past a 7-range table). Name the register the FSSM row and PSV agree on;
+            // the runtime builds the host table from the same rows.
+            if self.ex.stage != Stage::Compute {
+                if let Some(found) = self.fssm_descriptor(sgpr, offset, stride) {
+                    return Ok(found);
+                }
+            }
         }
         Err(format!("unmapped descriptor at s{sgpr} + {offset:#x}"))
     }
@@ -1818,7 +1836,14 @@ impl<'a> Emitter<'a> {
     /// load only when exactly one row sits at this SGPR and offset and exactly one PSV
     /// binding of the matching class names its register.
     fn rootless_fssm_descriptor(&self, sgpr: u8, offset: u32, stride: u32) -> Option<(Option<u32>, u32, u32)> {
-        if self.ex.root_sig.is_some() || stride != 32 || offset % 32 != 0 {
+        if self.ex.root_sig.is_some() {
+            return None;
+        }
+        self.fssm_descriptor(sgpr, offset, stride)
+    }
+
+    fn fssm_descriptor(&self, sgpr: u8, offset: u32, stride: u32) -> Option<(Option<u32>, u32, u32)> {
+        if stride != 32 || offset % 32 != 0 {
             return None;
         }
         let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?.filter(|&[class, pos, _, _, loc]| {
