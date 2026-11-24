@@ -48,7 +48,7 @@ impl Packet {
 #[derive(Default)]
 pub(super) struct Prefix {
     pending: Vec<Packet>,
-    in_body: bool,
+    pub(super) in_body: bool,
     pub(super) segments: Vec<Arc<Segment>>,
 }
 
@@ -134,8 +134,8 @@ pub(super) unsafe extern "system" fn wait_value64(
     target: u64,
     flags: u32,
 ) {
-    super::probe_write("wait_value64", address, format_args!("target={target:#x} comparison={comparison} flags={flags} type={}",
-        unsafe { list.native.GetType() }.0));
+    super::probe_write("wait", address, format_args!("target={target:#x} flags={flags} type={} in_body={}",
+        unsafe { list.native.GetType() }.0, recording(list).prefix.in_body));
     let mut state = recording(list);
     if !state.ensure_open(&list.native) {
         return;
@@ -225,6 +225,7 @@ impl Worker {
                                 let line = format!("GPU memory wait stalled 5 s: guest {:#x} value {current:#x} < target {:#x}",
                                     word.guest, job.segment.target);
                                 crate::diagnostics::log_once(&std::sync::Once::new(), || line);
+                                super::dump_probes();
                             }
                             std::thread::sleep(Duration::from_millis(1));
                         }

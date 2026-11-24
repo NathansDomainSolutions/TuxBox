@@ -73,6 +73,8 @@ pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
     if mode == 0 {
+        super::probe_write("value", address, format_args!("value={arg:#x} flags={flags:#x} type={} in_body={}",
+            unsafe { list.native.GetType() }.0, state.prefix.in_body));
         let result = (|| -> windows::core::Result<()> {
             if address == 0 || !address.is_multiple_of(8) || flags & !0x800 != 0 { return Err(E_INVALIDARG.into()); }
             let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };

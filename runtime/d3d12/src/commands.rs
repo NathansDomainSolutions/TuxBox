@@ -1100,12 +1100,20 @@ unsafe extern "system" fn execute_indirect(
     }
 }
 
-// LOCAL diagnostic: report GPU writes aimed at the guest words a stalled
-// memory wait watches (around 0x4f8f000 in GTA VI 1.0.2.1).
+// LOCAL diagnostic: keep the last GPU writes/waits aimed at the guest words a
+// stalled memory wait watches (around 0x4f8f000 in GTA VI 1.0.2.1); a stall
+// dumps them.
+static PROBES: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
 pub(super) fn probe_write(kind: &str, address: u64, detail: std::fmt::Arguments<'_>) {
-    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if (0x4f80000..0x4fa0000).contains(&address) && COUNT.fetch_add(1, Ordering::Relaxed) < 48 {
-        let line = format!("probe: {kind} at {address:#x} {detail}");
+    if !(0x4f80000..0x4fa0000).contains(&address) { return; }
+    let mut ring = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+    if ring.len() >= 96 { ring.pop_front(); }
+    ring.push_back(format!("{kind} {address:#x} {detail} tid={}", unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }));
+}
+pub(crate) fn dump_probes() {
+    let ring = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+    for line in ring.iter() {
+        let line = format!("probe: {line}");
         crate::diagnostics::log_once(&std::sync::Once::new(), || line);
     }
 }
