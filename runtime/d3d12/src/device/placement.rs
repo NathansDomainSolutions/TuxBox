@@ -552,15 +552,26 @@ pub(crate) unsafe fn submit(
         return execute();
     }
     unique(textures);
-    for writer in writes.iter() {
-        if textures
-            .iter()
-            .any(|t| !Arc::ptr_eq(writer, t) && overlaps(&writer.range(), &t.range()))
-        {
-            crate::diagnostics::recording_error(format_args!(
-                "overlapping placed texture layouts in one GPU write batch"
-            ));
-            return Err(E_NOTIMPL.into());
+    // LOCAL: RAGE aliases transient targets in the same memory within one
+    // batch. Each alias has its own host image, so run the batch and leave the
+    // aliasing textures out of CPU coherence instead of rejecting the queue.
+    let aliased: Vec<Arc<Texture>> = textures
+        .iter()
+        .filter(|t| {
+            writes.iter().any(|w| !Arc::ptr_eq(w, t) && overlaps(&w.range(), &t.range()))
+                || (writes.iter().any(|w| Arc::ptr_eq(w, t))
+                    && textures.iter().any(|o| !Arc::ptr_eq(o, t) && overlaps(&o.range(), &t.range())))
+        })
+        .cloned()
+        .collect();
+    if !aliased.is_empty() {
+        static ALIASED: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&ALIASED, || format!(
+            "aliased placed textures in one GPU write batch ({}); left out of CPU coherence", aliased.len()));
+        textures.retain(|t| !aliased.iter().any(|a| Arc::ptr_eq(a, t)));
+        writes.retain(|t| !aliased.iter().any(|a| Arc::ptr_eq(a, t)));
+        if textures.is_empty() {
+            return execute();
         }
     }
 
@@ -589,10 +600,10 @@ pub(crate) unsafe fn submit(
             .filter(|w| overlaps(&texture.range(), &w.range))
         {
             if Arc::as_ptr(texture) != write.texture.as_ptr() {
-                crate::diagnostics::recording_error(format_args!(
-                    "placed texture layout alias before GPU write publication"
-                ));
-                return Err(E_NOTIMPL.into());
+                // LOCAL: an alias of a pending GPU write. Wait for that write's
+                // publication, then treat this image as current.
+                static ALIAS: std::sync::Once = std::sync::Once::new();
+                crate::diagnostics::log_once(&ALIAS, || "placed texture alias before GPU write publication; waiting on it".into());
             }
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.

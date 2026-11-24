@@ -436,6 +436,7 @@ unsafe extern "system" fn reset(
 
 unsafe extern "system" fn close(list: &List) -> HRESULT {
     let mut state = recording(list);
+    let mut native_closed = true;
     match state.phase {
         ListState::Closed => return E_FAIL,
         ListState::Fresh(..) => {} // The initial empty recording is already closed on the host.
@@ -443,6 +444,7 @@ unsafe extern "system" fn close(list: &List) -> HRESULT {
             if let Err(error) = state.prefix.finish(&list.native) { state.error = error.code(); }
             if let Err(error) = unsafe { list.native.Close() } {
                 state.error = error.code();
+                native_closed = false;
             }
         }
     }
@@ -452,6 +454,11 @@ unsafe extern "system" fn close(list: &List) -> HRESULT {
             "graphics command list Close rejected {:#010x} (list {list:p}, guest caller {:#x})",
             state.error.0, crate::survey::title_rva().unwrap_or(0),
         ));
+    }
+    // LOCAL: a recording error leaves a valid native list without the failed
+    // commands; execute submits it. Report success so the title continues.
+    if state.error.is_err() && native_closed {
+        return S_OK;
     }
     state.error
 }
@@ -1329,10 +1336,21 @@ unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut c_void, fr
             .ok_or(E_INVALIDARG)?;
             let state = recording(list);
             if !matches!(state.phase, ListState::Closed)
-                || state.error.is_err()
                 || unsafe { list.native.GetType() } != queue.state.kind
             {
                 return Err(E_INVALIDARG);
+            }
+            if state.error.is_err() {
+                // LOCAL: the native list holds every command except the ones
+                // that failed to record. Submit it rather than rejecting the
+                // batch and poisoning the queue for the rest of the session.
+                static PARTIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = PARTIAL.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    let code = state.error.0;
+                    crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+                        "submitted a command list with a recording error {code:#010x} ({n} so far)"));
+                }
             }
             // A descriptor write after Close can exhaust the map's native
             // heap. Never submit an indexed access with an unpublished entry.
