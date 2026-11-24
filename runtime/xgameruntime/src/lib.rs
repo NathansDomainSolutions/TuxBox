@@ -230,6 +230,13 @@ static THREAD_OBJECT: Object = Object {
     references: AtomicU32::new(0),
 };
 
+// Probe: XSystem slot 5 is unmapped. Log its arguments so the signature can be
+// identified before implementing it (device type, per RAGE's "Anaconda" line).
+unsafe extern "system" fn system_probe_5(_: &Object, a: usize, b: usize, c: usize) -> i32 {
+    report(format_args!("probe XSystem slot 5 args {a:#x} {b:#x} {c:#x}"));
+    NOT_IMPLEMENTED
+}
+
 // XSystemGetXboxLiveSandboxId on a host without a provisioned Xbox Live sandbox.
 unsafe extern "system" fn sandbox_id(
     _: &Object,
@@ -263,6 +270,7 @@ static SYSTEM_TABLE: [Slot; 32] = {
     slots[2] = slot!(release);
     slots[3] = slot!(services::system_console_id);
     slots[4] = slot!(sandbox_id);
+    slots[5] = slot!(system_probe_5);
     slots
 };
 static SYSTEM_OBJECT: Object = Object {
