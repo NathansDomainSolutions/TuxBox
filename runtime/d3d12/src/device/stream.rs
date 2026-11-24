@@ -241,6 +241,8 @@ unsafe fn create(
         super::compute_table::capture_stage_root(pixel, root);
     }
     let mut rooted = [None, None];
+    // Set when the host pipeline gets a reflected root instead of the guest's.
+    let mut reflected_root = false;
     if let Some(root) = guest_root && original[0].is_some() && original[1].is_some()
         && (root_record.is_none() || original[2..].iter().any(Option::is_some))
     {
@@ -257,6 +259,7 @@ unsafe fn create(
         let root = match layout {
             TableLayout::Original => Some(root),
             TableLayout::Reflected(table) => {
+                reflected_root = true;
                 unsafe { field.write(table.native.as_raw()) };
                 Some(&pipeline.raster_table.insert(table).layout)
             }
@@ -273,8 +276,31 @@ unsafe fn create(
             }
         }
     }
+    // A root-less stage under the guest's own root may encode its static
+    // samplers as inline words. Offer the root's samplers to the translator,
+    // falling back to the plain request when that variant is refused.
+    let mut sampler_sources: [Option<Vec<u8>>; 2] = [None, None];
+    let mut sampler_compiled: [Option<Vec<u8>>; 2] = [None, None];
+    if let Some(root) = guest_root.filter(|_| !reflected_root) {
+        for i in 0..2 {
+            if rooted[i].is_none() && let Some((code, _)) = original[i]
+                && let Some(source) = shader_cache::raster_with_samplers(code, root.payload())
+                && let Some(compiled) = shader_cache::prepared(&source)
+            {
+                sampler_sources[i] = Some(source);
+                sampler_compiled[i] = Some(compiled);
+            }
+        }
+    }
     for (i, variant) in rooted.iter().enumerate() {
         let Some((code, _)) = original[i] else { continue; };
+        if let (Some(compiled), Some(source)) = (sampler_compiled[i].take(), sampler_sources[i].as_deref()) {
+            let target = fields[i].ok_or(E_INVALIDARG)?;
+            unsafe { target.write(rectangle::bytecode(&compiled)) };
+            original[i] = Some((source, Some(stages.len())));
+            stages.push(compiled);
+            continue;
+        }
         let source = variant.as_deref().unwrap_or(code);
         let Some(compiled) = shader_cache::prepared(source) else {
             if variant.is_some() { return Err(E_NOTIMPL.into()); }

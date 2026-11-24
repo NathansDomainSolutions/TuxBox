@@ -629,6 +629,7 @@ fn heap_extract(rows: &[[u32; 5]], flags: u32, isa: &[u8]) -> crate::ShaderExtra
             num_static_samplers: 0,
             static_samplers: Vec::new(),
         }),
+        pipeline_samplers: Vec::new(),
     }
 }
 
