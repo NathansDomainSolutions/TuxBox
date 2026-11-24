@@ -1244,8 +1244,6 @@ unsafe extern "system" fn reset_extended(list: &List, allocator: *mut c_void, in
 
 // Device11 titles use the new raster-state slots even when requesting the
 // base graphics-list IID. The List6-only cache barriers remain separate.
-// Device11 titles use the new raster-state slots even when requesting the
-// base graphics-list IID. The List6-only cache barriers remain separate.
 // GTA VI (Device11) also calls copy_resource at 86, dispatch_mesh at 129 and
 // the enhanced barrier at 148 (two above their base slots), while reset at 139
 // stays in place, so only the observed slots are added.
