@@ -231,7 +231,7 @@ pub(super) unsafe extern "system" fn copy(
         return;
     }
     let Some(host) = &list.state.raytracing else {
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     let Some(owner) = &list.parent else {

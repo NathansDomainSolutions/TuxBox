@@ -79,7 +79,7 @@ unsafe extern "system" fn barriers(list: &List, count: u32, input: *const D3D12_
         return;
     }
     let Some(media) = state.media.as_mut() else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let guest = unsafe { slice::from_raw_parts(input, count as usize) };
@@ -140,7 +140,7 @@ unsafe extern "system" fn copy(
         return;
     };
     let Some(media) = state.media.as_mut() else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     if let Err(error) = unsafe { record_copy(list, media, dst, [x, y, z], src, region.as_ref()) } {

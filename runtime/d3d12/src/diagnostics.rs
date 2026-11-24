@@ -330,7 +330,8 @@ pub(crate) mod display {
     }
 
     pub(crate) fn capture_draws() -> bool {
-        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref() == Some(std::ffi::OsStr::new("1")));
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("TUXBOX_CAPTURE_DRAW_READBACK").as_deref() == Some(std::ffi::OsStr::new("1"))
+            || crate::present::redirect::enabled());
         *ON
     }
     use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -362,7 +363,10 @@ pub(crate) mod display {
     static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
     pub(crate) fn mark_resource(native: *mut core::ffi::c_void) {
-        if enabled() { RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize); }
+        RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(native as usize);
+    }
+    pub(crate) fn is_display_any(native: *mut core::ffi::c_void) -> bool {
+        RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
     }
     pub(crate) fn is_display(native: *mut core::ffi::c_void) -> bool {
         enabled() && RESOURCES.lock().unwrap_or_else(|e| e.into_inner()).contains(&(native as usize))
@@ -392,6 +396,15 @@ pub(crate) mod display {
     /// Report each distinct (null compute shader, group count) dispatch once.
     pub(crate) fn null_dispatch(native: *mut core::ffi::c_void, groups: [u32; 3]) {
         if !enabled() { return; }
+        {
+            static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = PROBES.fetch_add(1, Ordering::Relaxed);
+            if matches!(n, 0 | 100 | 1000 | 10000) {
+                let map = NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner());
+                let (size, hit) = (map.len(), map.contains_key(&(native as usize)));
+                super::log_once(&std::sync::Once::new(), || format!("dispatch probe #{n}: pso={:#x} null map={size} hit={hit}", native as usize));
+            }
+        }
         let Some(digest) = NULL_COMPUTE.lock().unwrap_or_else(|e| e.into_inner()).get(&(native as usize)).cloned() else { return };
         let mut seen = NULL_DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
         if seen.len() < 120 && seen.insert((native as usize, groups)) {
@@ -438,5 +451,16 @@ mod tests {
         assert_eq!(seen.sight("c"), Sighting::Full);
         assert_eq!(seen.sight("d"), Sighting::Repeat);
         assert_eq!(seen.sight("b"), Sighting::Repeat);
+    }
+}
+
+/// Log the first E_INVALIDARG raised at each command-list site.
+pub(crate) fn invalid_site(file: &'static str, line: u32) {
+    static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&(file, line)) {
+        seen.push((file, line));
+        let rva = crate::survey::title_rva().unwrap_or(0);
+        log_once(&Once::new(), || format!("command list error at {file}:{line} title RVA {rva:#x}"));
     }
 }

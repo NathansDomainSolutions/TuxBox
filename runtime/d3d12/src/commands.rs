@@ -99,7 +99,7 @@ impl Recording {
             return;
         }
         if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<true>() {
-            self.error = E_NOTIMPL;
+            { crate::invalid_site!(); self.error = E_NOTIMPL };
             return;
         }
         if let Err(error) = self.bindings.refresh_inline_tables::<true>(self.descriptor_arena.as_deref()) {
@@ -169,7 +169,7 @@ impl Recording {
             }
         };
         if let Some(table) = self.bindings.reflected_table::<false>() {
-            if self.stencil_slot.is_some() { self.error = E_NOTIMPL; return; }
+            if self.stencil_slot.is_some() { { crate::invalid_site!(); self.error = E_NOTIMPL }; return; }
             if let Some(binding) = table.index_map {
                 // These PSOs have one descriptor table followed by one root
                 // constants parameter. The native ISA selects its scalar
@@ -178,9 +178,9 @@ impl Recording {
                     .and_then(|word| self.resource_heap.as_ref()?.scalar_descriptor(
                         word & binding.scalar_mask, self.descriptor_arena.as_deref(),
                     ));
-                let Some(descriptor) = descriptor else { self.error = E_INVALIDARG; return };
+                let Some(descriptor) = descriptor else { { crate::invalid_site!(); self.error = E_INVALIDARG }; return };
                 if self.scalar_descriptors.try_reserve(1).is_err() {
-                    self.error = E_OUTOFMEMORY;
+                    { crate::invalid_site!(); self.error = E_OUTOFMEMORY };
                     return;
                 }
                 self.scalar_descriptors.insert(descriptor);
@@ -188,7 +188,7 @@ impl Recording {
                     && !self.indexed_arenas.iter().any(|used| Arc::ptr_eq(used, arena))
                 {
                     if self.indexed_arenas.try_reserve(1).is_err() {
-                        self.error = E_OUTOFMEMORY;
+                        { crate::invalid_site!(); self.error = E_OUTOFMEMORY };
                         return;
                     }
                     self.indexed_arenas.push(arena.clone());
@@ -208,7 +208,7 @@ impl Recording {
             return;
         }
         if self.descriptor_arena.is_some() && !self.bindings.supports_paged_draw::<false>() {
-            self.error = E_NOTIMPL;
+            { crate::invalid_site!(); self.error = E_NOTIMPL };
             return;
         }
         if let Err(error) = self.bindings.refresh_inline_tables::<false>(self.descriptor_arena.as_deref()) {
@@ -263,6 +263,17 @@ impl Recording {
 
     fn ensure_open(&mut self, native: &ID3D12GraphicsCommandList) -> bool {
         if self.error.is_err() {
+            if crate::diagnostics::display::enabled() {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static DROPPED: AtomicU32 = AtomicU32::new(0);
+                let n = DROPPED.fetch_add(1, Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    let code = self.error.0;
+                    let rva = crate::survey::title_rva().unwrap_or(0);
+                    crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+                        "dropped command on errored list #{n} error={code:#010x} title RVA {rva:#x}"));
+                }
+            }
             return false;
         }
         match &self.phase {
@@ -276,7 +287,7 @@ impl Recording {
                 self.phase = ListState::Open;
             }
             ListState::Open => {}
-            ListState::Closed => self.error = E_FAIL,
+            ListState::Closed => { crate::invalid_site!(); self.error = E_FAIL },
         }
         self.error.is_ok()
     }
@@ -528,7 +539,7 @@ unsafe extern "system" fn transition(
         return;
     }
     if barriers.is_null() {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     // The guest supplies count readable barriers. Read a transition payload
@@ -736,14 +747,14 @@ unsafe extern "system" fn flush_texture_cache(list: &List, mask: u32, address: u
         crate::diagnostics::recording_error(format_args!(
             "texture cache flush mask {mask:#x} address {address:#x} bytes {bytes:#x}"
         ));
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     }
     if address.checked_add(bytes).is_none() {
         crate::diagnostics::recording_error(format_args!(
             "overflowing texture cache flush address {address:#x} bytes {bytes:#x}"
         ));
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     if address != 0 || bytes != 0xff_ffff_ff00 {
@@ -765,7 +776,7 @@ unsafe extern "system" fn extended_cache_barrier(
         return;
     }
     if address.checked_add(bytes).is_none() {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     global_cache_barrier(list, &mut state);
@@ -778,7 +789,7 @@ fn global_cache_barrier(list: &List, state: &mut Recording) {
         .get_or_init(|| enhanced_barriers(&list.native))
     else {
         crate::diagnostics::recording_error(format_args!("enhanced global barriers unavailable"));
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     let barrier = D3D12_GLOBAL_BARRIER {
@@ -810,7 +821,7 @@ unsafe extern "system" fn clear_rtv(
         return;
     }
     if handle.ptr == 0 || color.is_null() || (count != 0 && rects.is_null()) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     crate::diagnostics::display::clear(handle.ptr);
@@ -847,11 +858,11 @@ unsafe extern "system" fn discard(
         return;
     }
     let Some(resource) = (unsafe { device::resource_proxy(object, parent(&list.parent)) }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     if (unsafe { region.as_ref() }).is_some_and(|r| r.NumRects != 0 && r.pRects.is_null()) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     // CPU-backed read-only textures acquire their contents at submission.
@@ -921,7 +932,7 @@ unsafe extern "system" fn copy_texture(
     }
     if flags != 0 {
         crate::diagnostics::recording_error(format_args!("CopyTextureRegion flags {flags:#x}"));
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     }
     let device = parent(&list.parent);
@@ -930,7 +941,7 @@ unsafe extern "system" fn copy_texture(
             copy_location(src, device)
         })
     else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     if let Err(error) = state.prepare_copy(destination, source) {
@@ -967,7 +978,7 @@ unsafe extern "system" fn copy_resource(
         crate::diagnostics::recording_error(format_args!(
             "slot 84 CopyResource options {options:#x}"
         ));
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     }
     let owner = parent(&list.parent);
@@ -976,7 +987,7 @@ unsafe extern "system" fn copy_resource(
     let (Some(dst), Some(src)) = (unsafe { device::resource_proxy(dst, owner) }, unsafe {
         device::resource_proxy(src, owner)
     }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     crate::diagnostics::display::copy(dst.native.as_raw());
@@ -986,7 +997,7 @@ unsafe extern "system" fn copy_resource(
         let (from, other) = src.state.buffer_window().unwrap_or((0, s.Width));
         if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || s.Dimension != d.Dimension || size != other
             || (dst.native == src.native && to < from + size && from < to + size) {
-            state.error = E_INVALIDARG;
+            { crate::invalid_site!(); state.error = E_INVALIDARG };
             return;
         }
         unsafe { list.native.CopyBufferRegion(&dst.native, to, &src.native, from, size) };
@@ -1001,7 +1012,7 @@ unsafe extern "system" fn copy_resource(
         // block-compressed and uncompressed textures. Leave those to the driver.
         || (d.Format == s.Format && (d.Width != s.Width || d.Height != s.Height))
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     if let Err(error) = state.prepare_copy(dst.state.placed(), src.state.placed()) {
@@ -1040,20 +1051,20 @@ unsafe extern "system" fn execute_indirect(
         unsafe { device::indirect::signature(signature, owner) },
         unsafe { device::resource_proxy(arguments, owner) },
     ) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let bytes = u64::from(signature.state.stride) * u64::from(max_count);
     let Some(argument_offset) = compute::buffer_offset(arguments, argument_offset, bytes) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let (count, count_offset) = if count_buffer.is_null() { (None, count_offset) } else {
-        let Some(buffer) = (unsafe { device::resource_proxy(count_buffer, owner) }) else { state.error = E_INVALIDARG; return; };
-        let Some(offset) = compute::buffer_offset(buffer, count_offset, 4) else { state.error = E_INVALIDARG; return; };
+        let Some(buffer) = (unsafe { device::resource_proxy(count_buffer, owner) }) else { { crate::invalid_site!(); state.error = E_INVALIDARG }; return; };
+        let Some(offset) = compute::buffer_offset(buffer, count_offset, 4) else { { crate::invalid_site!(); state.error = E_INVALIDARG }; return; };
         (Some(&buffer.native), offset)
     };
-    if !(argument_offset | count_offset).is_multiple_of(4) { state.error = E_INVALIDARG; return; }
+    if !(argument_offset | count_offset).is_multiple_of(4) { { crate::invalid_site!(); state.error = E_INVALIDARG }; return; }
     let execute = || unsafe {
         list.native.ExecuteIndirect(
             &signature.native,
@@ -1087,7 +1098,7 @@ unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, fl
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
     if address == 0 || !address.is_multiple_of(4) || flags != 0 || reserved != 0 {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     let result = (|| -> windows::core::Result<()> {
@@ -1512,7 +1523,12 @@ unsafe fn present_planes(
             return E_NOTIMPL;
         }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    let redirected = crate::present::redirect::source(&source);
+    if redirected.is_some() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&FIRST, || "presenting the title's full-size render target in place of the display surface".into());
+    }
+    let result = queue.state.presentation.present(&queue.native, redirected.as_ref().unwrap_or(&source));
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.
     unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };

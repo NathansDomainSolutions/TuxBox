@@ -41,7 +41,7 @@ pub(super) unsafe extern "system" fn constants<const COMPUTE: bool>(
         return;
     }
     if data.is_null() || offset.checked_add(count).is_none_or(|end| end > 64) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     // SAFETY: the caller supplies count readable DWORDs for this command.
@@ -86,7 +86,7 @@ pub(super) unsafe extern "system" fn async_compute_budget(list: &List, budget: *
     }
     // SAFETY: the Xbox caller supplies a readable 24-byte record for this call.
     let Some(budget) = (unsafe { budget.as_ref() }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     // SetAsyncComputeBudgetInternal passes six zero DWORDs at RVA 0x5765a97.
@@ -95,7 +95,7 @@ pub(super) unsafe extern "system" fn async_compute_budget(list: &List, budget: *
         crate::diagnostics::recording_error(format_args!(
             "nonzero asynchronous compute budget {budget:02x?}"
         ));
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     }
     static FIRST: std::sync::Once = std::sync::Once::new();
@@ -110,7 +110,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
         return;
     }
     if x.max(y).max(z) > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     if let Some(super::compute_bindings::Pipeline::Regular(pso, ..)) = &state.bindings.pipeline {
@@ -160,11 +160,11 @@ pub(super) unsafe extern "system" fn copy_buffer(
     let (Some(dst), Some(src)) = (unsafe { device::resource_proxy(dst, owner) }, unsafe {
         device::resource_proxy(src, owner)
     }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let (Some(dst_offset), Some(src_offset)) = (buffer_offset(dst, dst_offset, bytes), buffer_offset(src, src_offset, bytes)) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     // SAFETY: both native buffers belong to the list and contain the requested range.

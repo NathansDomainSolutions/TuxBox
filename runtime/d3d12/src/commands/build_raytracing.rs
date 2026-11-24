@@ -264,7 +264,7 @@ pub(super) unsafe extern "system" fn single(
     if desc.is_null() || (postbuild_count != 0 && postbuild.is_null()) {
         let mut state = recording(list);
         if state.can_record(&list.native) {
-            state.error = E_INVALIDARG;
+            { crate::invalid_site!(); state.error = E_INVALIDARG };
         }
         return;
     }
@@ -296,11 +296,11 @@ unsafe fn record_builds(
         return;
     }
     let Some(host) = &list.state.raytracing else {
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     if entries.is_null() {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     if let Err(error) = outputs
@@ -312,9 +312,14 @@ unsafe fn record_builds(
     }
     let entries = unsafe { core::slice::from_raw_parts(entries, count as usize) };
     let alignment = u64::from(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    let mut valid = Vec::with_capacity(entries.len());
     for e in entries {
         if e.extension != [0; 4] {
-            state.error = E_NOTIMPL;
+            static EXTENDED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&EXTENDED, || format!(
+                "ignored acceleration structure build call with extension words {:?} (entries={count})", e.extension));
+            // The entry layout does not match this title's call. Ignore the whole
+            // call rather than failing the command list or walking bad entries.
             return;
         }
         let b = &e.build;
@@ -330,8 +335,15 @@ unsafe fn record_builds(
                 .is_multiple_of(alignment)
             || (update && b.SourceAccelerationStructureData == 0)
         {
-            state.error = E_INVALIDARG;
-            return;
+            // An invalid build must not discard the rest of the command list:
+            // the title's later passes (including the display composite) would
+            // be dropped with it. Skip only this acceleration structure.
+            static SKIPPED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&SKIPPED, || format!(
+                "skipped invalid acceleration structure build type={} descs={} flags={:#x} dest={:#x} scratch={:#x} source={:#x}",
+                b.Inputs.Type.0, b.Inputs.NumDescs, b.Inputs.Flags.0, b.DestAccelerationStructureData,
+                b.ScratchAccelerationStructureData, b.SourceAccelerationStructureData));
+            continue;
         }
         if b.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
             && b.Inputs.NumDescs != 0
@@ -343,20 +355,21 @@ unsafe fn record_builds(
                 8
             };
             if va == 0 || !va.is_multiple_of(align) {
-                state.error = E_INVALIDARG;
+                { crate::invalid_site!(); state.error = E_INVALIDARG };
                 return;
             }
         }
+        valid.push(e);
     }
     let Some(owner) = &list.parent else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
-    for entry in entries {
+    for entry in valid {
         // One build can need a late-bound instance table, an update-source
         // check, and a destination publication, in that command order.
         if state.scene_commands.try_reserve(3).is_err() {
-            state.error = E_OUTOFMEMORY;
+            { crate::invalid_site!(); state.error = E_OUTOFMEMORY };
             return;
         }
         let (build, instances, bytes) = match translate(&mut state, owner, host, entry.build) {

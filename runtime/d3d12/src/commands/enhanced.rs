@@ -154,7 +154,7 @@ pub(super) unsafe extern "system" fn barrier(
         return;
     }
     if groups.is_null() {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     let Some(native) = list
@@ -162,7 +162,7 @@ pub(super) unsafe extern "system" fn barrier(
         .enhanced_barriers
         .get_or_init(|| enhanced_barriers(&list.native))
     else {
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     if let Err(error) =

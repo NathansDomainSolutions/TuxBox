@@ -95,7 +95,7 @@ pub(super) unsafe extern "system" fn bind_heaps(
         return;
     }
     if count > 2 || (count != 0 && heaps.is_null()) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     let guest = if count == 0 {
@@ -110,12 +110,12 @@ pub(super) unsafe extern "system" fn bind_heaps(
     let mut descriptor_arena = None;
     for (index, &object) in guest.iter().enumerate() {
         let Some(heap) = (unsafe { device::descriptor_heap(object, parent(&list.parent)) }) else {
-            state.error = E_INVALIDARG;
+            { crate::invalid_site!(); state.error = E_INVALIDARG };
             return;
         };
         let desc = &heap.state.desc;
         if desc.Flags != D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE || previous == Some(desc.Type) {
-            state.error = E_INVALIDARG;
+            { crate::invalid_site!(); state.error = E_INVALIDARG };
             return;
         }
         if let Some(views) = &heap.state.placed_views {

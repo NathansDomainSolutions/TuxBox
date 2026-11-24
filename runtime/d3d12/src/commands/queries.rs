@@ -18,12 +18,12 @@ pub(super) unsafe extern "system" fn query<const BEGIN: bool>(
     }
     let heap = unsafe { range(object, parent(&list.parent), kind, index, 1) };
     let Some((heap, _)) = heap else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     if BEGIN {
         if kind == D3D12_QUERY_TYPE_TIMESTAMP {
-            state.error = E_INVALIDARG;
+            { crate::invalid_site!(); state.error = E_INVALIDARG };
             return;
         }
         unsafe { list.native.BeginQuery(heap, kind, index) };
@@ -49,14 +49,14 @@ pub(super) unsafe extern "system" fn resolve(
     let heap = unsafe { range(object, owner, kind, start, count) };
     let dst = unsafe { resource_proxy(destination, owner) };
     let (Some((heap, stride)), Some(dst)) = (heap, dst) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let Some(offset) = super::compute::buffer_offset(dst, offset, u64::from(count) * stride) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
-    if !offset.is_multiple_of(8) { state.error = E_INVALIDARG; return; }
+    if !offset.is_multiple_of(8) { { crate::invalid_site!(); state.error = E_INVALIDARG }; return; }
     unsafe {
         list.native
             .ResolveQueryData(heap, kind, start, count, &dst.native, offset)

@@ -48,7 +48,7 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, guest: *mut c_void) {
             state.bindings.draw_trace = host.state.draw_trace.clone();
             unsafe { list.native.SetPipelineState(&host.native) };
         }
-        _ => state.error = E_INVALIDARG,
+        _ => { crate::invalid_site!(); state.error = E_INVALIDARG },
     }
 }
 
@@ -64,7 +64,7 @@ pub(super) unsafe extern "system" fn viewports(
     if count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
         || (count != 0 && views.is_null())
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     unsafe { (list.native.vtable().RSSetViewports)(list.native.as_raw(), count, views) };
@@ -78,7 +78,7 @@ pub(super) unsafe extern "system" fn scissors(list: &List, count: u32, rects: *c
     if count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
         || (count != 0 && rects.is_null())
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     unsafe { (list.native.vtable().RSSetScissorRects)(list.native.as_raw(), count, rects) };
@@ -98,7 +98,7 @@ pub(super) unsafe extern "system" fn targets(
         return;
     }
     if count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count != 0 && rtvs.is_null()) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     // CPU RTV descriptors are consumed by OMSetRenderTargets immediately.
@@ -116,6 +116,7 @@ pub(super) unsafe extern "system" fn targets(
         state.trace_target = if count == 1 {
             crate::diagnostics::display::draw_target(unsafe { (*rtvs).ptr })
         } else { None };
+        if let Some(target) = &state.trace_target { crate::present::redirect::bound(target); }
     }
     if crate::diagnostics::display::enabled() {
         // Contiguous ranges: the display target is bound alone in practice.
@@ -187,7 +188,7 @@ pub(super) unsafe extern "system" fn shading_rate(
         D3D12_SHADING_RATE_2X2 | D3D12_SHADING_RATE_2X4 | D3D12_SHADING_RATE_4X2 | D3D12_SHADING_RATE_4X4)
         || (!combiners.is_null() && unsafe { std::slice::from_raw_parts(combiners, 2) }.iter()
             .any(|op| !(0..=4).contains(&op.0))) {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     let native = match list.native.cast::<ID3D12GraphicsCommandList5>() {
@@ -207,7 +208,7 @@ pub(super) unsafe extern "system" fn force_shader_depth_order(list: &List, enabl
         return;
     }
     if enable > 1 || unsafe { list.native.GetType() } != D3D12_COMMAND_LIST_TYPE_DIRECT {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     static MODES: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
@@ -243,7 +244,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(list: &List, x: u32, y: u32, 
             D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_BUNDLE
         )
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     let Some(native) = list.state.mesh.get_or_init(|| list.native.cast().ok()) else {
@@ -288,7 +289,7 @@ pub(super) unsafe extern "system" fn vertex_buffers(
     if start > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT
         || count > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT - start
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     if views.is_null() || count == 0 {

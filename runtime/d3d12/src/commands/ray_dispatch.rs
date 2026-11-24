@@ -11,11 +11,11 @@ pub(super) unsafe extern "system" fn pipeline(list: &List, object: *mut c_void) 
         return;
     }
     let Some(host) = &list.state.raytracing else {
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     let Some(native) = (unsafe { crate::device::ray_state(object, parent(&list.parent)) }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     state.bindings.pipeline = Some(super::compute_bindings::Pipeline::Ray(native.clone()));
@@ -33,11 +33,11 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DI
         return;
     }
     let Some(host) = &list.state.raytracing else {
-        state.error = E_NOTIMPL;
+        { crate::invalid_site!(); state.error = E_NOTIMPL };
         return;
     };
     let Some(desc) = (unsafe { desc.as_ref() }) else {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     };
     let table_alignment = u64::from(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
@@ -61,7 +61,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DI
                     || t.StrideInBytes > u64::from(D3D12_RAYTRACING_MAX_SHADER_RECORD_STRIDE))
         })
     {
-        state.error = E_INVALIDARG;
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
     state.sample_heap();
