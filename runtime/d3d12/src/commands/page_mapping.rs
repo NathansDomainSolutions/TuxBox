@@ -149,7 +149,7 @@ impl Mappings {
                 )
             };
             for import in overlaps {
-                unsafe {
+                let status = unsafe {
                     validate(
                         batches.len() as u32,
                         batches.as_ptr(),
@@ -158,8 +158,17 @@ impl Mappings {
                         import.start,
                         import.end,
                     )
+                };
+                // LOCAL HACK: streaming remaps pages under a pinned GPU import.
+                // Apply the CPU mapping anyway; that import keeps the old pages
+                // (stale GPU reads) instead of failing the title.
+                if status == E_NOTIMPL {
+                    static STALE: std::sync::Once = std::sync::Once::new();
+                    crate::diagnostics::log_once(&STALE, || format!(
+                        "page remap under pinned import {:#x}..{:#x} applied anyway", import.start, import.end));
+                    continue;
                 }
-                .ok()?;
+                status.ok()?;
             }
         }
         unsafe {
