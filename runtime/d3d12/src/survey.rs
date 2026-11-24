@@ -30,6 +30,7 @@ pub(crate) fn install() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         relax_hang_watchdog();
+        start_sampler();
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
         if enabled() {
             log(format!("survey mode active (assert handler installed: {})", !handle.is_null()));
@@ -68,6 +69,71 @@ fn relax_hang_watchdog() {
                 crate::diagnostics::log_once(&Once::new(), || format!("relaxed the title hang watchdog at RVA {:#x}", rva + branch));
             }
         }
+    }
+}
+
+/// LOCAL diagnostic: `TUXBOX_SAMPLE_AT=<seconds>` waits, then samples the two
+/// title threads with the most CPU time: their RIP and title return addresses
+/// found on the stack, eight times each, to locate spin-waits.
+fn start_sampler() {
+    let Some(delay) = std::env::var("TUXBOX_SAMPLE_AT").ok().and_then(|v| v.parse::<u64>().ok()) else { return };
+    let _ = std::thread::Builder::new().name("TuxBox sampler".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(delay));
+        loop {
+            sample_busy_threads();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+}
+
+fn sample_busy_threads() {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, ReadProcessMemory};
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadTimes, OpenThread, ResumeThread, SuspendThread, THREAD_ALL_ACCESS};
+    let Some((start, end)) = title_image() else { return };
+    let pid = unsafe { GetCurrentProcessId() };
+    let me = unsafe { GetCurrentThreadId() };
+    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else { return };
+    let mut entry = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
+    let mut times = Vec::new();
+    let mut ok = unsafe { Thread32First(snap, &mut entry) }.is_ok();
+    while ok {
+        if entry.th32OwnerProcessID == pid && entry.th32ThreadID != me {
+            if let Ok(h) = unsafe { OpenThread(THREAD_ALL_ACCESS, false, entry.th32ThreadID) } {
+                let (mut a, mut b, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+                if unsafe { GetThreadTimes(h, &mut a, &mut b, &mut k, &mut u) }.is_ok() {
+                    let t = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+                    times.push((t(k) + t(u), entry.th32ThreadID));
+                }
+                let _ = unsafe { CloseHandle(h) };
+            }
+        }
+        ok = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snap) };
+    times.sort_unstable_by(|a, b| b.cmp(a));
+    for &(cpu, tid) in times.iter().take(2) {
+        let Ok(h) = (unsafe { OpenThread(THREAD_ALL_ACCESS, false, tid) }) else { continue };
+        for round in 0..8 {
+            if unsafe { SuspendThread(h) } == u32::MAX { break; }
+            let mut ctx = CONTEXT { ContextFlags: CONTEXT_FULL_AMD64, ..Default::default() };
+            let got = unsafe { GetThreadContext(h, &mut ctx) }.is_ok();
+            let mut stack = [0u64; 512];
+            let mut read = 0usize;
+            if got {
+                let _ = unsafe { ReadProcessMemory(GetCurrentProcess(), ctx.Rsp as *const _, stack.as_mut_ptr().cast(), size_of_val(&stack), Some(&mut read)) };
+            }
+            let _ = unsafe { ResumeThread(h) };
+            if !got { break; }
+            let rel = |v: u64| if (start as u64..end as u64).contains(&v) { format!("+{:#x}", v - start as u64) } else { format!("{v:#x}") };
+            let returns: Vec<String> = stack[..read / 8].iter().filter(|&&v| (start as u64..end as u64).contains(&v)).take(14).map(|&v| rel(v)).collect();
+            let line = format!("sampler: tid {tid} cpu {}ms round {round}: rip {} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} stack [{}]",
+                cpu / 10_000, rel(ctx.Rip), ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, returns.join(" "));
+            crate::diagnostics::log_once(&Once::new(), || line);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let _ = unsafe { CloseHandle(h) };
     }
 }
 
