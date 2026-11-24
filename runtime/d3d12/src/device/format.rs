@@ -26,6 +26,7 @@ pub(crate) fn host_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
 pub(super) fn view_format(translated: bool, format: DXGI_FORMAT) -> DXGI_FORMAT {
     match format {
         DXGI_FORMAT_B4G4R4A4_UNORM if translated => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP if translated => DXGI_FORMAT_R11G11B10_FLOAT,
         other => host_format(other),
     }
 }
@@ -68,6 +69,13 @@ pub(super) fn substitute(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DE
         }
         DXGI_FORMAT_B4G4R4A4_UNORM if flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0 => {
             (DXGI_FORMAT_R8G8B8A8_UNORM, flags)
+        }
+        // Scarlett renders and writes shared-exponent HDR (Series S mode). The
+        // desktop format cannot be a target or UAV; R11G11B10 keeps 4 bytes
+        // per texel and an unsigned float range.
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP if flags
+            & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0 => {
+            (DXGI_FORMAT_R11G11B10_FLOAT, flags)
         }
         // Scarlett depth can also allow unordered access; the desktop image
         // keeps its format and depth usage. A UAV on it is reported at view creation.
