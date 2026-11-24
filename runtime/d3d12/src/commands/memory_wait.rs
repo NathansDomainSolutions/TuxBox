@@ -10,6 +10,8 @@ use windows::core::Result;
 
 pub(super) enum Packet {
     Marker(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER),
+    // A 64-bit value written after all preceding work (bottom of pipe).
+    Value([D3D12_WRITEBUFFERIMMEDIATE_PARAMETER; 2]),
     Timestamp(ID3D12QueryHeap, u32, ID3D12Resource, u64),
 }
 
@@ -20,6 +22,11 @@ impl Packet {
                 Self::Marker(write) => {
                     list.cast::<ID3D12GraphicsCommandList2>()?
                         .WriteBufferImmediate(1, write, None);
+                }
+                Self::Value(writes) => {
+                    let modes = [D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; 2];
+                    list.cast::<ID3D12GraphicsCommandList2>()?
+                        .WriteBufferImmediate(2, writes.as_ptr(), Some(modes.as_ptr()));
                 }
                 Self::Timestamp(heap, index, dest, offset) => {
                     list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *index);

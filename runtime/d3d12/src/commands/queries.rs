@@ -65,11 +65,27 @@ pub(super) unsafe extern "system" fn resolve(
 
 // A Series timestamp packet writes the queue clock directly to title memory.
 // Desktop D3D12 exposes the same clock through a timestamp query and resolve.
-pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg: u32, flags: u32, mode: u32) {
-    super::probe_write("timestamp_at", address, format_args!("arg={arg} flags={flags:#x} mode={mode}"));
+// Mode 0 writes the immediate value instead: GTA VI signals its cross-queue
+// frame counters this way (flags 0x800, bottom of pipe) and waits on them with
+// 64-bit memory waits.
+pub(super) unsafe extern "system" fn timestamp_at(list: &List, address: u64, arg: u64, flags: u32, mode: u32) {
     const SLOTS: u32 = 256;
     let mut state = recording(list);
     if !state.ensure_open(&list.native) { return; }
+    if mode == 0 {
+        let result = (|| -> windows::core::Result<()> {
+            if address == 0 || !address.is_multiple_of(8) || flags & !0x800 != 0 { return Err(E_INVALIDARG.into()); }
+            let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
+            if let Some(resource) = &resource { super::raytracing::retain(&state, &[resource])?; }
+            let writes = [
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu, Value: arg as u32 },
+                D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 4, Value: (arg >> 32) as u32 },
+            ];
+            state.prefix.push(&list.native, super::memory_wait::Packet::Value(writes))
+        })();
+        if let Err(error) = result { state.error = error.code(); }
+        return;
+    }
     let result = (|| -> windows::core::Result<()> {
         if arg != 0 || flags != 0 || mode != 1 || address == 0 || !address.is_multiple_of(8) { return Err(E_INVALIDARG.into()); }
         let (resource, gpu) = unsafe { crate::device::command_buffer_address(parent(&list.parent), address, 8)? };
