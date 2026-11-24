@@ -1294,7 +1294,8 @@ unsafe extern "system" fn execute_frame(
     // suppresses a hardware buffer switch and bit 1 chains indirect buffers.
     // The desktop queue owns its packet storage and takes the ordered list
     // array in one submission. The frame token labels that submission.
-    if queue.state.kind != D3D12_COMMAND_LIST_TYPE_DIRECT || flags & !3 != 0 {
+    // GTA VI also submits frames on its async compute queue with flags 0x3.
+    if flags & !3 != 0 {
         crate::diagnostics::recording_error(format_args!("extended command-list submission flags {flags:#x}"));
         reject(queue, E_NOTIMPL);
         return;
