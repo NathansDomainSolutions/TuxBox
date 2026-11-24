@@ -1586,7 +1586,12 @@ unsafe fn present_planes(
         if rect.is_some_and(|r| r.left != 0 || r.top != 0 || r.right as u64 != desc.Width || r.bottom as u32 != desc.Height)
             || destination.is_some_and(|r| *r != [0.0, 0.0, 1.0, 1.0])
             || full.color_space != 0 || full.remaining != [0; 7] || params.options != [0; 7] {
-            return E_NOTIMPL;
+            // LOCAL: present the whole surface anyway instead of dropping every
+            // in-world frame; log what was not honoured once.
+            static UNHONOURED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&UNHONOURED, || format!(
+                "present parameters not honoured: {}x{} source {rect:?} destination {destination:?} color {} remaining {:?} options {:?}",
+                desc.Width, desc.Height, full.color_space, full.remaining, params.options));
         }
     }
     let redirected = crate::present::redirect::source(&source);
