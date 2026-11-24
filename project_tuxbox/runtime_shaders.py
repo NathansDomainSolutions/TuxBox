@@ -10,7 +10,8 @@ import stat
 import struct
 import subprocess
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_first
 
 from .inspect import digest
 from .shader_prep import SOURCE_CACHE, ToolFailure, compiler_tools, has_dxil_container, run_tool
@@ -257,23 +258,30 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
                 report(f"Could not save ProjectScarlett shader requests for the next launch: {exc}")
                 archive = None
 
+    jobs = int(os.environ.get("TUXBOX_PREP_JOBS", 0)) or os.cpu_count() or 1
+    pool = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="shader")
+    lock = Lock()
+    inflight = set()
+    futures = set()
     while not stop.is_set():
         directory = session / "requests"
         requests = [*directory.glob("*.dxbc"), *directory.glob("*.link"), *directory.glob("*.stencil")]
-        if not requests:
+        if not requests and not futures:
             wait()
             continue
-        for source in requests:
-            if stop.is_set():
-                break
+        # Compile a batch in parallel: the guest blocks on each missing shader,
+        # and one DXC run can take many seconds.
+        def handle(source):
+            nonlocal tools, cache, refused, cached_refusals
             key = source.stem
             if not re.fullmatch(REQUEST_PATTERNS[source.suffix], key):
                 remove_request(source)
-                continue
+                return
             failed = False
             try:
-                if tools is None:
-                    tools, cache = bind_cache()
+                with lock:
+                    if tools is None:
+                        tools, cache = bind_cache()
                 if archive is None:
                     compiled = compile_request(source, key, tools, cache, session)
                 else:
@@ -282,10 +290,12 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
                     report(f"Compiled Xbox shader {key}")
             except ShaderRefused as exc:
                 failed = True
-                if exc.cached:
-                    cached_refusals += 1
-                else:
-                    refused += 1
+                with lock:
+                    if exc.cached:
+                        cached_refusals += 1
+                    else:
+                        refused += 1
+                if not exc.cached:
                     report(f"Xbox shader {key}: {exc}")
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 failed = True
@@ -294,6 +304,19 @@ def _serve_requests(session, stop, report, xshader, wait, archive):
                 remove_request(source)
                 if failed:
                     (session / (key + ".failed")).touch()
+
+        todo = [source for source in requests if source not in inflight]
+        inflight.update(todo)
+        for source in todo:
+            if stop.is_set():
+                break
+            futures.add(pool.submit(lambda s=source: (handle(s), inflight.discard(s))))
+        futures = {f for f in futures if not f.done()}
+        if len(futures) >= jobs:
+            wait_first(futures, return_when=FIRST_COMPLETED)
+        elif not todo:
+            wait()
+    pool.shutdown(wait=True)
     if refused or cached_refusals:
         report(f"Xbox shader worker: {refused} new unsupported translations, {cached_refusals} cached refusals")
 

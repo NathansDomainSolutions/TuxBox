@@ -55,7 +55,7 @@ def prepare_scarlett(executable, host):
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 return "failed", f"{source.name}: {exc}"
 
-        workers = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1))
+        workers = ThreadPoolExecutor(max_workers=int(os.environ.get("TUXBOX_PREP_JOBS", 0)) or os.cpu_count() or 1)
         try:
             pending = [workers.submit(compile_one, source) for source in sources]
             for completed, result in enumerate(as_completed(pending), 1):
