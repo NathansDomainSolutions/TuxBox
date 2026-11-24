@@ -1104,6 +1104,15 @@ unsafe extern "system" fn unknown_61(_list: &List, a: usize, b: u32, c: usize, d
     }
 }
 
+// LOCAL: Xbox list slot 129 (title 0x14555e799 tail call) takes (n, 1, 1)
+// like a dispatch. Not identified as compute or mesh yet; log and skip.
+unsafe extern "system" fn unknown_129(_list: &List, x: u32, y: u32, z: u32) {
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::diagnostics::log_once(&std::sync::Once::new(), || format!("list slot 129 skipped: ({x}, {y}, {z})"));
+    }
+}
+
 // Xbox list slot 62 (title RVA 0x979699): copy `bytes` CPU bytes into GPU memory
 // at `address`. The bytes are captured at record time, as the console embeds
 // them in the command buffer, and written in order with immediate writes.
@@ -1219,6 +1228,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[121] = crate::slot!(ray_dispatch::dispatch);
     slots[126] = crate::slot!(graphics::shading_rate);
     slots[127] = crate::slot!(graphics::dispatch_mesh);
+    slots[129] = crate::slot!(unknown_129);
     slots[131] = crate::slot!(build_raytracing::batch);
     slots[139] = crate::slot!(reset_extended);
     slots[146] = crate::slot!(enhanced::barrier);
