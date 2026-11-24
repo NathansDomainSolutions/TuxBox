@@ -121,6 +121,8 @@ enum Sym {
     HeapSampler(DirectSampler),
     HeapOffset,
     HeapDescriptor(u32),
+    /// Guest sampler-heap index read at a run-time byte offset (compute sampler heap).
+    HeapSamplerIndex,
     InlineWord(u32),
     Table(u8),
     Desc { table: u8, off: u32, k: u32 },
@@ -155,6 +157,10 @@ enum Res {
     Tex(u32, u32), // slot, dim
     Samp(u32),
     HeapSampler(DirectSampler),
+    /// Sampler-heap byte offset in this SGPR becomes a sampler index (16-byte descriptors).
+    HeapSamplerLoad(u16),
+    /// Sampler named by the sampler-heap index held in this SGPR.
+    HeapSamplerDyn(u16),
     Uav(u32, u32), // slot, dim
     Buf(u32, bool), // slot, is_uav (structured buffer)
     Raw(u32, bool), // slot, is_uav (byte-address buffer)
@@ -2951,6 +2957,19 @@ impl<'a> Emitter<'a> {
                             self.res.insert(idx, vec![Res::HeapLoad(soff)]);
                             continue;
                         }
+                        // A sampler picked at run time from the directly indexed compute sampler
+                        // heap (CS_RaytracingResolve: per-material index << 4, then a waterfall).
+                        if self.compute_heap && self.sampler_heap_base == Some(table) && n == 4 && ins.aux.imm == 0
+                            && soff < 106 && written.contains(&soff)
+                        {
+                            for k in 0..4 {
+                                sym.remove(&(d + k));
+                                written.insert(d + k);
+                            }
+                            sym.insert(d, Sym::HeapSamplerIndex);
+                            self.res.insert(idx, vec![Res::HeapSamplerLoad(soff)]);
+                            continue;
+                        }
                         if let Some(Sym::SamplerOffset(index)) = sym.get(&soff).copied() {
                             // Four dwords per sampler, on the heap pointer following
                             // s8 (table) and its immediately following root constants.
@@ -3155,6 +3174,9 @@ impl<'a> Emitter<'a> {
                                 let (_, slot) = self.table_binding(table, offset, 16)?;
                                 samp_res.push((((table as u32) << 24) | offset, Res::Samp(slot)));
                             }
+                        } else if sym.get(&ss) == Some(&Sym::HeapSamplerIndex) {
+                            self.uses_heap_sampler = true;
+                            samp_res.push((0, Res::HeapSamplerDyn(ss)));
                         } else if let Some(Sym::HeapSampler(index)) = sym.get(&ss) {
                             self.uses_heap_sampler = true;
                             samp_res.push((0, Res::HeapSampler(*index)));
@@ -4512,6 +4534,14 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                         let dst = d.ok_or("missing direct descriptor destination")?;
                         self.touch(&dst);
                         self.ws(&dst, &format!("tb_heap_index({value} >> 5)"))?;
+                        return Ok(());
+                    }
+                    if let Some(Res::HeapSamplerLoad(offset)) = self.res.get(&idx).and_then(|v| v.first()).copied() {
+                        let value = ssrc_name(u32::from(offset))?;
+                        self.regs.insert(value.clone());
+                        let dst = d.ok_or("missing sampler descriptor destination")?;
+                        self.touch(&dst);
+                        self.ws(&dst, &format!("({value} >> 4)"))?;
                         return Ok(());
                     }
                     if let Some(Res::CodeTbl) = self.res.get(&idx).and_then(|v| v.first()) {
@@ -6969,7 +6999,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         }
         let sslot = match rs.get(1) {
             Some(Res::Samp(s)) => Some(*s),
-            Some(Res::HeapSampler(_)) => None,
+            Some(Res::HeapSampler(_) | Res::HeapSamplerDyn(_)) => None,
             _ => return Err("image op without sampler unsupported".into()),
         };
         // RDNA2 sample/gather family. Opcode = family base (0x20 sample, 0x40 gather4) +
@@ -7107,6 +7137,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let ty = if cmp { "SamplerComparisonState" } else { "SamplerState" };
             self.line(&format!("{ty} {name} = SamplerDescriptorHeap[tb_index{}_{}.{}];",
                 key.register, key.space, XYZW[key.component as usize]));
+            name
+        } else if let Some(Res::HeapSamplerDyn(reg)) = rs.get(1).copied() {
+            let name = format!("tb_sampler{idx}");
+            let ty = if cmp { "SamplerComparisonState" } else { "SamplerState" };
+            let index = ssrc_name(u32::from(reg))?;
+            self.regs.insert(index.clone());
+            self.line(&format!("{ty} {name} = SamplerDescriptorHeap[NonUniformResourceIndex({index})];"));
             name
         } else if let Some(s) = sslot {
             if cmp { format!("scmp{s}") } else { format!("samp{s}") }
