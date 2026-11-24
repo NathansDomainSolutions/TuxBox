@@ -25,15 +25,33 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Install the assert handler once, when the title creates its first device.
+/// Outside survey mode it only steps over the asserts in `RECOVERABLE`.
 pub(crate) fn install() {
     static INSTALL: Once = Once::new();
-    if !enabled() {
-        return;
-    }
     INSTALL.call_once(|| {
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
-        log(format!("survey mode active (assert handler installed: {})", !handle.is_null()));
+        if enabled() {
+            log(format!("survey mode active (assert handler installed: {})", !handle.is_null()));
+        }
     });
+}
+
+/// Title asserts whose own continue path is correct for TuxBox, matched by
+/// RVA and by the exact bytes there, so another build cannot match.
+///
+/// ProjectScarlett 1.0.2.1, RVA 0x4ffd879: the tile-heap mapping loop at
+/// 0x4ffd520 asserts when a request is shorter than a whole flagged page run
+/// (an 8 KiB request against a 16 KiB run about 60 s after player selection).
+/// The continue path maps min(run, remaining), which is what was requested.
+const RECOVERABLE: [(usize, [u8; 9]); 1] =
+    [(0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff])];
+
+fn recoverable(start: usize, end: usize, at: usize) -> bool {
+    RECOVERABLE.iter().any(|&(rva, bytes)| {
+        at == start + rva && at + bytes.len() <= end
+            // SAFETY: the range lies within the mapped title image.
+            && unsafe { core::slice::from_raw_parts(at as *const u8, bytes.len()) } == bytes
+    })
 }
 
 fn log(line: String) {
@@ -75,7 +93,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return CONTINUE_SEARCH;
     };
     if record_.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
-        describe_fault(context);
+        if enabled() {
+            describe_fault(context);
+        }
         return CONTINUE_SEARCH;
     }
     if record_.ExceptionCode != EXCEPTION_BREAKPOINT {
@@ -85,6 +105,19 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let rip = context.Rip as usize;
     if !(start..end).contains(&rip) {
         return CONTINUE_SEARCH;
+    }
+    if !enabled() {
+        if !recoverable(start, end, rip) {
+            return CONTINUE_SEARCH;
+        }
+        context.Rip += 1;
+        let hits = record(&ASSERTS, rip - start);
+        if hits.is_power_of_two() {
+            crate::diagnostics::log_once(&Once::new(), || {
+                format!("continued past recoverable title assert RVA {:#x} (hit {hits})", rip - start)
+            });
+        }
+        return CONTINUE_EXECUTION;
     }
     // Windows reports an int3 at its own address; resume after it.
     // SAFETY: rip lies within the mapped title image.
