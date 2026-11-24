@@ -7017,6 +7017,45 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 }
                 return Ok(());
             }
+            if modi == 4 && zref.is_none() && matches!(dim, 1 | 5) {
+                // gather4_l: SM 6.x Gather has no LOD operand. Sample the four texel
+                // centres of the footprint at the requested mip instead. A sample exactly at
+                // a texel centre returns that texel under point or bilinear filtering, and
+                // keeps the bound sampler's address mode. The mip rounds to the nearest level.
+                let chan = match ins.aux.mask {
+                    1 => "r",
+                    2 => "g",
+                    4 => "b",
+                    8 => "a",
+                    m => return Err(format!("gather4 with dmask {m:#x} unsupported")),
+                };
+                let lod = lod.as_ref().ok_or("missing gather4_l lod")?;
+                let (uv, slice, dims, ext) = if dim == 5 {
+                    (format!("({cvec}).xy"), Some(format!("({cvec}).z")), format!("w{t}, h{t}, e{t}, m{t}"), format!("uint e{t};"))
+                } else {
+                    (cvec.clone(), None, format!("w{t}, h{t}, m{t}"), String::new())
+                };
+                self.line(&format!("uint w{t}, h{t}, m{t}; {ext} {tex}.GetDimensions(0u, {dims});"));
+                self.line(&format!("uint l{t} = (uint)clamp(round({lod}), 0.0, float(max(1u, m{t}) - 1u));"));
+                self.line(&format!("{tex}.GetDimensions(l{t}, {dims}); float2 sz{t} = max(float2(w{t}, h{t}), 1.0);"));
+                let off2 = offset.as_ref().map(|o| format!(" + float2({o})")).unwrap_or_default();
+                self.line(&format!("float2 base{t} = floor({uv} * sz{t} - 0.5) + 0.5{off2};"));
+                // D3D gather order: (0,1), (1,1), (1,0), (0,0) relative to the top-left texel.
+                let taps = ["0,1", "1,1", "1,0", "0,0"].map(|xy| {
+                    let p = format!("(base{t} + float2({xy})) / sz{t}");
+                    let p = match &slice { Some(s) => format!("float3({p}, {s})"), None => p };
+                    format!("{tex}.SampleLevel({smp}, {p}, l{t}).{chan}")
+                });
+                self.line(&format!("float4 t{t} = float4({});", taps.join(", ")));
+                if d16 {
+                    let chans: Vec<String> = XYZW.iter().map(|c| format!("t{t}.{c}")).collect();
+                    return self.write_d16(vd, &chans);
+                }
+                for (k, channel) in XYZW.iter().enumerate() {
+                    self.wv(&Opnd::Vgpr(vd + k as u8), &format!("asuint(t{t}.{channel})"))?;
+                }
+                return Ok(());
+            }
             if !matches!(modi, 0 | 7) {
                 return Err("gather4 with explicit LOD/bias unsupported".into());
             }
