@@ -2611,6 +2611,8 @@ impl<'a> Emitter<'a> {
         let block_start = range.start;
         let inline_samplers = self.resource_heap_base.is_some()
             || (self.ex.root_sig.is_none() && self.ex.resources.iter().any(|r| r.res_type == 1))
+            // Literal sampler words can name any static sampler with identical state.
+            || self.ex.root_sig.as_ref().is_some_and(|r| !r.static_samplers.is_empty())
             || (self.ex.stage == Stage::Compute && self.ex.root_sig.as_ref().is_some_and(|r| !r.static_samplers.is_empty())
                 && self.ex.resources.iter().filter(|r| r.res_type == 1).count() > 1);
         for idx in range {
@@ -3095,6 +3097,7 @@ impl<'a> Emitter<'a> {
                                 (self.ex.stage == Stage::Compute).then(|| sampler_heap::guarded_words(insns, idx, ss as u8, compute_group(self.ex))).flatten()
                             });
                             words.and_then(|w| sampler_heap::inline_sampler(self.ex, w, ins.op & 8 != 0))
+                                .or_else(|| self.static_sampler())
                         } else { self.static_sampler() } {
                             if self.binding_spaces.insert((3, slot), space).is_some_and(|old| old != space) {
                                 return Err(format!("static sampler s{slot} overlaps another space"));
