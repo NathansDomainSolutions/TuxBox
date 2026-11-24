@@ -2624,7 +2624,8 @@ impl<'a> Emitter<'a> {
             let ins = &insns[idx];
             // A compute-heap byte offset held in a VGPR (key 2000 + v) lasts until the
             // VGPR is written again; `v_lshlrev_b32 v, 5, x` below re-marks it.
-            if self.compute_heap {
+            // v_nop writes nothing; its encoding can still carry stale VDST/SRC0 fields.
+            if self.compute_heap && ins.mnemonic != "v_nop" {
                 for d in &ins.dst {
                     if let Opnd::Vgpr(v) = d {
                         if sym.get(&(2000 + *v as u16)) == Some(&Sym::HeapOffset) {
@@ -3103,6 +3104,7 @@ impl<'a> Emitter<'a> {
                     }
                     self.res.insert(idx, v);
                 }
+                Enc::Vop1 if ins.mnemonic == "v_nop" => {}
 
                 _ => {
                     for d in &ins.dst {
@@ -6004,6 +6006,34 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         Ok(())
     }
 
+    /// `buffer_store_format_*` with IDXEN through a heap descriptor: the typed UAV's
+    /// desktop descriptor supplies the element format, so store the float channels.
+    fn heap_typed_store(&mut self, ins: &Insn, src: u16) -> Result<(), String> {
+        if ins.aux.mask & 1 != 0 || ins.aux.imm != 0 || !self.zero_buffer_offset(ins) {
+            return Err("typed heap buffer store with a byte offset unsupported".into());
+        }
+        let channels = match ins.mnemonic.rsplit('_').next() {
+            Some("x") => 1u8, Some("xy") => 2, Some("xyz") => 3, Some("xyzw") => 4,
+            _ => return Err(format!("unsupported typed heap store {}", ins.mnemonic)),
+        };
+        let Opnd::Vgpr(vd) = ins.dst[0] else { return Err("bad vdata".into()) };
+        let index = r(&ins.src[0])?;
+        let t = self.tmp;
+        self.tmp += 1;
+        self.regs.insert(format!("s{src}"));
+        let mut value = Vec::new();
+        for k in 0..4u8 {
+            value.push(if k < channels {
+                let o = Opnd::Vgpr(vd + k);
+                self.touch(&o);
+                format!("asfloat({})", r(&o)?)
+            } else if k == 3 { "1.0f".into() } else { "0.0f".into() });
+        }
+        self.line(&format!("RWBuffer<float4> tb_tw{t} = ResourceDescriptorHeap[NonUniformResourceIndex(s{src})];"));
+        self.line(&format!("if (exec_lo & 1u) tb_tw{t}[{index}] = float4({});", value.join(", ")));
+        Ok(())
+    }
+
     fn raw_transfer_on(&mut self, ins: &Insn, buffer: String, is_uav: bool) -> Result<(), String> {
         let load = ins.mnemonic.starts_with("buffer_load_");
         if !load && (!is_uav || !ins.mnemonic.starts_with("buffer_store_")) {
@@ -6096,6 +6126,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             if ins.mnemonic.starts_with("buffer_load_format_") && ins.aux.mask & 2 != 0 {
                 return self.heap_typed_load(ins, src);
+            }
+            if ins.mnemonic.starts_with("buffer_store_format_") && ins.aux.mask & 2 != 0 {
+                return self.heap_typed_store(ins, src);
             }
             return self.heap_raw_transfer(ins, src);
         }
