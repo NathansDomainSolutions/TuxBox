@@ -1082,6 +1082,40 @@ unsafe extern "system" fn execute_indirect(
     }
 }
 
+// Xbox list slot 62 (title RVA 0x979699): copy `bytes` CPU bytes into GPU memory
+// at `address`. The bytes are captured at record time, as the console embeds
+// them in the command buffer, and written in order with immediate writes.
+unsafe extern "system" fn write_bytes(list: &List, source: *const u8, address: u64, bytes: u32, flags: u32) {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || format!(
+        "list slot 62 write_bytes source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
+    let mut state = recording(list);
+    if !state.ensure_open(&list.native) { return; }
+    if bytes == 0 { return; }
+    if source.is_null() || address == 0 || !address.is_multiple_of(4) || !bytes.is_multiple_of(4)
+        || bytes > 1 << 20 {
+        static BAD: std::sync::Once = std::sync::Once::new();
+        crate::diagnostics::log_once(&BAD, || format!(
+            "list slot 62 rejected source={source:p} address={address:#x} bytes={bytes} flags={flags:#x}"));
+        { crate::invalid_site!(); state.error = E_INVALIDARG };
+        return;
+    }
+    let result = (|| -> windows::core::Result<()> {
+        let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, u64::from(bytes))? };
+        if let Some(buffer) = &resource { raytracing::retain(&state, &[buffer])?; }
+        let words = unsafe { core::slice::from_raw_parts(source, bytes as usize) };
+        let mut writes = Vec::new();
+        writes.try_reserve_exact(words.len() / 4).map_err(|_| windows::core::Error::from(E_OUTOFMEMORY))?;
+        writes.extend(words.chunks_exact(4).enumerate().map(|(i, w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+            Dest: dest + 4 * i as u64, Value: u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
+        }));
+        let native = list.native.cast::<ID3D12GraphicsCommandList2>()?;
+        unsafe { native.WriteBufferImmediate(writes.len() as u32, writes.as_ptr(), None) };
+        Ok(())
+    })();
+    if let Err(error) = result { state.error = error.code(); }
+}
+
 // Record the title's four-byte progress marker at the requested GPU address.
 unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, flags: u32, reserved: u32) {
     let mut state = recording(list);
@@ -1143,6 +1177,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[54] = crate::slot!(depth::clear_uav::<true>);
     slots[55] = crate::slot!(discard);
     slots[59] = crate::slot!(execute_indirect);
+    slots[62] = crate::slot!(write_bytes);
     slots[67] = crate::slot!(flush_texture_cache);
     slots[68] = crate::slot!(graphics::depth_bounds);
     slots[71] = crate::slot!(write_marker);
