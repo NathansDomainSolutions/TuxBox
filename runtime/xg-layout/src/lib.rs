@@ -1,6 +1,8 @@
 //! Scarlett Texture2D layout and array addressing for single-sample color textures.
 mod depth;
 mod msaa_color;
+#[cfg(test)]
+mod tests;
 pub use depth::DepthStencil;
 
 use windows_sys::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
