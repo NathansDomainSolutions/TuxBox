@@ -217,6 +217,25 @@ def package(root):
     }
 
 
+def package_root(target, executable):
+    """Return the package directory whose manifest declares the executable, or None.
+
+    A package directory target is its own root. For an executable target, the closest
+    ancestor whose MicrosoftGame.config or microsoft_gameconfig.bin declares that
+    executable is the root, at any depth.
+    """
+    executable = executable.resolve()
+    target = target.resolve()
+    for directory in (target,) if target.is_dir() else executable.parents:
+        try:
+            _, _, entries = manifest(directory)
+        except (OSError, ValueError, struct.error, ElementTree.ParseError):
+            continue
+        if any(path is not None and path == executable for *_, path in entries):
+            return directory
+    return None
+
+
 def launch_target(path, app_id):
     path = path.resolve()
     if path.is_dir():

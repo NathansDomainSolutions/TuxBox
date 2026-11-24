@@ -1,4 +1,5 @@
-//! Attach the launcher's scratch directory after Wine initializes its drive mappings.
+//! Attach the launcher's scratch directory (T:) and package root (G:) after Wine
+//! initializes its drive mappings.
 use std::{fs::OpenOptions, io, os::windows::io::AsRawHandle, ptr};
 use windows_sys::Win32::{
     Foundation::{ERROR_FILE_NOT_FOUND, GetLastError},
@@ -27,16 +28,20 @@ struct Drive {
     path: [u8; 4096],
 }
 
-fn mount(path: &str) -> io::Result<()> {
+fn mount(letter: u8, path: &str, replace: bool) -> io::Result<()> {
     let mut name = [0u16; 256];
-    // Even an inaccessible assigned device owns the letter. Only attach on a
-    // confirmed missing device and leave existing drive-directory aliases alone.
-    unsafe {
-        if QueryDosDeviceW(w!("T:"), name.as_mut_ptr(), name.len() as u32) != 0
-            || GetLastError() != ERROR_FILE_NOT_FOUND
-            || std::path::Path::new(r"T:\").is_dir()
-        {
-            return Ok(());
+    let device = [u16::from(letter), u16::from(b':'), 0];
+    // Even an inaccessible assigned device owns the letter. Unless asked to
+    // replace it, only attach on a confirmed missing device and leave existing
+    // drive-directory aliases alone.
+    if !replace {
+        unsafe {
+            if QueryDosDeviceW(device.as_ptr(), name.as_mut_ptr(), name.len() as u32) != 0
+                || GetLastError() != ERROR_FILE_NOT_FOUND
+                || std::path::Path::new(&format!("{}:\\", char::from(letter))).is_dir()
+            {
+                return Ok(());
+            }
         }
     }
     if !path.starts_with('/') || path.len() >= 4096 {
@@ -49,7 +54,7 @@ fn mount(path: &str) -> io::Result<()> {
         fs_type: 0,
         serial: 0,
         unix_dev: 0,
-        letter: u16::from(b'T'),
+        letter: u16::from(letter),
         mount_point_offset: offset as u16,
         device_offset: 0,
         label_offset: 0,
@@ -83,17 +88,25 @@ fn mount(path: &str) -> io::Result<()> {
 }
 
 pub(super) fn attach() {
-    let Ok(path) = std::env::var("TUXBOX_WINE_TITLE_TEMP") else {
-        return;
-    };
     let ntdll = unsafe { GetModuleHandleW(w!("ntdll.dll")) };
     if ntdll.is_null()
         || unsafe { GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()) }.is_none()
     {
         return;
     }
-    if let Err(error) = mount(&path) {
-        let message = format!("TuxBox xgameruntime: could not attach T: ({error})\n\0");
-        unsafe { OutputDebugStringA(message.as_ptr()) };
+    // Titles read their package through G:, as on the console. The launcher records
+    // the prefix's G: before the launch and restores it after the title exits, so
+    // the launched package replaces any G: here.
+    for (variable, letter, replace) in [
+        ("TUXBOX_WINE_TITLE_TEMP", b'T', false),
+        ("TUXBOX_WINE_PACKAGE_DRIVE", b'G', true),
+    ] {
+        let Ok(path) = std::env::var(variable) else {
+            continue;
+        };
+        if let Err(error) = mount(letter, &path, replace) {
+            let message = format!("TuxBox xgameruntime: could not attach {}: ({error})\n\0", char::from(letter));
+            unsafe { OutputDebugStringA(message.as_ptr()) };
+        }
     }
 }

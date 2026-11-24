@@ -18,7 +18,7 @@ except ImportError:
 from project_tuxbox.backend_log import check_log_path
 from project_tuxbox.game_log import game_log
 from project_tuxbox.host import Host
-from project_tuxbox.inspect import binary_file, image, launch_target, package
+from project_tuxbox.inspect import binary_file, image, launch_target, package, package_root
 from project_tuxbox.d3d12_status import d3d12_table
 from project_tuxbox.progress_map import library_table, shader_table, write_map
 from project_tuxbox.shader_prep import prepare_for_launch
@@ -28,7 +28,8 @@ from project_tuxbox.verify import SUITES, verify, status
 
 def launch_game(args):
     exe = launch_target(args.target.expanduser(), args.app_id)
-    host = Host(args.backend, args.proton, args.prefix)
+    package_dir = package_root(args.target.expanduser(), exe)
+    host = Host(args.backend, args.proton, args.prefix, offline=args.offline)
     if args.log_file:
         check_log_path(host.backend, host.env, exe.parent, args.log_file.expanduser().resolve())
     with game_log(exe, args.log_file) as log:
@@ -36,6 +37,8 @@ def launch_game(args):
         log.status(f"Executable: {exe}")
         if host.backend in ("wine", "proton"):
             log.status(f"Prefix: {host.env['WINEPREFIX']}")
+        if host.offline:
+            log.status("Network: offline. The game cannot reach servers or upload crash reports.")
         try:
             if args.prepare_only or (not args.no_shader_prep and os.environ.get("TUXBOX_SHADER_PREP") != "0"
                                      and "-nullrhi" not in (arg.lower() for arg in args.arguments)):
@@ -53,8 +56,8 @@ def launch_game(args):
                         return 0 if supported else 1
             log.status("Starting game")
             start = monotonic()
-            code = host.run_game(exe, args.arguments, log, mangohud=args.mangohud,
-                                 profile_pipelines=args.profile_pipelines).returncode
+            code = host.run_game(exe, args.arguments, log, package=package_dir,
+                                 mangohud=args.mangohud, profile_pipelines=args.profile_pipelines).returncode
         except KeyboardInterrupt:
             log.status("Launch interrupted")
             return 130
@@ -78,6 +81,8 @@ def main():
                      help="show Vulkan performance metrics and record frame times beside the game log on Linux")
     run.add_argument("--profile-pipelines", action="store_true",
                      help="record vkd3d-proton pipeline creation times and keys beside the game log")
+    run.add_argument("--offline", action="store_true",
+                     help="on Linux, launch without network access so the game cannot upload crash reports")
     preparation = run.add_mutually_exclusive_group()
     preparation.add_argument("--prepare-only", action="store_true", help="prepare supported shader caches and exit")
     preparation.add_argument("--no-shader-prep", action="store_true", help="skip shader preparation for this launch")

@@ -5,7 +5,7 @@ import unittest
 
 from types import SimpleNamespace
 
-from project_tuxbox.inspect import import_symbol, launch_target, manifest, member
+from project_tuxbox.inspect import import_symbol, launch_target, manifest, member, package_root
 
 
 class PackagePaths(unittest.TestCase):
@@ -28,6 +28,22 @@ class PackagePaths(unittest.TestCase):
         for app, reason in [(None, "Select one"), ("two", "missing"), ("unknown", "Select one")]:
             with self.assertRaisesRegex(ValueError, reason):
                 launch_target(self.root, app)
+
+    def test_package_root_follows_the_declaring_manifest_at_any_depth(self):
+        deep = self.root / "Mount/Title/Binaries/XSX/Shipping"
+        deep.mkdir(parents=True)
+        (deep / "x.exe").touch()
+        (self.root / "MicrosoftGame.Config").write_text(
+            '<Game><ExecutableList><Executable Name="Mount\\Title\\Binaries\\XSX\\Shipping\\x.exe" Id="x"/>'
+            '</ExecutableList></Game>')
+        # A nested manifest that does not declare the executable is not its package.
+        (deep.parent / "MicrosoftGame.config").write_text(
+            '<Game><ExecutableList><Executable Name="other.exe" Id="o"/></ExecutableList></Game>')
+        exe = deep / "x.exe"
+        self.assertEqual(package_root(self.root, exe), self.root)
+        self.assertEqual(package_root(exe, exe), self.root)
+        loose = self.root / "BiN/game.exe"
+        self.assertIsNone(package_root(loose, loose))
 
     def test_absolute_parent_and_drive_relative_names(self):
         for name in ["../file", "x/../../file", "C:\\Windows\\x", "D:name", "\\\\server\\share\\x", ""]:
