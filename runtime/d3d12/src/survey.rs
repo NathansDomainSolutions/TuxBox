@@ -29,11 +29,39 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn install() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
+        relax_hang_watchdog();
         let handle = unsafe { AddVectoredExceptionHandler(1, Some(handler)) };
         if enabled() {
             log(format!("survey mode active (assert handler installed: {})", !handle.is_null()));
         }
     });
+}
+
+/// LOCAL: ProjectScarlett 1.0.2.1, RVA 0x2215bdc: RAGE's hang watchdog jumps to
+/// its fatal handler when a registered thread misses its heartbeat threshold.
+/// Under translation the render thread can stall far longer than on console,
+/// so replace that branch with two NOPs. `TUXBOX_WATCHDOG=1` keeps it.
+fn relax_hang_watchdog() {
+    use windows::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, VirtualProtect};
+    const RVA: usize = 0x2215bd8;
+    const EXPECTED: [u8; 6] = [0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e];
+    if std::env::var_os("TUXBOX_WATCHDOG").is_some_and(|v| v == "1") { return; }
+    let Some((start, end)) = title_image() else { return };
+    let at = start + RVA;
+    if at + EXPECTED.len() > end { return; }
+    // SAFETY: the range lies within the mapped title image.
+    if unsafe { core::slice::from_raw_parts(at as *const u8, EXPECTED.len()) } != EXPECTED { return; }
+    let branch = (at + 4) as *mut u8;
+    let mut old = PAGE_PROTECTION_FLAGS::default();
+    // SAFETY: two bytes of the title's own code, made writable only for this store.
+    unsafe {
+        if VirtualProtect(branch.cast(), 2, PAGE_EXECUTE_READWRITE, &mut old).is_ok() {
+            branch.write(0x90);
+            branch.add(1).write(0x90);
+            let _ = VirtualProtect(branch.cast(), 2, old, &mut old);
+            crate::diagnostics::log_once(&Once::new(), || "relaxed the title hang watchdog at RVA 0x2215bdc".into());
+        }
+    }
 }
 
 /// Title asserts whose own continue path is correct for TuxBox, matched by
