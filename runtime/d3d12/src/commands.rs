@@ -1640,6 +1640,7 @@ unsafe fn present_planes(
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || "presenting the title's full-size render target in place of the display surface".into());
     }
+    crate::present::dump::at_present(&queue.native, redirected.as_ref().unwrap_or(&source));
     let result = queue.state.presentation.present(&queue.native, redirected.as_ref().unwrap_or(&source));
     // Frame pacing must advance even if the host present failed; the title
     // otherwise waits forever for this token's flip.

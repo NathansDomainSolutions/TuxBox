@@ -101,6 +101,12 @@ pub(super) unsafe extern "system" fn targets(
         { crate::invalid_site!(); state.error = E_INVALIDARG };
         return;
     }
+    if crate::present::dump::enabled() && count != 0 {
+        let handles: Vec<usize> = (0..count as usize).map(|i| unsafe {
+            if contiguous.as_bool() { (*rtvs).ptr + i * 32 } else { (*rtvs.add(i)).ptr }
+        }).collect();
+        crate::present::dump::bound(&handles);
+    }
     // CPU RTV descriptors are consumed by OMSetRenderTargets immediately.
     // Capture their resources now even if the guest overwrites a slot before drawing.
     if let Err(error) = unsafe {

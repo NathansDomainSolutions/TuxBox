@@ -383,6 +383,17 @@ pub(crate) mod sampler {
     }
 
     impl Sample {
+        /// LOCAL: write the raw texels with their footprint in the file name.
+        pub(crate) fn write(&self, dir: &std::path::Path, stem: &str) {
+            let f = self.layout.Footprint;
+            let mut mapped = std::ptr::null_mut();
+            if unsafe { self.buffer.Map(0, None, Some(&mut mapped)) }.is_err() || mapped.is_null() { return; }
+            let bytes = f.RowPitch as usize * f.Height as usize;
+            let data = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), bytes) };
+            let name = format!("{stem}_{}x{}_f{}_p{}.raw", f.Width, f.Height, f.Format.0, f.RowPitch);
+            let _ = std::fs::write(dir.join(name), data);
+            unsafe { self.buffer.Unmap(0, None) };
+        }
         /// Called after the GPU has finished this frame's commands.
         pub(crate) fn report(&self, name: &str) {
             let f = self.layout.Footprint;
@@ -444,5 +455,84 @@ pub(crate) mod redirect {
         let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
         let (a, b) = unsafe { (display.GetDesc(), last.GetDesc()) };
         (a.Width == b.Width && a.Height == b.Height && a.Format == b.Format).then_some(last)
+    }
+}
+
+/// LOCAL diagnostic: `TUXBOX_DUMP_AT=<seconds>[,<seconds>...]` copies every
+/// render target of at least 640x360 that a frame binds, at the first present
+/// after each time, to raw files in `TUXBOX_DUMP_DIR` (default C:\tuxbox_dump).
+pub(crate) mod dump {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
+    use std::collections::HashMap;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static TIMES: LazyLock<Vec<u64>> = LazyLock::new(|| std::env::var("TUXBOX_DUMP_AT").ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_default());
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static RTVS: LazyLock<Mutex<HashMap<usize, ID3D12Resource>>> = LazyLock::new(Default::default);
+    static FRAME: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+    pub(crate) fn enabled() -> bool { !TIMES.is_empty() }
+
+    pub(crate) fn rtv(handle: usize, resource: Option<&ID3D12Resource>) {
+        if !enabled() { return; }
+        let _ = *START;
+        let mut map = RTVS.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&handle);
+        if let Some(r) = resource {
+            let d = unsafe { r.GetDesc() };
+            if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 640 && d.Height >= 360 && d.SampleDesc.Count == 1 {
+                map.insert(handle, r.clone());
+            }
+        }
+    }
+
+    pub(crate) fn bound(handles: &[usize]) {
+        if !enabled() { return; }
+        let map = RTVS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        for h in handles {
+            if let Some(r) = map.get(h) && frame.len() < 64 && !frame.iter().any(|f| f.as_raw() == r.as_raw()) {
+                frame.push(r.clone());
+            }
+        }
+    }
+
+    pub(crate) fn at_present(queue: &ID3D12CommandQueue, presented: &ID3D12Resource) {
+        if !enabled() { return; }
+        let mut frame = std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()));
+        let i = NEXT.load(Ordering::Relaxed);
+        if i >= TIMES.len() || START.elapsed().as_secs() < TIMES[i] { return; }
+        NEXT.store(i + 1, Ordering::Relaxed);
+        if !frame.iter().any(|f| f.as_raw() == presented.as_raw()) { frame.insert(0, presented.clone()); }
+        let result = (|| -> windows::core::Result<()> {
+            let mut device: Option<ID3D12Device> = None;
+            unsafe { queue.GetDevice(&mut device)? };
+            let device = device.ok_or(windows::Win32::Foundation::E_FAIL)?;
+            let allocator: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)? };
+            let list: ID3D12GraphicsCommandList = unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)? };
+            let samples: Vec<(usize, super::sampler::Sample)> = frame.iter().enumerate()
+                .filter_map(|(k, r)| super::sampler::record(&list, r, D3D12_RESOURCE_STATE_COMMON).map(|s| (k, s))).collect();
+            unsafe { list.Close()? };
+            unsafe { queue.ExecuteCommandLists(&[Some(list.clone().into())]) };
+            let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+            unsafe { queue.Signal(&fence, 1)? };
+            let count = samples.len();
+            std::thread::spawn(move || {
+                let _keep = (allocator, list, frame);
+                if unsafe { fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()) }.is_err() { return; }
+                let dir = std::path::PathBuf::from(std::env::var("TUXBOX_DUMP_DIR").unwrap_or_else(|_| "C:\\tuxbox_dump".into()));
+                let _ = std::fs::create_dir_all(&dir);
+                for (k, s) in &samples { s.write(&dir, &format!("dump{i}_{k:02}")); }
+                crate::diagnostics::log_once(&std::sync::Once::new(), || format!("dumped {count} render targets (dump {i}) to {}", dir.display()));
+            });
+            Ok(())
+        })();
+        if let Err(e) = result {
+            crate::diagnostics::log_once(&std::sync::Once::new(), || format!("render target dump failed: {:?}", e.code()));
+        }
     }
 }

@@ -609,6 +609,7 @@ pub(super) unsafe extern "system" fn rtv(
     let resource = unsafe { view_resource(device, object, desc, handle) };
     let proxy = unsafe { super::resource_proxy(object, identity(device).as_raw()) };
     crate::diagnostics::display::capture_target(handle.ptr, resource);
+    crate::present::dump::rtv(handle.ptr, resource);
     crate::diagnostics::display::rtv(handle.ptr, proxy.map(|p| p.native.as_raw()));
     device.state.placements.targets.set(handle.ptr, proxy.and_then(|p| p.state.placed()));
     let substitute = proxy.is_some_and(|p| p.state.translated().is_some());
