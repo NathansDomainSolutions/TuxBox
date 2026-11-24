@@ -1652,8 +1652,13 @@ impl<'a> Emitter<'a> {
                 // be matched to the title's registers here, so use the private slots that
                 // inline_sampler::sites derives from the ISA alone (space 32765). The runtime
                 // appends the same descriptors to the host root signature.
-                .or_else(|| (ex.root_sig.is_none()
+                .or_else(|| ((ex.root_sig.is_none()
                     && ex.resources.iter().filter(|r| r.res_type == 1).count() > 1)
+                    // A root with no static samplers: the runtime recovers the private ones
+                    // (compute_table.rs, inline_sampler::private) from the same sites.
+                    || (matches!(ex.stage, Stage::Compute | Stage::Pixel)
+                        && ex.root_sig.as_ref().is_some_and(|r| r.static_samplers.is_empty())
+                        && ex.resources.iter().any(|r| r.res_type == 1)))
                     .then(|| tuxbox_dxbc::inline_sampler::sites(&ex.isa, if ex.stage == Stage::Pixel { 5 } else { 0 }))
                     .flatten()
                     .map(|recovered| recovered.sites))
