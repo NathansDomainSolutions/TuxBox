@@ -218,6 +218,19 @@ impl Worker {
                             unsafe {
                                 job.device.GetDeviceRemovedReason()?;
                             }
+                            // LOCAL: TuxBox moves value writes into wait prefixes, which can
+                            // form a cross-queue cycle the console never has. Release the
+                            // gate after 250 ms rather than deadlock both queues.
+                            if started.elapsed() > Duration::from_millis(250) {
+                                static GAVE_UP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                let n = GAVE_UP.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n.is_power_of_two() {
+                                    let line = format!("GPU memory wait released after 250 ms ({n} so far): guest {:#x} target {:#x}",
+                                        job.segment.word.guest, job.segment.target);
+                                    crate::diagnostics::log_once(&std::sync::Once::new(), || line);
+                                }
+                                break;
+                            }
                             if !reported && started.elapsed() > Duration::from_secs(5) {
                                 reported = true;
                                 let word = &job.segment.word;
