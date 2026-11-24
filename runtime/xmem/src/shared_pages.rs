@@ -2,9 +2,10 @@
 use core::{ffi::c_void, ptr};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
     MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
     MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
     SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
@@ -42,10 +43,17 @@ pub(super) fn replace_aperture(address: *mut c_void, bytes: usize) -> *mut c_voi
     base
 }
 
-// One demand-committed pagefile section per batch of XMem physical tokens.
+// One pagefile section per batch of XMem physical tokens.
+//
+// The section is committed whole when it is created. Committing through each
+// view instead costs one wineserver request per view under Wine, and each
+// request scans every range committed so far, so loading stalls on wineserver.
+// If the whole commit fails (for example at the commit limit), views fall back
+// to committing their own range.
 pub(super) struct Section {
     bytes: u64,
     handle: OnceLock<OwnedHandle>,
+    committed: AtomicBool,
 }
 
 impl Section {
@@ -53,6 +61,7 @@ impl Section {
         Self {
             bytes: count as u64 * PAGE as u64,
             handle: OnceLock::new(),
+            committed: AtomicBool::new(false),
         }
     }
 
@@ -73,9 +82,10 @@ impl Section {
         if h.is_null() {
             return Err(unsafe { GetLastError() });
         }
-        self.handle
-            .set(unsafe { OwnedHandle::from_raw_handle(h) })
-            .ok();
+        if self.handle.set(unsafe { OwnedHandle::from_raw_handle(h) }).is_ok() {
+            let raw = self.handle.get().unwrap().as_raw_handle();
+            self.committed.store(commit_whole(raw, self.bytes as usize), Ordering::Release);
+        }
         Ok(self.handle.get().unwrap().as_raw_handle())
     }
 
@@ -100,7 +110,9 @@ impl Section {
         if view.Value.is_null() {
             return Err(unsafe { GetLastError() });
         }
-        if unsafe { VirtualAlloc(view.Value, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        if !self.committed.load(Ordering::Acquire)
+            && unsafe { VirtualAlloc(view.Value, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null()
+        {
             let err = unsafe { GetLastError() };
             unmap(address)?;
             return Err(err);
@@ -127,6 +139,18 @@ impl Section {
         }
         Ok(())
     }
+}
+
+// Commit every page of a SEC_RESERVE section through one temporary view.
+// The commit belongs to the section, so it outlives the view.
+fn commit_whole(handle: *mut c_void, bytes: usize) -> bool {
+    let view = unsafe { MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, bytes) };
+    if view.Value.is_null() {
+        return false;
+    }
+    let ok = !unsafe { VirtualAlloc(view.Value, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null();
+    unsafe { UnmapViewOfFile(view) };
+    ok
 }
 
 pub(super) fn unmap(address: usize) -> Result<(), u32> {
