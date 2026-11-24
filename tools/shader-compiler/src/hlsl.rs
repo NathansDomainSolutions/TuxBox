@@ -2610,6 +2610,7 @@ impl<'a> Emitter<'a> {
         let mut dbg_prev: Option<Sym> = dbg_reg.and_then(|r| sym.get(&r).copied());
         let block_start = range.start;
         let inline_samplers = self.resource_heap_base.is_some()
+            || (self.ex.root_sig.is_none() && self.ex.resources.iter().any(|r| r.res_type == 1))
             || (self.ex.stage == Stage::Compute && self.ex.root_sig.as_ref().is_some_and(|r| !r.static_samplers.is_empty())
                 && self.ex.resources.iter().filter(|r| r.res_type == 1).count() > 1);
         for idx in range {

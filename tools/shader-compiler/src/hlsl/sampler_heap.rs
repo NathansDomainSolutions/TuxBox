@@ -188,7 +188,18 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: boo
         let word0 = address(u)? | address(v)? << 3 | address(w)? << 6 | (func - 1) << 12;
         (literal == [word0, 0x00c00000, filter, border << 30]).then_some((slot, space))
     };
-    let samplers = &ex.root_sig.as_ref()?.static_samplers;
+    let Some(root) = ex.root_sig.as_ref() else {
+        // Root-less programs: the title's own root signature supplies the static
+        // sampler, so bind the inline words to the one sampler PSV declares. Only
+        // accept words shaped like a static sampler (word 1 = MAX_LOD 12, no bias).
+        let mut declared = ex.resources.iter().filter(|r| r.res_type == 1);
+        let sampler = declared.next()?;
+        if declared.next().is_some() || sampler.lower != sampler.upper || literal[1] != 0x00c00000 {
+            return None;
+        }
+        return Some((sampler.lower, sampler.space));
+    };
+    let samplers = &root.static_samplers;
     let declared = |&(slot, space): &(u32, u32)| {
         ex.resources.iter().any(|r| (r.res_type, r.lower, r.upper, r.space) == (1, slot, slot, space))
     };
