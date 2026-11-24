@@ -26,6 +26,8 @@ class PerformanceTests(unittest.TestCase):
                 ]
                 first.write_text("[\n" + "".join(json.dumps(dict(name=label, pid=kind, ph="X",
                                  ts=2_000_000, dur=duration)) + ",\n" for kind, label, duration in events)
+                                 + '{"pid":"pso","ph":"X","name":"0000000000000002 COMP", "ts":0},\n'
+                                 + '{"pid":"pso","ph":"X","name":"0000000000000002 COMP", "ts":0,"dur":"bad"},\n'
                                  + '{"pid":"pso","name":')
             result = json.loads(first.with_name("summary.json").read_text())
             self.assertEqual(result, summarize(first))

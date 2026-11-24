@@ -153,8 +153,11 @@ pub(super) fn resource_base(ex: &ShaderExtract) -> Option<u8> {
 
 /// Match the literal RDNA2 state of the normalized, isotropic samplers used
 /// with direct textures to a static sampler in the supplied root signature.
-/// Require every serialized state field before selecting a register.
-pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4]) -> Option<(u32, u32)> {
+/// Require every serialized state field before selecting a register. A static
+/// sampler is immutable, so any register with identical state samples alike;
+/// one the shader declares (PSV) is preferred. `compare` selects comparison
+/// samplers (depth-compare image ops) and only those.
+pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4], compare: bool) -> Option<(u32, u32)> {
     fn address(mode: u32) -> Option<u32> {
         match mode {
             1 => Some(0),
@@ -163,26 +166,45 @@ pub(super) fn inline_sampler(ex: &ShaderExtract, literal: [u32; 4]) -> Option<(u
             _ => None,
         }
     }
-    ex.root_sig.as_ref()?.static_samplers.iter().find_map(|s| {
-        let [filter, u, v, w, bias, aniso, compare, border, min, max, slot, space, vis] = *s;
+    let state = |s: &[u32; 13]| -> Option<(u32, u32)> {
+        let [filter, u, v, w, bias, aniso, func, border, min, max, slot, space, vis] = *s;
         if !(vis == 0 || (vis == 5 && ex.stage == Stage::Pixel))
-            || (bias, aniso, compare, border, min, max) != (0, 1, 1, 0, 0, 12.0_f32.to_bits())
-            || !ex
-                .resources
-                .iter()
-                .any(|r| (r.res_type, r.lower, r.upper, r.space) == (1, slot, slot, space))
+            || (bias, aniso, min, max) != (0, 1, 0, 12.0_f32.to_bits())
+            || (filter & 0x80 != 0) != compare
+            || border > 2
+            || !(1..=8).contains(&func)
+            || (!compare && func != 1)
         {
             return None;
         }
-        let filter = match filter {
+        let filter = match filter & 0x7f {
             0 => 0x14000000,
             0x14 => 0x14500000,
             0x15 => 0x18500000,
             _ => return None,
         };
-        let clamp = address(u)? | address(v)? << 3 | address(w)? << 6;
-        (literal == [clamp, 0x00c00000, filter, 0]).then_some((slot, space))
-    })
+        // DEPTH_COMPARE_FUNC (word 0 bits 12..14) is D3D12_COMPARISON_FUNC - 1;
+        // BORDER_COLOR_TYPE (word 3 bits 30..31) uses the D3D12 static border order.
+        let word0 = address(u)? | address(v)? << 3 | address(w)? << 6 | (func - 1) << 12;
+        (literal == [word0, 0x00c00000, filter, border << 30]).then_some((slot, space))
+    };
+    let Some(root) = ex.root_sig.as_ref() else {
+        // Root-less programs: the title's own root signature supplies the static
+        // sampler, so bind the inline words to the one sampler PSV declares. Only
+        // accept words shaped like a static sampler (word 1 = MAX_LOD 12, no bias).
+        let mut declared = ex.resources.iter().filter(|r| r.res_type == 1);
+        let sampler = declared.next()?;
+        if declared.next().is_some() || sampler.lower != sampler.upper || literal[1] != 0x00c00000 {
+            return None;
+        }
+        return Some((sampler.lower, sampler.space));
+    };
+    let samplers = &root.static_samplers;
+    let declared = |&(slot, space): &(u32, u32)| {
+        ex.resources.iter().any(|r| (r.res_type, r.lower, r.upper, r.space) == (1, slot, slot, space))
+    };
+    samplers.iter().filter_map(state).find(declared)
+        .or_else(|| samplers.iter().find_map(state))
 }
 
 /// An empty EXEC branch can skip inline sampler initialization only when the

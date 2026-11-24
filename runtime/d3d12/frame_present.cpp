@@ -54,10 +54,13 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
         if (present(queue, 1, &plane.prefix, &params) != E_NOTIMPL)
             throw std::runtime_error("unsupported presentation flag was accepted");
         params.options[5] = 0;
-        plane.options[0] = 1;
+        // Bytes 24 and 32 of the 72-byte retail plane are the source-rectangle and
+        // destination pointers; the provider dereferences them. Probe the color
+        // space at byte 40 instead, a plain value it must reject when nonzero.
+        plane.options[4] = 1;
         if (present(queue, 1, &plane.prefix, &params) != E_NOTIMPL)
             throw std::runtime_error("unsupported plane option was accepted");
-        plane.options[0] = 0;
+        plane.options[4] = 0;
     }
     // Frosty's main thread owns the game window while a render thread presents.
     auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });

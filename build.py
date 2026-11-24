@@ -56,7 +56,7 @@ class Toolchain:
         obj = source.stem + ".obj"
         directory.mkdir(parents=True, exist_ok=True)
         subprocess.run([require_tool(self.compiler[0]), *self.compiler[1:], "/nologo", "/c", "/O2", "/MT", "/Brepro",
-                        *language, *self.includes, *extra, f"/Fo{obj}", str(source)],
+                        *language, *self.includes, *extra, *(["-Wno-cast-function-type"] if self.compiler[0] == "clang-cl" else []), f"/Fo{obj}", str(source)],
                        cwd=directory, check=True)
         return obj
 

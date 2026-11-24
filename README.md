@@ -14,7 +14,13 @@ Many calls an Xbox Series game makes already work through standard Windows APIs.
 - **Lanes** is a small game that uses TuxBox’s Xbox graphics, memory and input libraries. Collect coins and dodge barriers using a keyboard, mouse or Xbox controller.
 - **The Matrix Awakens (Frosty)** reaches the Wake Up chase cinematic on Linux with TuxBox XG and reduced graphics settings. Earlier reduced-settings runs reached the highway chase and open city. With the original Xbox settings it loads the Construct map and presents a black frame before stopping while creating a compute shader during scene setup. You supply the game, its matching Xbox system files and Proton. [Setup and test results](docs/MATRIX_AWAKENS.md)
 
-**GTA VI (ProjectScarlett)** shows the player selection prompt at 3840×2160 on stock Proton Experimental. [Title progress](docs/PROGRESS.md)
+**GTA VI (ProjectScarlett)** shows the player selection prompt at 3840×2160 on stock Proton Experimental. [Title progress](docs/PROGRESS.md) · [Setup guide](docs/PROJECTSCARLETT.md)
+
+### Project Scarlett graphics trials
+
+On Linux, put `--graphics-menu` before the game path to choose the packaged settings or experimental Series S mode. Use `--graphics-profile series-s` to select it from a script. Series S mode uses Bubblewrap and a temporary copy of the Wine prefix. The copy is discarded at exit.
+
+The Series S trial requested a 1920×1080 render resource and stopped on a texture allocation before presenting. Use the packaged settings for the current playable startup path.
 
 ## Shader preparation
 

@@ -125,6 +125,10 @@ Three of Frosty’s vertex shaders give us expected positions and texture coordi
 
 Frosty’s menu material at entry 2 illustrates the overlap with AnyPS5’s instruction profile. LLVM 23.1.5 decodes the shader’s call at byte offset `0x18` as `s_swappc_b64 s[4:5], s[4:5]` on both `gfx1013` and `gfx1030`. At `0x1cc`, the former recognizes `v_mad_f32` and the latter rejects the instruction encoding. TuxBox uses AMD’s GFX10.1 and GFX10.3 tables together. The Xbox shader signature and input layout supply the evidence for how a game binds its vertex data. [Menu material inventory](../evidence/matrix-awakens/menu-materials.json) · [Opcode table](../runtime/dxbc/src/rdna2/opcodes.rs) · [AnyPS5 research notes](REFERENCES.md)
 
+## ProjectScarlett refusals
+
+Shader preparation reports only how many recorded requests xshader refused. `tools/triage_scarlett_shaders.py` runs the HLSL emitter on each recorded request in the prefix's `projectscarlett/<exe sha256>/requests` directory. It groups the refusal messages with program counters and register numbers masked. It does not run DXC and does not write to the cache. On 9,102 requests recorded through player selection, xshader translated 4,383 and refused 4,719. The largest groups were `s_load` with a dynamic SOFFSET (29%), sampler descriptors resolved from an inline word (19%), and wave reductions in divergent control flow (13%).
+
 ## Reusing compiled shaders during play
 
 The graphics provider can read a cached translation directly after the host identifies the compiler for the session. It checks the shader stage and the SHA-256 of the bytes it passes to the pipeline. On a warm cache, one of Frosty’s clear pipelines took 0.82 ms on GeForce and 1.62 ms on Radeon. The previous polling worker took 52.13 ms and 26.14 ms respectively. Both GPUs returned all 1,400 expected buffer words. For a new translation, Linux now wakes the worker when the guest publishes its request. In 20 cold trials with the same clear shader, the median time from request to validated DXIL fell from 46.94 ms to 18.16 ms. [GPU readbacks and worker timings](../evidence/providers/shader-cache-readback.json)

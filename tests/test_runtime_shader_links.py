@@ -138,6 +138,33 @@ class RuntimeShaderLinks(unittest.TestCase):
                     compile_request(source, key, self.tools, self.cache, self.session)
                 self.assertFalse((self.cache / (key + ".unsupported")).exists())
 
+    def test_dxc_retries_a_timeout_without_optimization(self):
+        program = b"Xbox compute shader"
+        key = hashlib.sha256(program).hexdigest()
+        source = self.requests / (key + ".dxbc")
+        source.write_bytes(program)
+        dxil = portable_program(5, b"compute")
+
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                args[args.index("--hlsl-out") + 1].write_text("compute shader")
+                args[args.index("--profile-out") + 1].write_text("cs_6_0")
+            elif args[0] == "dxc":
+                output = args[args.index("-Fo") + 1]
+                if "-O0" not in args:
+                    output.write_bytes(b"partial")
+                    raise subprocess.TimeoutExpired("dxc", timeout)
+                self.assertFalse(output.exists())
+                output.write_bytes(dxil)
+            else:
+                self.assertEqual(args[0], "dxv")
+                self.assertEqual(args[1].read_bytes(), dxil)
+
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
+            self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
+        self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxc", "dxv"])
+        self.assertEqual((self.session / (key + ".cso")).read_bytes(), dxil)
+
     def test_scarlett_replays_exact_recorded_requests_before_launch(self):
         directory = self.session.parent
         title = directory / "game_scarlett_master.exe"

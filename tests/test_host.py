@@ -19,6 +19,15 @@ class SelectProton(unittest.TestCase):
             self.assertEqual(proton_installation(str(runner)), install)
             self.assertEqual(proton_installation(str(install)), install)
 
+    @unittest.skipUnless(sys.platform == "linux", "Proton runner symlinks require Linux")
+    def test_explicit_runner_symlink_to_renamed_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp).resolve()
+            (install / "proton-launcher").touch()
+            runner = install / "proton"
+            runner.symlink_to("proton-launcher")
+            self.assertEqual(proton_installation(str(runner)), install)
+
     def test_registered_steam_library(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -112,6 +121,57 @@ class SelectProton(unittest.TestCase):
             self.assertTrue(drive.is_dir())
             host.backend = "native"
             self.assertIsNone(launch(package))
+
+    @unittest.skipUnless(sys.platform == "linux", "Wine prefix drive links require Linux")
+    def test_linux_package_drive_record_is_removed_when_setup_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp).resolve()
+            drive = prefix / "dosdevices/g:"
+            drive.parent.mkdir()
+            drive.symlink_to("../user-g")
+            host = Host.__new__(Host)
+            host.backend, host.command = "proton", ["umu-run"]
+            host.env = {"WINEPREFIX": str(prefix)}
+            log = Mock()
+
+            with patch("project_tuxbox.host.configure_console_cbv", side_effect=OSError("CBV setup failed")):
+                with self.assertRaisesRegex(OSError, "CBV setup failed"):
+                    host.run_game(prefix / "game.exe", [], log, package=prefix / "package")
+
+            log.run.assert_not_called()
+            self.assertEqual(os.readlink(drive), "../user-g")
+            self.assertFalse((prefix / "tuxbox-package-drive.json").exists())
+
+
+@unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
+class OfflineLaunch(unittest.TestCase):
+    def host(self, probe_code=0, stderr=""):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        probe = subprocess.CompletedProcess([], probe_code, stderr=stderr)
+        with patch("project_tuxbox.host.shutil.which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+             patch("project_tuxbox.host.subprocess.check_output", return_value="wine-10.0\n"), \
+             patch("project_tuxbox.host.subprocess.run", return_value=probe) as run:
+            host = Host("wine", None, Path(tmp.name), offline=True)
+        return host, run
+
+    def test_wraps_every_launch_in_a_network_namespace(self):
+        host, run = self.host()
+        wrapper = ["/usr/bin/unshare", "--user", "--map-current-user", "--net", "--"]
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [*wrapper, "true"])
+        self.assertEqual(host.command, [*wrapper, "/usr/bin/wine"])
+        self.assertEqual(host.env["UMU_RUNTIME_UPDATE"], "0")
+        self.assertTrue(host.offline)
+
+    def test_refuses_to_launch_online_when_isolation_fails(self):
+        with self.assertRaisesRegex(ValueError, "Operation not permitted"):
+            self.host(1, "unshare: unshare failed: Operation not permitted\n")
+
+    def test_native_backend_rejects_offline(self):
+        with patch("project_tuxbox.host.platform.machine", return_value="x86_64"), \
+             self.assertRaisesRegex(ValueError, "--offline"):
+            Host("native", None, None, offline=True)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")

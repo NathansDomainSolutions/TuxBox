@@ -29,6 +29,13 @@ constexpr Color first{0, 255, 255, 255}, second{255, 0, 0, 0};
 constexpr DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr Color first{17, 91, 203, 255}, second{244, 51, 115, 69};
 #endif
+// Normalize at compile time. clang 19.1 at /O2 vectorizes the run-time
+// byte-to-float loop for the RGB10 variant into 0/1 lane masks, dropping the
+// 255 scale and clearing with 1/255 instead of 1.0.
+constexpr std::array<float, 4> unorm(const Color& c) {
+    return {c[0] / 255.f, c[1] / 255.f, c[2] / 255.f, c[3] / 255.f};
+}
+constexpr std::array<float, 4> first_rgba = unorm(first), second_rgba = unorm(second);
 constexpr UINT64 guard = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 constexpr UINT64 interval = ((guard + height * pitch + guard - 1) / guard) * guard;
 constexpr SIZE_T bytes = 2 * interval + guard;
@@ -87,11 +94,9 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
 void record(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* view,
             ID3D12Resource* texture, ID3D12Resource* readback, unsigned index) {
     transition(list, texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const auto& color = index ? second : first;
-    float rgba[4];
-    for (size_t k = 0; k < 4; ++k) rgba[k] = color[k] / 255.f;
+    const auto& rgba = index ? second_rgba : first_rgba;
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv{method<CpuHandle>(view, 9)(view)};
-    method<Clear>(list, 52)(list, rtv, rgba, index ? 1 : 0, index ? &inset : nullptr);
+    method<Clear>(list, 52)(list, rtv, rgba.data(), index ? 1 : 0, index ? &inset : nullptr);
 
     const auto tagged_read = static_cast<D3D12_RESOURCE_STATES>(0x120000c0);
     const auto combined_read = static_cast<D3D12_RESOURCE_STATES>(0x8c3);
@@ -131,7 +136,7 @@ void check_snapshots(const BYTE* mapped) {
                 }
                 if (std::memcmp(mapped + i * interval + guard + y * pitch + x * 4, &expected, 4))
                     throw std::runtime_error("pixel mismatch in snapshot " + std::to_string(i + 1) +
-                                             " at " + std::to_string(x) + "," + std::to_string(y));
+                                             " at " + std::to_string(x) + "," + std::to_string(y) + [&] { UINT32 got; std::memcpy(&got, mapped + i * interval + guard + y * pitch + x * 4, 4); char text[48]; std::snprintf(text, sizeof text, " got 0x%08x expected 0x%08x", got, expected); return std::string(text); }());
             }
 }
 

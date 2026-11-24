@@ -3,6 +3,7 @@ from collections import Counter
 from contextlib import contextmanager
 import heapq
 import json
+import math
 from pathlib import Path
 import re
 from tempfile import mkdtemp
@@ -23,23 +24,35 @@ def summarize(trace):
                 event = json.loads(line.strip().removesuffix(","))
             except json.JSONDecodeError:
                 continue
-            if event.get("pid") != "pso" or event.get("ph") != "X":
+            if not isinstance(event, dict) or event.get("pid") != "pso" or event.get("ph") != "X":
                 continue
-            match = re.fullmatch(r"([0-9a-f]{16}) (.+)", event["name"])
+            name = event.get("name")
+            if not isinstance(name, str):
+                continue
+            match = re.fullmatch(r"([0-9a-f]{16}) (\S.*)", name)
             if not match:
+                continue
+            duration, timestamp = event.get("dur"), event.get("ts")
+            if any(type(value) not in (int, float) for value in (duration, timestamp)):
+                continue
+            try:
+                duration /= 1000
+                timestamp /= 1_000_000
+            except OverflowError:
+                continue
+            if not math.isfinite(duration) or not math.isfinite(timestamp):
                 continue
             key, operation = match.groups()
             label = operation.split()[0]
             if label in ("GFX", "COMP", "LINK"):
                 pipeline_kinds[key] = "compute" if label == "COMP" else "graphics"
             kind = "driver_internal" if label == "META" else pipeline_kinds.get(key, "unknown")
-            duration = event["dur"] / 1000
             total = totals.setdefault(kind, Counter())
             total["calls"] += 1
             total["over_100_ms"] += duration >= 100
             total["total_ms"] += duration
             row = dict(pipeline_key=key, operation=operation, duration_ms=round(duration, 3),
-                       type=kind, wine_seconds=round(event["ts"] / 1_000_000, 6))
+                       type=kind, wine_seconds=round(timestamp, 6))
             heapq.heappush(slowest, (duration, index, row))
             if len(slowest) > 20:
                 heapq.heappop(slowest)
