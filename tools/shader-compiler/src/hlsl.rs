@@ -2492,6 +2492,25 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Raw SRV behind a root descriptor whose GPU address arrives in user SGPR `sgpr`.
+    fn root_raw_srv(&mut self, sgpr: u8) -> Option<Res> {
+        let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?
+            .filter(|&[class, _, _, _, loc]| class == 0x100 && (loc >> 8) & 0xff == u32::from(sgpr));
+        let [_, _, register, _, _] = rows.next()?;
+        if rows.next().is_some() {
+            return None;
+        }
+        let mut raw = self.ex.resources.iter().filter(|p| p.res_type == 4 && p.lower == register && p.upper == register);
+        let space = raw.next()?.space;
+        if raw.next().is_some() {
+            return None;
+        }
+        if self.binding_spaces.insert((0, register), space).is_some_and(|old| old != space) {
+            return None;
+        }
+        self.raw_binding(register, false)
+    }
+
     fn raw_binding(&mut self, slot: u32, is_uav: bool) -> Option<Res> {
         let ty = if is_uav { 7 } else { 4 };
         if self.ex.resources.iter().any(|p| p.res_type == ty && p.space == self.binding_spaces.get(&(u32::from(is_uav), slot)).copied().unwrap_or(0) && p.lower <= slot && slot <= p.upper) {
@@ -2976,6 +2995,16 @@ impl<'a> Emitter<'a> {
                         for k in d..d+n as u16 { sym.remove(&k); written.insert(k); }
                         continue;
                     }
+                    // A V# built inline from a root descriptor's GPU address (FSSM class 0x100
+                    // row at that user SGPR, e.g. VS_LinearDepth's s[11:12]) reads the raw SRV
+                    // that PSV declares at the row's register.
+                    if let Some(Sym::Table(t)) = sym.get(&b).copied() {
+                        if let Some(raw) = self.root_raw_srv(t) {
+                            self.res.insert(idx, vec![raw]);
+                            for k in d..d+n as u16 { sym.remove(&k); written.insert(k); }
+                            continue;
+                        }
+                    }
                     // CBV descriptors sit on a 32-byte stride (cb1 is loaded from table offset
                     // 0x20 in MainOnePassPointLightPS).
                     let cands = self.desc_candidates(sym.get(&b)).ok_or_else(|| {
@@ -3026,8 +3055,15 @@ impl<'a> Emitter<'a> {
                         self.res.insert(idx, vec![Res::HeapRaw(rs)]);
                         continue;
                     }
-                    let raw = self.mesh_raw_descriptor(sym, rs)?
-                        .ok_or("typed buffer load requires a verified linear root SRV")?;
+                    let root_raw = match sym.get(&rs).copied() {
+                        Some(Sym::Table(t)) if self.mesh_bindings.is_none() => self.root_raw_srv(t),
+                        _ => None,
+                    };
+                    let raw = match root_raw {
+                        Some(raw) => raw,
+                        None => self.mesh_raw_descriptor(sym, rs)?
+                            .ok_or("typed buffer load requires a verified linear root SRV")?,
+                    };
                     self.res.insert(idx, vec![raw]);
                 }
                 // buffer_gl0_inv / buffer_gl1_inv (MUBUF 0x71 / 0x72) have no resource operands.
@@ -3045,6 +3081,12 @@ impl<'a> Emitter<'a> {
                     if self.compute_heap && sym.get(&rs) == Some(&Sym::HeapDescriptor(4)) {
                         self.res.insert(idx, vec![Res::HeapRaw(rs)]);
                         continue;
+                    }
+                    if let Some(Sym::Table(t)) = sym.get(&rs).copied() {
+                        if let Some(raw) = self.root_raw_srv(t) {
+                            self.res.insert(idx, vec![raw]);
+                            continue;
+                        }
                     }
                     let cands = self.desc_candidates(sym.get(&rs)).ok_or_else(|| {
                         format!("mubuf at {:#x}: s{rs} not a buffer descriptor ({:?})", ins.offset, sym.get(&rs))
@@ -6402,9 +6444,18 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         // Address = element index (IDXEN: first address register) * stride + byte offset
         // (OFFEN: the next address register, or the first when there is no index) + imm.
         let (offen, idxen) = (ins.aux.mask & 1 != 0, ins.aux.mask & 2 != 0);
-        if !self.zero_buffer_offset(ins) {
-            return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
-        }
+        // SOFFSET is one more byte term of the address (buffer base + soffset + voffset +
+        // index * stride + imm); fold a non-zero one into the run-time byte offset.
+        let soff = if self.zero_buffer_offset(ins) {
+            None
+        } else {
+            let o = ins.src.get(2).copied().ok_or("missing MUBUF SOFFSET")?;
+            if !matches!(o, Opnd::Sgpr(_) | Opnd::ConstInt(_)) {
+                return Err("MUBUF with a dynamic SOFFSET is unsupported".into());
+            }
+            self.touch(&o);
+            Some(r(&o)?)
+        };
         let n = Self::mubuf_dwords(&ins.mnemonic).ok_or("unsupported MUBUF op")?;
         let a0 = ins.src[0];
         let a1 = match a0 {
@@ -6419,6 +6470,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.touch(&a1);
                 Some(r(&a1)?)
             }
+        };
+        let voff = match (voff, soff) {
+            (Some(v), Some(s)) => Some(format!("({v}) + ({s})")),
+            (v, None) => v,
+            (None, s) => s,
         };
         let w0 = ins.aux.imm as u32 / 4;
         let vd = match ins.dst[0] {
