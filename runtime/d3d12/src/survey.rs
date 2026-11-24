@@ -43,8 +43,17 @@ pub(crate) fn install() {
 /// 0x4ffd520 asserts when a request is shorter than a whole flagged page run
 /// (an 8 KiB request against a 16 KiB run about 60 s after player selection).
 /// The continue path maps min(run, remaining), which is what was requested.
-const RECOVERABLE: [(usize, [u8; 9]); 1] =
-    [(0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff])];
+///
+/// LOCAL: the same loop's other consistency asserts (0x4ffd859 request past the
+/// run table's sentinel, 0x4ffd85f request before the run, 0x4ffd868) fire in
+/// the open world once the tile heap's run table is shorter than its requests.
+/// Root cause (a short table) is not found yet; continuing may map wrong pages.
+const RECOVERABLE: [(usize, [u8; 9]); 4] = [
+    (0x4ffd879, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xf0, 0xfd, 0xff, 0xff]),
+    (0x4ffd859, [0xcc, 0xe9, 0xa5, 0xfd, 0xff, 0xff, 0xcc, 0x48, 0x8b]),
+    (0x4ffd85f, [0xcc, 0x48, 0x8b, 0x1f, 0xe9, 0xc1, 0xfd, 0xff, 0xff]),
+    (0x4ffd868, [0xcc, 0x48, 0x8b, 0x1f, 0x89, 0xda, 0x81, 0xe2, 0x00]),
+];
 
 fn recoverable(start: usize, end: usize, at: usize) -> bool {
     RECOVERABLE.iter().any(|&(rva, bytes)| {
