@@ -1093,6 +1093,17 @@ unsafe extern "system" fn execute_indirect(
     }
 }
 
+// LOCAL: Xbox list slot 61 (title RVA 0x248cbc1) is not identified yet. The
+// title passes (resource, 1, pointer, u32, 16 zero bytes). Log the first calls
+// and record nothing, so the title keeps running.
+unsafe extern "system" fn unknown_61(_list: &List, a: usize, b: u32, c: usize, d: u64, e: u64, f: u64) {
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+            "list slot 61 ignored: a={a:#x} b={b:#x} c={c:#x} d={d:#x} e={e:#x} f={f:#x}"));
+    }
+}
+
 // Xbox list slot 62 (title RVA 0x979699): copy `bytes` CPU bytes into GPU memory
 // at `address`. The bytes are captured at record time, as the console embeds
 // them in the command buffer, and written in order with immediate writes.
@@ -1188,6 +1199,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[54] = crate::slot!(depth::clear_uav::<true>);
     slots[55] = crate::slot!(discard);
     slots[59] = crate::slot!(execute_indirect);
+    slots[61] = crate::slot!(unknown_61);
     slots[62] = crate::slot!(write_bytes);
     slots[67] = crate::slot!(flush_texture_cache);
     slots[68] = crate::slot!(graphics::depth_bounds);
