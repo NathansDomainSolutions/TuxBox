@@ -1113,6 +1113,18 @@ unsafe extern "system" fn unknown_129(_list: &List, x: u32, y: u32, z: u32) {
     }
 }
 
+// LOCAL: Xbox list slot 101 is a (kind, enable) state toggle with 25 title
+// call sites (e.g. 0x50a6651 sets (2, 1), 0x50a666a clears (2, 0)). Unknown
+// state; log the kinds seen and ignore.
+unsafe extern "system" fn toggle_101(_list: &List, kind: u32, enable: u32) {
+    static KINDS: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(kind, enable)) && seen.len() < 16 {
+        seen.push((kind, enable));
+        crate::diagnostics::log_once(&std::sync::Once::new(), || format!("list slot 101 ignored: kind={kind} enable={enable}"));
+    }
+}
+
 // Xbox list slot 62 (title RVA 0x979699): copy `bytes` CPU bytes into GPU memory
 // at `address`. The bytes are captured at record time, as the console embeds
 // them in the command buffer, and written in order with immediate writes.
@@ -1228,6 +1240,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[121] = crate::slot!(ray_dispatch::dispatch);
     slots[126] = crate::slot!(graphics::shading_rate);
     slots[127] = crate::slot!(graphics::dispatch_mesh);
+    slots[101] = crate::slot!(toggle_101);
     slots[129] = crate::slot!(unknown_129);
     slots[131] = crate::slot!(build_raytracing::batch);
     slots[139] = crate::slot!(reset_extended);
