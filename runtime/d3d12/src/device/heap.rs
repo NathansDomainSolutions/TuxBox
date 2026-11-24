@@ -560,7 +560,8 @@ unsafe fn place_gpu_target(
 ) -> HRESULT {
     let initial = super::format::host_initial_layout(desc, initial);
     let primary = super::depth::primary(desc);
-    if primary.is_some() && initial == D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS {
+    // Only a substituted depth image loses unordered access on the host.
+    if primary.is_some() && super::format::is_depth(desc) && initial == D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS {
         return E_NOTIMPL;
     }
     let mut host = D3D12_RESOURCE_DESC1 {

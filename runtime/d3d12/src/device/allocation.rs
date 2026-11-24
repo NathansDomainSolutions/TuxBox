@@ -20,7 +20,7 @@ fn host_description(desc: &D3D12_RESOURCE_DESC) -> Option<D3D12_RESOURCE_DESC> {
     use super::format::HOST_FLAGS;
     // Console-only flag bits (including DCC) are dropped; the host driver
     // chooses its own compression for the image it creates.
-    super::depth::primary(desc).or_else(|| super::format::substitute(desc)).or_else(|| {
+    super::depth::primary(desc).or_else(|| {
         (desc.Flags.0 & !HOST_FLAGS != 0)
             .then(|| D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAGS(desc.Flags.0 & HOST_FLAGS), ..*desc })
     })
