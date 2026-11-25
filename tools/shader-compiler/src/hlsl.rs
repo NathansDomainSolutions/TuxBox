@@ -55,6 +55,7 @@ mod instance_cull_views;
 mod classify_materials;
 mod int16;
 mod int32;
+mod lds_atomics;
 mod float64;
 mod norm16;
 mod indexed_lane;
@@ -5711,6 +5712,41 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     _ => v,
                 };
                 return self.wv(&dst, &e);
+            }
+            Enc::Ds
+                if self.is_cs
+                    && (lds_atomics::native(m) || lds_atomics::update(m, "", "", "").is_some()) =>
+            {
+                // Group-shared atomics without a matching Interlocked* intrinsic: a
+                // compare-exchange loop on the dword (see hlsl/lds_atomics.rs).
+                if ins.raw[0] & (1 << 17) != 0 {
+                    return Err("GDS is unsupported".into());
+                }
+                self.uses_lds = true;
+                let off = ins.aux.imm as u32 & 0xffff;
+                let t = self.tmp;
+                self.tmp += 1;
+                // Snapshot the address and data before the destination can overwrite them.
+                self.line(&format!("uint t{t} = 0u; if (exec_lo & 1u) {{ uint t{t}a = (({} + {off:#x}u) >> 2) & 8191u;", r(&s[0])?));
+                self.line(&format!("uint t{t}d = {};", r(&s[1])?));
+                if lds_atomics::two_data(m) {
+                    self.line(&format!("uint t{t}e = {};", r(&s[2])?));
+                }
+                match m.replace("_rtn", "").as_str() {
+                    "ds_sub_u32" => self.line(&format!("InterlockedAdd(tb_lds[t{t}a], 0u - (t{t}d), t{t}); }}")),
+                    "ds_cmpst_b32" => self.line(&format!("InterlockedCompareExchange(tb_lds[t{t}a], t{t}d, t{t}e, t{t}); }}")),
+                    _ => {
+                        let new = lds_atomics::update(m, &format!("t{t}s"), &format!("t{t}d"), &format!("t{t}e"))
+                            .ok_or("unsupported LDS atomic")?;
+                        self.line(&format!("InterlockedOr(tb_lds[t{t}a], 0u, t{t}); uint t{t}s;"));
+                        self.line(&format!("[allow_uav_condition] do {{ t{t}s = t{t}; uint t{t}_n = {new};"));
+                        self.line(&format!("InterlockedCompareExchange(tb_lds[t{t}a], t{t}s, t{t}_n, t{t}); }} while (t{t} != t{t}s); }}"));
+                    }
+                }
+                if m.contains("_rtn") {
+                    self.wv(&d.ok_or("no dst")?, &format!("t{t}"))?;
+                }
+                Ok(())
             }
             Enc::Ds
                 if self.is_cs
