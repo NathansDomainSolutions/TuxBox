@@ -28,6 +28,7 @@ mod pixel_quad;
 mod mubuf_offsets;
 mod code_offset;
 mod scalar_bits;
+mod permlane;
 #[cfg(test)]
 mod raw_width;
 #[cfg(test)]
@@ -1407,6 +1408,13 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     if uses_bpermute && insns.iter().any(|ins| ins.enc == Enc::Sopp && Emitter::branch_cond(ins.op).is_some()) {
         return Err("backward permute with scalar branches needs verified convergent control flow".into());
     }
+    // Row permutes other than the established plain permlanex16 read lanes of
+    // a converged wave32, like the backward permute. The cull and page-wave
+    // lowerings keep their own recognized cross-row exchanges.
+    let uses_permlane = !wave_cull && !page_waves && insns.iter().any(permlane::verified_form);
+    if uses_permlane && insns.iter().any(|ins| ins.enc == Enc::Sopp && Emitter::branch_cond(ins.op).is_some()) {
+        return Err("row permute with scalar branches needs verified convergent control flow".into());
+    }
     let uses_quad_add = insns.iter().any(is_quad_exchange);
     let scan = if wave_cull { None } else { wave_scan::prepare(ex, &mut insns)? };
     let scan_width = scan.as_ref().map(|s| s.width);
@@ -1499,7 +1507,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && em.insns.iter().all(|i| i.op != wave_sum::DPP_REDUCE || i.enc != Enc::Vop2
             || matches!(i.mnemonic.as_str(), "v_and_b32" | "v_or_b32" | "v_min_u32" | "v_max_u32" | "v_min_f32" | "v_max_f32" | "v_add_nc_u32" | "v_add_f32"));
     let required_wave_size = if em.pixel_wave { None } else { required_wave_size };
-    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1)) || uses_bpermute || group_extrema).then_some(32));
+    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1)) || uses_bpermute || uses_permlane || group_extrema).then_some(32));
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
@@ -1544,7 +1552,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
         && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
-        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !probe_trace
+        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !uses_permlane && !probe_trace
         && scan_width.is_none() && !particle_sort && !hair_cluster_export && !hair_cluster
         && !instance_cull && !hzb_cull && view_cull.is_none() && !post_cull
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
@@ -6871,6 +6879,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             self.line(&format!("if (exec_lo & 1u) {{ uint t{t} = {x}; {x} = {y}; {y} = t{t}; }}"));
             return Ok(());
         }
+        if permlane::emit(self, self.cur_idx, ins)? { return Ok(()); }
         if m == "v_permlanex16_b32" {
             let flags = (ins.raw[0] >> 11) & 0xf;
             if flags != 0 || ins.aux.mask != 0 || ins.aux.imm != 0 || ins.aux.imm2 != 0 {
