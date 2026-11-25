@@ -1,8 +1,16 @@
 //! Exactly specified double-precision forms on register pairs: rounding to
-//! an integral value and conversions between f64 and 32-bit integers.
+//! an integral value, conversions between f64 and 32-bit integers, and the
+//! IEEE-754 binary64 add, multiply, fused multiply-add and ldexp.
 //! Like the f64 comparisons they use bit operations on `uint2` (low, high)
 //! pairs, so no host FP64 support is required. Each result is exact; the
-//! only mode dependence is whether f64 input denormals are flushed.
+//! only mode dependence is whether f64 denormals are flushed (MODE bit 6
+//! for inputs; bit 7 for arithmetic outputs).
+//!
+//! The arithmetic helpers are soft float on 32-bit words, rounding to
+//! nearest even. Speculative, not checked on hardware: MODE.FP_ROUND is
+//! ignored; output flushing tests the rounded result and keeps its sign; a
+//! NaN operand is returned quieted (the first NaN operand, in source order,
+//! payload kept), and an invalid operation returns +qNaN 0x7ff8000000000000.
 use super::{r, Emitter, Enc, Insn, Opnd};
 
 pub(super) const HELPERS: &str = r#"
@@ -61,26 +69,268 @@ uint2 tb_i32_to_f64(uint v, bool signedInput) {
 }
 "#;
 
-/// Forms whose source is an f64 register pair.
+/// Soft-float arithmetic on register pairs (VOP3 only).
+pub(super) const ARITH_HELPERS: &str = r#"
+uint2 tb_u64_add(uint2 a, uint2 b) {
+    uint lo = a.x + b.x;
+    return uint2(lo, a.y + b.y + (lo < a.x ? 1u : 0u));
+}
+uint2 tb_u64_sub(uint2 a, uint2 b) {
+    return uint2(a.x - b.x, a.y - b.y - (a.x < b.x ? 1u : 0u));
+}
+bool tb_u64_less(uint2 a, uint2 b) {
+    return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+uint2 tb_u64_shl(uint2 a, uint n) {
+    // 0 <= n < 64.
+    if (n == 0u) return a;
+    if (n >= 32u) return uint2(0u, a.x << (n - 32u));
+    return uint2(a.x << n, (a.y << n) | (a.x >> (32u - n)));
+}
+uint2 tb_u64_shr_jam(uint2 a, uint n) {
+    // Shift right; any nonzero bit shifted out sets bit 0.
+    if (n == 0u) return a;
+    if (n >= 64u) return uint2((a.x | a.y) != 0u ? 1u : 0u, 0u);
+    uint2 s;
+    bool lost;
+    if (n >= 32u) {
+        uint k = n - 32u;
+        s = uint2(a.y >> k, 0u);
+        lost = a.x != 0u || (k != 0u && (a.y << (32u - k)) != 0u);
+    } else {
+        s = uint2((a.x >> n) | (a.y << (32u - n)), a.y >> n);
+        lost = (a.x << (32u - n)) != 0u;
+    }
+    return uint2(s.x | (lost ? 1u : 0u), s.y);
+}
+uint tb_u64_clz(uint2 a) {
+    return a.y != 0u ? 31u - firstbithigh(a.y) : a.x != 0u ? 63u - firstbithigh(a.x) : 64u;
+}
+uint2 tb_u32_mul_wide(uint a, uint b) {
+    uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;
+    uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);
+    return uint2((mid << 16) | (p00 & 0xffffu), p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16));
+}
+uint4 tb_u64_mul(uint2 a, uint2 b) {
+    // 128-bit product; .x is the least significant word.
+    uint2 p00 = tb_u32_mul_wide(a.x, b.x), p01 = tb_u32_mul_wide(a.x, b.y);
+    uint2 p10 = tb_u32_mul_wide(a.y, b.x), p11 = tb_u32_mul_wide(a.y, b.y);
+    uint2 c1 = tb_u64_add(tb_u64_add(uint2(p00.y, 0u), uint2(p01.x, 0u)), uint2(p10.x, 0u));
+    uint2 c2 = tb_u64_add(tb_u64_add(uint2(p01.y, 0u), uint2(p10.y, 0u)), tb_u64_add(uint2(p11.x, 0u), uint2(c1.y, 0u)));
+    return uint4(p00.x, c1.x, c2.x, p11.y + c2.y);
+}
+uint4 tb_u128_add(uint4 a, uint4 b) {
+    uint2 lo = tb_u64_add(a.xy, b.xy);
+    return uint4(lo, tb_u64_add(tb_u64_add(a.zw, b.zw), uint2(tb_u64_less(lo, a.xy) ? 1u : 0u, 0u)));
+}
+uint4 tb_u128_sub(uint4 a, uint4 b) {
+    uint2 lo = tb_u64_sub(a.xy, b.xy);
+    return uint4(lo, tb_u64_sub(tb_u64_sub(a.zw, b.zw), uint2(tb_u64_less(a.xy, b.xy) ? 1u : 0u, 0u)));
+}
+bool tb_u128_less(uint4 a, uint4 b) {
+    return tb_u64_less(a.zw, b.zw) || (a.z == b.z && a.w == b.w && tb_u64_less(a.xy, b.xy));
+}
+uint4 tb_u128_shl(uint4 a, uint n) {
+    // 0 <= n < 128.
+    if (n >= 64u) { a = uint4(0u, 0u, a.xy); n -= 64u; }
+    if (n >= 32u) { a = uint4(0u, a.xyz); n -= 32u; }
+    if (n == 0u) return a;
+    return uint4(a.x << n, (a.y << n) | (a.x >> (32u - n)), (a.z << n) | (a.y >> (32u - n)), (a.w << n) | (a.z >> (32u - n)));
+}
+uint4 tb_u128_shr_jam(uint4 a, uint n) {
+    if (n >= 128u) return uint4((a.x | a.y | a.z | a.w) != 0u ? 1u : 0u, 0u, 0u, 0u);
+    bool lost = false;
+    if (n >= 64u) { lost = (a.x | a.y) != 0u; a = uint4(a.zw, 0u, 0u); n -= 64u; }
+    if (n >= 32u) { lost = lost || a.x != 0u; a = uint4(a.yzw, 0u); n -= 32u; }
+    if (n != 0u) {
+        lost = lost || (a.x << (32u - n)) != 0u;
+        a = uint4((a.x >> n) | (a.y << (32u - n)), (a.y >> n) | (a.z << (32u - n)), (a.z >> n) | (a.w << (32u - n)), a.w >> n);
+    }
+    return uint4(a.x | (lost ? 1u : 0u), a.yzw);
+}
+uint tb_u128_clz(uint4 a) {
+    return a.w != 0u ? 31u - firstbithigh(a.w) : a.z != 0u ? 63u - firstbithigh(a.z)
+        : a.y != 0u ? 95u - firstbithigh(a.y) : a.x != 0u ? 127u - firstbithigh(a.x) : 128u;
+}
+bool tb_f64_nan(uint2 x) {
+    uint m = x.y & 0x7fffffffu;
+    return m > 0x7ff00000u || (m == 0x7ff00000u && x.x != 0u);
+}
+uint2 tb_f64_sig(uint2 x, bool keepDenormals) {
+    // Significand with its implicit bit; flushed subnormals give zero.
+    uint e = (x.y >> 20) & 0x7ffu;
+    if (e == 0u) return keepDenormals ? uint2(x.x, x.y & 0xfffffu) : uint2(0u, 0u);
+    return uint2(x.x, (x.y & 0xfffffu) | 0x100000u);
+}
+int tb_f64_exp(uint2 x) {
+    // Biased exponent; subnormals scale like exponent 1.
+    return max(int((x.y >> 20) & 0x7ffu), 1);
+}
+uint2 tb_f64_normalize(uint2 sig, inout int e) {
+    // Move the leading one of a nonzero significand to bit 52.
+    uint shift = tb_u64_clz(sig) - 11u;
+    e -= int(shift);
+    return tb_u64_shl(sig, shift);
+}
+uint2 tb_f64_pack(uint sign, int e, uint2 sig, bool keepDenormals) {
+    // sig has its leading one at bit 62 (or is a subnormal with e == 0) and
+    // its rounding bits below bit 10; e is one less than the biased exponent
+    // of bit 62. Rounds to nearest even: MODE.FP_ROUND is ignored.
+    // A rounding carry at e == 0x7fd produces the infinity encoding itself.
+    if (e > 0x7fd) return uint2(0u, sign | 0x7ff00000u);
+    if (e < 0) {
+        sig = tb_u64_shr_jam(sig, uint(-e));
+        e = 0;
+    }
+    uint roundBits = sig.x & 0x3ffu;
+    sig = tb_u64_add(sig, uint2(0x200u, 0u));
+    sig = uint2((sig.x >> 10) | (sig.y << 22), sig.y >> 10);
+    if (roundBits == 0x200u) sig.x &= ~1u;
+    if ((sig.x | sig.y) == 0u) e = 0;
+    uint hi = sign | ((uint(e) << 20) + sig.y);
+    // Speculative: output flushing tests the rounded result.
+    if (!keepDenormals && (hi & 0x7ff00000u) == 0u) return uint2(0u, sign);
+    return uint2(sig.x, hi);
+}
+uint2 tb_f64_add(uint2 a, uint2 b, bool keepIn, bool keepOut) {
+    if (tb_f64_nan(a) || tb_f64_nan(b)) return tb_f64_nan(a) ? uint2(a.x, a.y | 0x80000u) : uint2(b.x, b.y | 0x80000u);
+    uint signA = a.y & 0x80000000u, signB = b.y & 0x80000000u;
+    bool infA = (a.y & 0x7ff00000u) == 0x7ff00000u, infB = (b.y & 0x7ff00000u) == 0x7ff00000u;
+    if (infA && infB && signA != signB) return uint2(0u, 0x7ff80000u);
+    if (infA) return a;
+    if (infB) return b;
+    uint2 sigA = tb_u64_shl(tb_f64_sig(a, keepIn), 10u), sigB = tb_u64_shl(tb_f64_sig(b, keepIn), 10u);
+    int expA = tb_f64_exp(a), expB = tb_f64_exp(b);
+    if ((sigA.x | sigA.y | sigB.x | sigB.y) == 0u) return uint2(0u, signA & signB);
+    if (expA < expB || (expA == expB && tb_u64_less(sigA, sigB))) {
+        uint2 ts = sigA; sigA = sigB; sigB = ts;
+        int te = expA; expA = expB; expB = te;
+        uint tn = signA; signA = signB; signB = tn;
+    }
+    sigB = tb_u64_shr_jam(sigB, uint(expA - expB));
+    int e = expA - 1;
+    uint2 sig;
+    if (signA == signB) {
+        sig = tb_u64_add(sigA, sigB);
+        if (sig.y >= 0x80000000u) { sig = tb_u64_shr_jam(sig, 1u); e += 1; }
+    } else {
+        sig = tb_u64_sub(sigA, sigB);
+        if ((sig.x | sig.y) == 0u) return uint2(0u, 0u);
+        uint shift = tb_u64_clz(sig) - 1u;
+        sig = tb_u64_shl(sig, shift);
+        e -= int(shift);
+    }
+    return tb_f64_pack(signA, e, sig, keepOut);
+}
+uint2 tb_f64_mul(uint2 a, uint2 b, bool keepIn, bool keepOut) {
+    if (tb_f64_nan(a) || tb_f64_nan(b)) return tb_f64_nan(a) ? uint2(a.x, a.y | 0x80000u) : uint2(b.x, b.y | 0x80000u);
+    uint sign = (a.y ^ b.y) & 0x80000000u;
+    bool infA = (a.y & 0x7ff00000u) == 0x7ff00000u, infB = (b.y & 0x7ff00000u) == 0x7ff00000u;
+    uint2 sigA = tb_f64_sig(a, keepIn), sigB = tb_f64_sig(b, keepIn);
+    bool zero = (sigA.x | sigA.y) == 0u || (sigB.x | sigB.y) == 0u;
+    if (infA || infB) return zero ? uint2(0u, 0x7ff80000u) : uint2(0u, sign | 0x7ff00000u);
+    if (zero) return uint2(0u, sign);
+    int expA = tb_f64_exp(a), expB = tb_f64_exp(b);
+    sigA = tb_f64_normalize(sigA, expA);
+    sigB = tb_f64_normalize(sigB, expB);
+    uint4 p = tb_u64_mul(tb_u64_shl(sigA, 10u), tb_u64_shl(sigB, 11u));
+    uint2 sig = uint2(p.z | ((p.x | p.y) != 0u ? 1u : 0u), p.w);
+    int e = expA + expB - 0x3ff;
+    if (sig.y < 0x40000000u) { e -= 1; sig = tb_u64_shl(sig, 1u); }
+    return tb_f64_pack(sign, e, sig, keepOut);
+}
+uint2 tb_f64_fma(uint2 a, uint2 b, uint2 c, bool keepIn, bool keepOut) {
+    if (tb_f64_nan(a) || tb_f64_nan(b) || tb_f64_nan(c))
+        return tb_f64_nan(a) ? uint2(a.x, a.y | 0x80000u) : tb_f64_nan(b) ? uint2(b.x, b.y | 0x80000u) : uint2(c.x, c.y | 0x80000u);
+    uint signP = (a.y ^ b.y) & 0x80000000u, signC = c.y & 0x80000000u;
+    bool infA = (a.y & 0x7ff00000u) == 0x7ff00000u, infB = (b.y & 0x7ff00000u) == 0x7ff00000u;
+    bool infC = (c.y & 0x7ff00000u) == 0x7ff00000u;
+    uint2 sigA = tb_f64_sig(a, keepIn), sigB = tb_f64_sig(b, keepIn), sigC = tb_f64_sig(c, keepIn);
+    bool zeroP = (sigA.x | sigA.y) == 0u || (sigB.x | sigB.y) == 0u, zeroC = (sigC.x | sigC.y) == 0u;
+    if (infA || infB) return zeroP || (infC && signC != signP) ? uint2(0u, 0x7ff80000u) : uint2(0u, signP | 0x7ff00000u);
+    if (infC) return c;
+    if (zeroP) return zeroC ? uint2(0u, signP & signC) : tb_f64_pack(signC, tb_f64_exp(c) - 1, tb_u64_shl(sigC, 10u), keepOut);
+    int expA = tb_f64_exp(a), expB = tb_f64_exp(b);
+    sigA = tb_f64_normalize(sigA, expA);
+    sigB = tb_f64_normalize(sigB, expB);
+    // The exact product, leading one at bit 125 or 126, is p * 2^scale.
+    uint4 p = tb_u128_shl(tb_u64_mul(sigA, sigB), 21u);
+    int scale = expA + expB - 2171;
+    uint sign = signP;
+    if (!zeroC) {
+        // The addend, leading one at bit 126. Whenever alignment drops bits
+        // the other operand is at least 2^20 times larger, so the sticky
+        // bit stays far below the rounding position.
+        int expC = tb_f64_exp(c);
+        sigC = tb_f64_normalize(sigC, expC);
+        uint4 q = uint4(0u, 0u, tb_u64_shl(sigC, 10u));
+        int scaleC = expC - 1149;
+        if (scaleC > scale) { p = tb_u128_shr_jam(p, uint(scaleC - scale)); scale = scaleC; }
+        else q = tb_u128_shr_jam(q, uint(scale - scaleC));
+        if (signC == signP) {
+            p = tb_u128_add(p, q);
+        } else if (tb_u128_less(p, q)) {
+            p = tb_u128_sub(q, p);
+            sign = signC;
+        } else {
+            p = tb_u128_sub(p, q);
+            if ((p.x | p.y | p.z | p.w) == 0u) return uint2(0u, 0u);
+        }
+    }
+    if (p.w >= 0x80000000u) { p = tb_u128_shr_jam(p, 1u); scale += 1; }
+    else { uint shift = tb_u128_clz(p) - 1u; p = tb_u128_shl(p, shift); scale -= int(shift); }
+    uint2 sig = uint2(p.z | ((p.x | p.y) != 0u ? 1u : 0u), p.w);
+    return tb_f64_pack(sign, scale + 1148, sig, keepOut);
+}
+uint2 tb_f64_ldexp(uint2 a, int n, bool keepIn, bool keepOut) {
+    if (tb_f64_nan(a)) return uint2(a.x, a.y | 0x80000u);
+    if ((a.y & 0x7ff00000u) == 0x7ff00000u) return a;
+    uint sign = a.y & 0x80000000u;
+    uint2 sig = tb_f64_sig(a, keepIn);
+    if ((sig.x | sig.y) == 0u) return uint2(0u, sign);
+    int e = tb_f64_exp(a);
+    sig = tb_f64_normalize(sig, e);
+    return tb_f64_pack(sign, e - 1 + clamp(n, -2200, 2200), tb_u64_shl(sig, 10u), keepOut);
+}
+"#;
+
+/// Forms whose first source is an f64 register pair.
 fn pair_source(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64")
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64") || arith(m)
 }
 
 /// Forms whose result is an f64 register pair.
 pub(super) fn pair_result(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32")
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32") || arith(m)
+}
+
+/// Soft-float arithmetic forms, which use `ARITH_HELPERS`.
+pub(super) fn arith(m: &str) -> bool {
+    matches!(m, "v_add_f64" | "v_mul_f64" | "v_fma_f64" | "v_ldexp_f64")
+}
+
+/// Number of leading f64 register-pair sources.
+fn pair_sources(m: &str) -> usize {
+    match m {
+        "v_fma_f64" => 3,
+        "v_add_f64" | "v_mul_f64" => 2,
+        _ if pair_source(m) => 1,
+        _ => 0,
+    }
 }
 
 pub(super) fn handles(m: &str) -> bool {
     pair_source(m) || pair_result(m)
 }
 
-/// High register of each pair source, for the live-in analysis.
-pub(super) fn pair_source_highs(ins: &Insn) -> Option<u32> {
-    match ins.src.first() {
-        Some(Opnd::Vgpr(n)) if pair_source(&ins.mnemonic) => Some(u32::from(*n) + 1),
+/// High register of each register-pair source, for the live-in analysis.
+pub(super) fn pair_source_highs(ins: &Insn) -> Vec<Opnd> {
+    ins.src.iter().take(pair_sources(&ins.mnemonic)).filter_map(|o| match *o {
+        Opnd::Vgpr(n) => n.checked_add(1).map(Opnd::Vgpr),
+        Opnd::Sgpr(n @ 0..=104) => Some(Opnd::Sgpr(n + 1)),
         _ => None,
-    }
+    }).collect()
 }
 
 impl Emitter<'_> {
@@ -88,6 +338,9 @@ impl Emitter<'_> {
         let m = ins.mnemonic.as_str();
         if !handles(m) {
             return Ok(false);
+        }
+        if arith(m) {
+            return self.lower_f64_arith(ins).map(|()| true);
         }
         // Ordinary VGPR operands only; the VOP3 form without abs, neg,
         // clamp or omod. Verified in compute shaders only.
@@ -140,6 +393,63 @@ impl Emitter<'_> {
         self.wv(&high, &format!("t{t}f64.y"))?;
         Ok(true)
     }
+
+    /// V_ADD_F64, V_MUL_F64, V_FMA_F64 and V_LDEXP_F64 (VOP3). Source abs
+    /// and neg act on the sign bit of each pair; clamp, omod and op_sel are
+    /// refused. Register pairs, inline constants and literals as sources.
+    fn lower_f64_arith(&mut self, ins: &Insn) -> Result<(), String> {
+        let m = ins.mnemonic.as_str();
+        let pairs = pair_sources(m);
+        if ins.enc != Enc::Vop3 || !ins.is_complete() {
+            return Err("unsupported f64 arithmetic encoding".into());
+        }
+        if ins.aux.imm != 0 || ins.aux.imm2 != 0 {
+            return Err("unsupported f64 clamp or output modifier".into());
+        }
+        // Abs and neg only on the f64 sources (not on ldexp's exponent).
+        let modifiable = (1u8 << pairs) - 1;
+        if ins.raw[0] & 0x7800 != 0 || ins.aux.mask & !(modifiable | modifiable << 3) != 0 {
+            return Err("unsupported f64 op_sel or source modifier".into());
+        }
+        if self.ex.stage != super::Stage::Compute {
+            return Err("unverified f64 shader stage".into());
+        }
+        let Some(&Opnd::Vgpr(dst)) = ins.dst.first() else {
+            return Err("unsupported f64 operand".into());
+        };
+        if dst == u8::MAX {
+            return Err("VGPR pair overflows".into());
+        }
+        let mut args = Vec::new();
+        for (i, operand) in ins.src.iter().take(pairs).enumerate() {
+            let (low, mut high) = self.compare_pair(operand, "f64")?;
+            if ins.aux.mask & (1 << i) != 0 {
+                high = format!("({high} & 0x7fffffffu)");
+            }
+            if ins.aux.mask & (8 << i) != 0 {
+                high = format!("({high} ^ 0x80000000u)");
+            }
+            args.push(format!("uint2({low}, {high})"));
+        }
+        if m == "v_ldexp_f64" {
+            let exponent = &ins.src[1];
+            if !matches!(exponent, Opnd::Vgpr(_) | Opnd::Sgpr(_) | Opnd::ConstInt(_) | Opnd::Literal(_)) {
+                return Err("unsupported ldexp exponent operand".into());
+            }
+            args.push(format!("asint({})", r(exponent)?));
+        }
+        let mode = self.regs.contains("tb_fp_mode");
+        let keep_in = if mode { "(tb_fp_mode & 0x40u) != 0u" } else { "true" };
+        let keep_out = if mode { "(tb_fp_mode & 0x80u) != 0u" } else { "true" };
+        let op = &m[2..m.len() - 4];
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint2 t{t}f64 = tb_f64_{op}({}, {keep_in}, {keep_out});", args.join(", ")));
+        self.wv(&Opnd::Vgpr(dst), &format!("t{t}f64.x"))?;
+        let high = Opnd::Vgpr(dst + 1);
+        self.touch(&high);
+        self.wv(&high, &format!("t{t}f64.y"))
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +494,89 @@ pub(super) mod tests {
         // s_denorm_mode 0, then v_floor_f64_e32 v[8:9], v[4:5]
         let hlsl = translate(Stage::Compute, &[0xbfa5_0000, 0x7e10_3504]).unwrap();
         assert!(hlsl.contains("(tb_fp_mode & 0x40u) != 0u"), "{hlsl}");
+    }
+
+    #[test]
+    fn arithmetic_forms_call_soft_float_helpers() {
+        // LLVM gfx1030: v_add_f64 v[8:9], v[4:5], v[6:7]
+        let hlsl = translate(Stage::Compute, &[0xd564_0008, 0x0002_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_add(uint2(v4, v5), uint2(v6, v7), true, true);"), "{hlsl}");
+        assert!(hlsl.contains("uint2 tb_f64_add(uint2 a, uint2 b, bool keepIn, bool keepOut)"));
+        assert!(hlsl.contains("v8 = t") && hlsl.contains("v9 = t"), "{hlsl}");
+        assert!(!hlsl.contains("double"));
+        // Both halves of the unwritten second pair are read on entry.
+        assert!(hlsl.lines().next().unwrap().contains(" v6 v7"), "{hlsl}");
+        // LLVM gfx1030: v_mul_f64 v[8:9], v[4:5], v[6:7]
+        let hlsl = translate(Stage::Compute, &[0xd565_0008, 0x0002_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_mul(uint2(v4, v5), uint2(v6, v7), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_fma_f64 v[8:9], v[4:5], v[6:7], v[4:5]
+        let hlsl = translate(Stage::Compute, &[0xd54c_0008, 0x0412_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_fma(uint2(v4, v5), uint2(v6, v7), uint2(v4, v5), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_ldexp_f64 v[8:9], v[4:5], v6
+        let hlsl = translate(Stage::Compute, &[0xd568_0008, 0x0002_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_ldexp(uint2(v4, v5), asint(v6), true, true);"), "{hlsl}");
+        // The rounding and conversion helpers alone do not pull in soft float.
+        assert!(!translate(Stage::Compute, &[0x7e10_3504]).unwrap().contains("tb_f64_add"));
+    }
+
+    #[test]
+    fn arithmetic_source_modifiers_flip_or_clear_the_sign_bit() {
+        // LLVM gfx1030: v_add_f64 v[8:9], v[4:5], -v[6:7]
+        let hlsl = translate(Stage::Compute, &[0xd564_0008, 0x4002_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_add(uint2(v4, v5), uint2(v6, (v7 ^ 0x80000000u)), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_add_f64 v[8:9], |v[4:5]|, -|v[6:7]|
+        let hlsl = translate(Stage::Compute, &[0xd564_0308, 0x4002_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_add(uint2(v4, (v5 & 0x7fffffffu)), uint2(v6, ((v7 & 0x7fffffffu) ^ 0x80000000u)), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_fma_f64 v[8:9], -v[4:5], v[6:7], -v[2:3]
+        let hlsl = translate(Stage::Compute, &[0xd54c_0008, 0xa40a_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_fma(uint2(v4, (v5 ^ 0x80000000u)), uint2(v6, v7), uint2(v2, (v3 ^ 0x80000000u)), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_ldexp_f64 v[8:9], -v[4:5], s6
+        let hlsl = translate(Stage::Compute, &[0xd568_0008, 0x2000_0d04]).unwrap();
+        assert!(hlsl.contains("tb_f64_ldexp(uint2(v4, (v5 ^ 0x80000000u)), asint(s6), true, true);"), "{hlsl}");
+    }
+
+    #[test]
+    fn arithmetic_accepts_scalar_pairs_and_constants() {
+        // LLVM gfx1030: v_add_f64 v[8:9], s[4:5], v[6:7]
+        let hlsl = translate(Stage::Compute, &[0xd564_0008, 0x0002_0c04]).unwrap();
+        assert!(hlsl.contains("tb_f64_add(uint2(s4, s5), uint2(v6, v7), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_mul_f64 v[8:9], 2.0, v[4:5]
+        let hlsl = translate(Stage::Compute, &[0xd565_0008, 0x0002_08f4]).unwrap();
+        assert!(hlsl.contains("tb_f64_mul(uint2(0x0u, 0x40000000u), uint2(v4, v5), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_mul_f64 v[8:9], 0x40080000, v[4:5] (the literal is the high word)
+        let hlsl = translate(Stage::Compute, &[0xd565_0008, 0x0002_08ff, 0x4008_0000]).unwrap();
+        assert!(hlsl.contains("tb_f64_mul(uint2(0x0u, 0x40080000u), uint2(v4, v5), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_add_f64 v[8:9], -1, v[4:5] (integer constants are 64-bit integers)
+        let hlsl = translate(Stage::Compute, &[0xd564_0008, 0x0002_08c1]).unwrap();
+        assert!(hlsl.contains("tb_f64_add(uint2(0xffffffffu, 0xffffffffu), uint2(v4, v5), true, true);"), "{hlsl}");
+        // LLVM gfx1030: v_fma_f64 v[8:9], v[4:5], v[6:7], 1.0
+        let hlsl = translate(Stage::Compute, &[0xd54c_0008, 0x03ca_0d04]).unwrap();
+        assert!(hlsl.contains("uint2(0x0u, 0x3ff00000u), true, true);"), "{hlsl}");
+    }
+
+    #[test]
+    fn arithmetic_follows_the_f64_denormal_mode() {
+        // s_denorm_mode 0, then v_add_f64 v[8:9], v[4:5], v[6:7]
+        let hlsl = translate(Stage::Compute, &[0xbfa5_0000, 0xd564_0008, 0x0002_0d04]).unwrap();
+        assert!(hlsl.contains("uint2(v6, v7), (tb_fp_mode & 0x40u) != 0u, (tb_fp_mode & 0x80u) != 0u);"), "{hlsl}");
+    }
+
+    #[test]
+    fn arithmetic_output_modifiers_and_unmodelled_forms_are_refused() {
+        // LLVM gfx1030: v_add_f64 v[8:9], v[4:5], v[6:7] clamp
+        assert!(translate(Stage::Compute, &[0xd564_8008, 0x0002_0d04]).is_err());
+        // LLVM gfx1030: v_mul_f64 v[8:9], v[4:5], v[6:7] mul:2
+        assert!(translate(Stage::Compute, &[0xd565_0008, 0x0802_0d04]).is_err());
+        // v_add_f64 v[8:9], v[4:5], v[6:7] with op_sel bit 11 set by hand
+        assert!(translate(Stage::Compute, &[0xd564_0808, 0x0002_0d04]).is_err());
+        // v_ldexp_f64 v[8:9], v[4:5], -v6 (llvm-mc rejects it; neg bit set by hand)
+        assert!(translate(Stage::Compute, &[0xd568_0008, 0x4002_0d04]).is_err());
+        // LLVM gfx1030: v_ldexp_f64 v[8:9], v[4:5], 2.0 (an inline float as the integer exponent)
+        assert!(translate(Stage::Compute, &[0xd568_0008, 0x0001_e904]).is_err());
+        // LLVM gfx1030: v_min_f64 v[8:9], v[4:5], v[6:7] and v_max_f64 (not modelled)
+        assert!(translate(Stage::Compute, &[0xd566_0008, 0x0002_0d04]).is_err());
+        assert!(translate(Stage::Compute, &[0xd567_0008, 0x0002_0d04]).is_err());
+        assert!(translate(Stage::Pixel, &[0xd564_0008, 0x0002_0d04]).is_err());
     }
 
     #[test]
