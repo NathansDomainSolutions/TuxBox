@@ -5580,7 +5580,8 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             Enc::Ds if self.is_gs && matches!(m, "ds_read_b32" | "ds_read2_b32" | "ds_write_b32" | "ds_write2_b32") => {
                 self.emit_gs_lds(ins)
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_read_b64" | "ds_read2_b64" | "ds_read2st64_b64" | "ds_write_b128" | "ds_write_b64" | "ds_write2_b64") => {
+            Enc::Ds if self.is_cs && matches!(m, "ds_read_b64" | "ds_read_b96" | "ds_read_b128" | "ds_read2_b64" | "ds_read2st64_b64"
+                | "ds_write_b64" | "ds_write_b96" | "ds_write_b128" | "ds_write2_b64" | "ds_write2st64_b64") => {
                 if ins.raw[0] & (1 << 17) != 0 { return Err("GDS is unsupported".into()); }
                 self.uses_lds = true;
                 let t = self.tmp;
@@ -5589,9 +5590,14 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 self.line(&format!("uint t{t}addr = {};", r(&s[0])?));
                 let offset = ins.aux.imm as u32;
                 let read = m.starts_with("ds_read");
-                let paired = matches!(m, "ds_read2_b64" | "ds_read2st64_b64" | "ds_write2_b64");
-                let stride = if m == "ds_read2st64_b64" { 512 } else { 8 };
-                let count = if matches!(m, "ds_read_b64" | "ds_write_b64") { 2 } else { 4 };
+                let paired = matches!(m, "ds_read2_b64" | "ds_read2st64_b64" | "ds_write2_b64" | "ds_write2st64_b64");
+                // The two-address offsets count 8-byte elements, or 64 of them for st64.
+                let stride = if m.contains("2st64") { 512 } else { 8 };
+                let count = match m {
+                    "ds_read_b64" | "ds_write_b64" => 2,
+                    "ds_read_b96" | "ds_write_b96" => 3,
+                    _ => 4,
+                };
                 for word in 0..count {
                     let (base, k) = if read {
                         (ins.dst[0], word)
@@ -9562,6 +9568,35 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn wide_group_shared_accesses_move_consecutive_dwords() {
+        use crate::hlsl::float64::tests::translate;
+        let lds = |w: [u32; 2]| translate(Stage::Compute, &w).unwrap();
+        // LLVM gfx1030: ds_read_b96 v[8:10], v1 offset:16
+        let hlsl = lds([0xdbf8_0010, 0x0800_0001]);
+        for (v, byte) in [(8, 16), (9, 20), (10, 24)] {
+            assert!(hlsl.contains(&format!("v{v} = tb_lds[((t")) && hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u]")), "{hlsl}");
+        }
+        assert!(!hlsl.contains("v11 ="), "{hlsl}");
+        // ds_read_b128 v[1:4], v1: the address is read before v1 is overwritten.
+        let hlsl = lds([0xdbfc_0000, 0x0100_0001]);
+        let snapshot = hlsl.find("addr = v1;").expect(&hlsl);
+        assert!(snapshot < hlsl.find("v1 = tb_lds").expect(&hlsl), "{hlsl}");
+        assert!(hlsl.contains("addr + 12u) >> 2) & 8191u]") && hlsl.contains("v4 = tb_lds"), "{hlsl}");
+        // ds_write_b96 v1, v[4:6] offset:12
+        let hlsl = lds([0xdb78_000c, 0x0000_0401]);
+        for (v, byte) in [(4, 12), (5, 16), (6, 20)] {
+            assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+        }
+        // ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2: 512-byte units.
+        let hlsl = lds([0xd93c_0201, 0x0006_0401]);
+        for (v, byte) in [(4, 512), (5, 516), (6, 1024), (7, 1028)] {
+            assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+        }
+        // ds_read_b128 v[8:11], v1 gds
+        assert!(translate(Stage::Compute, &[0xdbfe_0000, 0x0800_0001]).unwrap_err().contains("GDS"));
     }
 
     #[test]
