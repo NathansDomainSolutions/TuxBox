@@ -731,6 +731,11 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
+        if matches!(insns[first].src.first(), Some(Opnd::Raw(233 | 234))) && !wave_sum::has_prologue(insns, first) {
+            // No EXEC save before it: an ordinary DPP8 operation; see `dpp16::prepare`.
+            at = first + 1;
+            continue;
+        }
         if insns[first].src.first() == Some(&Opnd::Raw(250)) {
             // Only two shapes start with a DPP16 operation: the quad add and the
             // min/max reduction behind s_nand_saveexec_b64. The integer and
@@ -1411,12 +1416,15 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && !wave_cull && !page_waves && !resolve_wave32 && !allocation_wave64
         && (ex.root_sig.is_some() || insns.iter().all(|i| !matches!(i.enc, Enc::Smem | Enc::Mubuf)))
         && wave_sum::straight_exchange(&mut insns, compute_group(ex));
+    // The guest wave width shown by the EXEC save of a recognized reduction.
+    let mut reduction_width = None;
     let required_wave_size = if wave_cull {
         fspx_wave.filter(|&width| width == 32)
     } else if straight_exchange { None }
       else {
         let width = lower_wave_reductions(&mut insns)?;
         dpp16::prepare(&mut insns)?;
+        reduction_width = width;
         width
     };
     let required_wave_size = if resolve_wave32 {
@@ -1530,6 +1538,11 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     let required_wave_size = if em.pixel_wave { None } else { required_wave_size };
     let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| (i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1) && !dpp16::marked(i))) || uses_bpermute || uses_permlane || group_extrema).then_some(32));
     em.required_wave_size = required_wave_size;
+    // Host lanes are the guest lanes when the host wave has the guest's known width,
+    // or when a 32-thread group (lanes 0-31 of one guest wave) runs as one host wave.
+    let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul);
+    dpp16::check_row_masks(&em.insns, ex.stage == Stage::Compute && required_wave_size.is_some()
+        && (required_wave_size == reduction_width || required_wave_size == Some(32) && threads == Some(32)))?;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
     em.compute_swizzle = ex.stage == Stage::Compute && scan_width.is_none() && !resolve_wave32
