@@ -4383,7 +4383,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 return Ok(());
             }
             if is_quad_exchange(ins) {
-                if self.loop_depth != 0 {
+                if self.loop_depth != 0 && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
                     return Err("DPP16 exchange inside backward control flow".into());
                 }
                 if open {
@@ -9565,6 +9565,71 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn dpp16_quad_exchange_in_loop_allowed_only_for_pixel_wave_quad_ops() {
+        let ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: None,
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        let loop_insns = |dpp_word: u32| {
+            let mut insns = vec![
+                Insn { offset: 0x0, ..dpp16_move_insn(dpp_word) },
+                Insn {
+                    offset: 0x8,
+                    dwords: 1,
+                    enc: Enc::Sopp,
+                    op: 4, // s_cbranch_scc0
+                    raw: vec![0xbf84fffd],
+                    mnemonic: "s_cbranch_scc0".into(),
+                    dst: vec![],
+                    src: vec![],
+                    aux: tuxbox_dxbc::rdna2::InsnAux { imm: -3, ..Default::default() },
+                },
+            ];
+            lower_wave_reductions(&mut insns).unwrap();
+            insns
+        };
+        let quad_insns = loop_insns(dpp16_word(0, 0xb1, 1, 1, 0xf, 0xf));
+        let mut em = Emitter::new(&ex, quad_insns.clone());
+        em.pixel_wave = true;
+        em.emit_body(true).expect("pixel_wave quad exchange in loop");
+        assert!(em.body.contains("QuadReadAcrossX("));
+
+        let mut em_non_pw = Emitter::new(&ex, quad_insns);
+        let err = em_non_pw.emit_body(true).expect_err("non-pixel_wave refused");
+        assert!(err.contains("DPP16 exchange inside backward control flow"), "{err}");
+
+        let mirror_insns = loop_insns(dpp16_word(2, 0x140, 0, 1, 0xf, 0xf));
+        let mut em_mirror = Emitter::new(&ex, mirror_insns);
+        em_mirror.pixel_wave = true;
+        let err = em_mirror.emit_body(true).expect_err("row_mirror refused");
+        assert!(err.contains("DPP16 exchange inside backward control flow"), "{err}");
     }
 
     #[test]
