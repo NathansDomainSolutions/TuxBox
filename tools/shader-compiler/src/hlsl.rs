@@ -9568,22 +9568,6 @@ mod tests {
     }
 
     #[test]
-    fn remaining_saveexec_forms_combine_with_exec() {
-        use crate::hlsl::float64::tests::translate;
-        // LLVM gfx1030 (wave32): s_nor_saveexec_b32 s8, s4 / s_orn1_saveexec_b32 s8, s4
-        for (w, combine) in [(0xbe88_4204u32, "~(s4 | exec_lo)"), (0xbe88_4504, "~s4 | exec_lo")] {
-            let hlsl = translate(Stage::Compute, &[w]).unwrap();
-            let t = hlsl.find(&format!("l = {combine};")).expect(&hlsl);
-            let saved = hlsl.find("s8 = exec_lo;").expect(&hlsl);
-            assert!(t < saved && saved < hlsl.find("exec_lo = t").expect(&hlsl), "{hlsl}");
-        }
-        // s_xnor_saveexec_b64 s[8:9], s[4:5]
-        let hlsl = translate(Stage::Compute, &[0xbe88_2b04]).unwrap();
-        assert!(hlsl.contains("l = ~(s4 ^ exec_lo);") && hlsl.contains("h = ~(s5 ^ exec_hi);"), "{hlsl}");
-        assert!(hlsl.contains("s9 = exec_hi;") && hlsl.contains("exec_hi = t"), "{hlsl}");
-    }
-
-    #[test]
     fn f16_interp_descriptor_decodes_attr_channel_and_high() {
         // attr=1, chan=0, high=1 (0b00000001 01_00 00_01)
         assert_eq!(Emitter::f16_interp_descriptor(0x00020101), (1, 0, true));
@@ -9625,6 +9609,22 @@ mod tests {
             let expr = tbuf_16_16_16_16_uint_channel(channel, "a", "b");
             assert!(expr.contains("& 65535u"), "channel {channel}: {expr}");
         }
+    }
+
+    #[test]
+    fn remaining_saveexec_forms_combine_with_exec() {
+        use crate::hlsl::float64::tests::translate;
+        // LLVM gfx1030 (wave32): s_nor_saveexec_b32 s8, s4 / s_orn1_saveexec_b32 s8, s4
+        for (w, combine) in [(0xbe88_4204u32, "~(s4 | exec_lo)"), (0xbe88_4504, "~s4 | exec_lo")] {
+            let hlsl = translate(Stage::Compute, &[w]).unwrap();
+            let t = hlsl.find(&format!("l = {combine};")).expect(&hlsl);
+            let saved = hlsl.find("s8 = exec_lo;").expect(&hlsl);
+            assert!(t < saved && saved < hlsl.find("exec_lo = t").expect(&hlsl), "{hlsl}");
+        }
+        // s_xnor_saveexec_b64 s[8:9], s[4:5]
+        let hlsl = translate(Stage::Compute, &[0xbe88_2b04]).unwrap();
+        assert!(hlsl.contains("l = ~(s4 ^ exec_lo);") && hlsl.contains("h = ~(s5 ^ exec_hi);"), "{hlsl}");
+        assert!(hlsl.contains("s9 = exec_hi;") && hlsl.contains("exec_hi = t"), "{hlsl}");
     }
 
     #[test]
