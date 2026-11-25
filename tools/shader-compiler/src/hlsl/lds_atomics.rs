@@ -142,4 +142,22 @@ mod tests {
         let err = compute([0x00, 0x00, 0x06, 0xd8, 0x01, 0x02, 0x00, 0x00]).unwrap_err();
         assert!(err.contains("GDS"), "{err}");
     }
+
+    #[test]
+    fn global_data_share_is_refused_by_the_native_forms_too() {
+        let cases: [[u8; 8]; 4] = [
+            // LLVM gfx1030: ds_add_u32 v1, v2 gds
+            [0x00, 0x00, 0x02, 0xd8, 0x01, 0x02, 0x00, 0x00],
+            // LLVM gfx1030: ds_write_b32 v1, v2 gds
+            [0x00, 0x00, 0x36, 0xd8, 0x01, 0x02, 0x00, 0x00],
+            // LLVM gfx1030: ds_read_u8 v5, v1 gds
+            [0x00, 0x00, 0xea, 0xd8, 0x01, 0x00, 0x00, 0x05],
+            // LLVM gfx1030: ds_read_b32 v5, v1 gds
+            [0x00, 0x00, 0xda, 0xd8, 0x01, 0x00, 0x00, 0x05],
+        ];
+        for bytes in cases {
+            let err = compute(bytes).unwrap_err();
+            assert!(err.contains("GDS"), "{err}");
+        }
+    }
 }

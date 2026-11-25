@@ -5687,6 +5687,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             {
                 // Compute: LDS is the thread group's shared memory → an HLSL `groupshared`
                 // array addressed by byte address / 4 (32 KiB, the D3D groupshared limit).
+                if ins.raw[0] & (1 << 17) != 0 { return Err("GDS is unsupported".into()); }
                 self.uses_lds = true;
                 let off = ins.aux.imm as u32;
                 // Two-address forms scale their 8-bit offsets by 4 bytes ("2") or by
@@ -5738,6 +5739,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8" | "ds_read_u16_d16" | "ds_read_u16_d16_hi") => {
                 // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
                 // read-modify-write the containing dword.
+                if ins.raw[0] & (1 << 17) != 0 {
+                    return Err(if m == "ds_write_b16_d16_hi" { "unsupported global data store halfword write" } else { "GDS is unsupported" }.into());
+                }
                 self.uses_lds = true;
                 let off = ins.aux.imm as u32 & 0xffff;
                 let bits = if m.contains("16") { 16u32 } else { 8 };
@@ -5816,10 +5820,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             {
                 // Atomic read-modify-write on group-shared memory (the `_rtn` forms also
                 // return the old value) → the matching HLSL Interlocked* intrinsic.
-                self.uses_lds = true;
                 if m == "ds_wrxchg_rtn_b32" && ins.raw[0] & (1 << 17) != 0 {
                     return Err("global data store exchange unsupported".into());
                 }
+                if ins.raw[0] & (1 << 17) != 0 { return Err("GDS is unsupported".into()); }
+                self.uses_lds = true;
                 if m == "ds_wrxchg_rtn_b32" && self.insns.iter().any(|op|
                     op.enc == Enc::Sopp && Self::branch_cond(op.op).is_some()) {
                     return Err("LDS exchange with unverified branch convergence".into());
