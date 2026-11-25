@@ -6227,6 +6227,13 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let x = r(&s[0])?;
             return self.wv(&d, &format!("((({x}) & 0x7fffu) > 0x7c00u ? 0u : (asuint((int)clamp({}, -32768.0, 32767.0)) & 0xffffu))", h16(&s[0])?));
         }
+        // These half forms don't yet model SDWA clamp or half inline constants. The SDWA
+        // path below would otherwise re-enter them as plain VOP1/VOP2 forms.
+        if ins.aux.sdwa.is_some()
+            && matches!(m.as_str(), "v_ldexp_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16" | "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16")
+        {
+            return Err(format!("unsupported SDWA form of {m}"));
+        }
         if ins.aux.sdwa.is_none() && m == "v_ldexp_f16" {
             // D.f16 = S0.f16 * 2^S1, with S1 a signed 16-bit exponent. Scaling in f32 is
             // exact over the half range, so the single rounding to half matches.
@@ -6629,10 +6636,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let dst_sel = if is_cmp { 6 } else { (sd >> 8) & 7 };
             if dst_sel == 7 {
                 return Err("SDWA destination select 7 is reserved".into());
-            }
-            // These half forms don't yet model SDWA clamp or half inline constants.
-            if matches!(m.as_str(), "v_ldexp_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16" | "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
-                return Err(format!("unsupported SDWA form of {m}"));
             }
             let mut c = ins.clone();
             c.aux.sdwa = None;
