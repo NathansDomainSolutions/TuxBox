@@ -116,6 +116,11 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
                     && ins.dst.first().is_some_and(|o| ordinary(&known,o,1)) => 1,
                 "s_cmov_b64" if compute && known_scc && src(0,2)
                     && ins.dst.first().is_some_and(|o| ordinary(&known,o,2)) => 2,
+                // Row-permute lane selectors; the vector result defines no SGPR.
+                "v_permlane16_b32" | "v_permlanex16_b32" if src(1,1) && src(2,1) => {
+                    sites.insert(at);
+                    0
+                }
                 _ if ins.enc == Enc::Smem
                     && matches!(em.res.get(&at).map(Vec::as_slice), Some([Res::Cb(_) | Res::CodeTbl]))
                     && (ins.op <= 4 || (8..=12).contains(&ins.op)) => 1usize << (ins.op & 7),
@@ -163,6 +168,12 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
         if let Some(d) = dest { known[d..d+width].fill(true); }
     }
     sites
+}
+
+/// Whether both lane selectors of the row permute at `idx` are proven
+/// ordinary scalar values, not lane masks or unknown words.
+pub(super) fn ordinary_selectors(em: &Emitter<'_>, idx: usize) -> bool {
+    em.ordinary_bit_sites.get_or_init(|| ordinary_sites(em)).contains(&idx)
 }
 
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn) -> Result<bool, String> {
