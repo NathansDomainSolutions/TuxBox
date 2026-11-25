@@ -90,26 +90,50 @@ impl<'a> Emitter<'a> {
         return self.wv(&d, &format!("({pack}({}) | ({pack}({}) << 16))", halves[0], halves[1]));
     }
 
-    /// Pack two values as normalised 16-bit integers.
-    pub(in crate::hlsl) fn emit_pack_unorm16(&mut self, d: Opnd, ins: &Insn) -> Result<(), String> {
-        if ins.raw[0] & 0xfc00 != 0 || ins.raw[1] & 0x98000000 != 0 {
-            return Err("unsupported UNORM16 pack modifiers".into());
+    /// Pack two values as normalised 16-bit integers (UNORM16 or SNORM16).
+    pub(in crate::hlsl) fn emit_pack_norm16(&mut self, d: Opnd, s: &[Opnd], ins: &Insn, signed: bool) -> Result<(), String> {
+        let kind = if signed { "SNORM16" } else { "UNORM16" };
+        // The half-float forms may select either half of each source (op_sel bits 11 and 12).
+        let half = ins.mnemonic.ends_with("_f16");
+        let select = if half { 0x1800 } else { 0 };
+        if ins.raw[0] & 0xfc00 & !select != 0 || ins.raw[1] & 0x98000000 != 0 {
+            return Err(format!("unsupported {kind} pack modifiers"));
         }
         if self.ex.stage == Stage::Pixel {
-            // The direct two-channel export is used for R16G16_UNORM. Until
-            // additional export formats have provenance, reject a skipped or
-            // indirect pack instead of reinterpreting the bits as FP16.
-            let e = self.insns.get(self.cur_idx + 1).ok_or("UNORM16 pack without export")?;
+            // The direct two-channel export is used for R16G16_UNORM and
+            // R16G16_SNORM. Until additional export formats have provenance,
+            // reject a skipped or indirect pack instead of reinterpreting the
+            // bits as FP16.
+            let e = self.insns.get(self.cur_idx + 1).ok_or_else(|| format!("{kind} pack without export"))?;
             if e.enc != Enc::Exp || e.aux.imm != 0 || e.aux.mask != 3 || e.aux.imm2 & 1 == 0
                 || e.src.first() != Some(&d) || self.insns.iter().any(|i| i.enc == Enc::Sopp
                     && Self::branch_cond(i.op).is_some() && i.offset as i64 + 4 + 4*i.aux.imm == e.offset as i64)
             {
-                return Err("unresolved packed UNORM16 pixel export".into());
+                return Err(format!("unresolved packed {kind} pixel export"));
             }
         }
-        let lo = self.fm(ins, 0)?;
-        let hi = self.fm(ins, 1)?;
-        return self.wv(&d, &format!("((uint)round(saturate({lo}) * 65535.0) | ((uint)round(saturate({hi}) * 65535.0) << 16))"));
+        let (lo, hi) = if half {
+            let source = |i: usize| -> Result<String, String> {
+                let high = ins.raw[0] & (0x800 << i) != 0;
+                let x = match &s[i] {
+                    Opnd::ConstF32(_) if high => return Err("high-half selection on inline float".into()),
+                    Opnd::ConstF32(_) => f(&s[i])?,
+                    o => format!("f16tof32(({} >> {}u) & 0xffffu)", r(o)?, if high { 16 } else { 0 }),
+                };
+                Ok(Self::float_source(x, ins.aux.mask, i))
+            };
+            (source(0)?, source(1)?)
+        } else {
+            (self.fm(ins, 0)?, self.fm(ins, 1)?)
+        };
+        if !signed {
+            return self.wv(&d, &norm16::pack(false, &lo, &hi));
+        }
+        // The signed form reads each source twice (NaN test and value).
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("float t{t}lo = {lo}; float t{t}hi = {hi};"));
+        self.wv(&d, &norm16::pack(true, &format!("t{t}lo"), &format!("t{t}hi")))
     }
 
     /// Half precision fused multiply and add.

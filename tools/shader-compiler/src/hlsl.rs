@@ -36,6 +36,7 @@ mod mubuf_offsets;
 mod scalar_values;
 mod code_offset;
 mod scalar_bits;
+mod permlane;
 #[cfg(test)]
 #[path = "tests/hlsl/raw_width.rs"]
 mod raw_width;
@@ -73,7 +74,9 @@ mod instance_cull_views;
 mod classify_materials;
 mod int16;
 mod int32;
+mod lds_atomics;
 mod float64;
+mod norm16;
 mod indexed_lane;
 mod particle_sort;
 mod persistent;
@@ -114,6 +117,7 @@ mod heap_origins;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
+mod dpp16;
 use packed_root::{PackedRoot, RootAbi};
 
 pub struct Translated {
@@ -331,6 +335,8 @@ struct Emitter<'a> {
     exec_snapshots: exec_snapshot::Snapshots,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
+    /// Instructions whose DPP16 source lane was read outside the guards.
+    dpp16_fetched: BTreeSet<usize>,
     indexed_lane: bool,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,

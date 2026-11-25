@@ -209,12 +209,14 @@ impl<'a> Emitter<'a> {
         if ins.aux.sdwa.is_none() && (unary_op.is_some() || half_int_src) {
             return self.emit_half_unary(m.clone(), s, d, ins, unary_op, &modified_half_bits);
         }
-        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16") {
+        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16" | "v_log_f16") {
             let a = h16(&s[0])?;
             let e = match m.as_str() {
                 "v_rcp_f16" => format!("1.0 / {a}"),
                 "v_sqrt_f16" => format!("sqrt({a})"),
                 "v_rsq_f16" => format!("rsqrt({a})"),
+                // Base-2 like v_log_f32: 0 gives -inf and a negative input NaN.
+                "v_log_f16" => format!("log2({a})"),
                 _ => format!("exp2({a})"),
             };
             // The compact reciprocal updates the low half. The FSPX shader first
@@ -245,6 +247,45 @@ impl<'a> Emitter<'a> {
                 value = format!("((({}) & 0x7fffu) > 0x7c00u ? 0u : {value})", r(&s[0])?);
             }
             return self.wv(&d, &format!("(({} & 0xffff0000u) | {value})", r(&d)?));
+        }
+        // These half forms don't yet model SDWA clamp or half inline constants. The SDWA
+        // path below would otherwise re-enter them as plain VOP1/VOP2 forms.
+        if ins.aux.sdwa.is_some()
+            && matches!(m.as_str(), "v_ldexp_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16")
+        {
+            return Err(format!("unsupported SDWA form of {m}"));
+        }
+        if ins.aux.sdwa.is_none() && m == "v_ldexp_f16" {
+            // D.f16 = S0.f16 * 2^S1, with S1 a signed 16-bit exponent. Scaling in f32 is
+            // exact over the half range, so the single rounding to half matches.
+            let n = format!("(asint(({}) << 16) >> 16)", r(&s[1])?);
+            return self.wv(&d, &hres(format!("tb_ldexp({}, {n})", h16(&s[0])?)));
+        }
+        if ins.aux.sdwa.is_none()
+            && matches!(m.as_str(), "v_frexp_mant_f16" | "v_frexp_exp_i16_f16")
+        {
+            if ins.enc == Enc::Vop3 && (ins.aux.imm != 0 || ins.aux.imm2 != 0) {
+                return Err("unsupported half conversion clamp or output modifier".into());
+            }
+            // The 16-bit source pattern with VOP3 abs/neg applied to its sign bit. An inline
+            // float constant denotes the half of that value.
+            let mut bits = match &s[0] {
+                Opnd::ConstF32(_) => format!("f32tof16({})", f(&s[0])?),
+                o => format!("(({}) & 0xffffu)", r(o)?),
+            };
+            if ins.enc == Enc::Vop3 {
+                if ins.aux.mask & 1 != 0 { bits = format!("({bits} & 0x7fffu)"); }
+                if ins.aux.mask & 8 != 0 { bits = format!("({bits} ^ 0x8000u)"); }
+            }
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = {bits};"));
+            let e = if m == "v_frexp_mant_f16" {
+                format!("tb_frexp_mant16(t{t})")
+            } else {
+                format!("(asuint(tb_frexp_exp16(t{t})) & 0xffffu)")
+            };
+            return self.wv(&d, &e);
         }
         if matches!(m.as_str(), "v_fmaak_f16" | "v_fmamk_f16") {
             // The trailing literal dword carries the half-float constant K in its low bits.
@@ -302,8 +343,8 @@ impl<'a> Emitter<'a> {
             let (a, b, acc) = (r(&s[0])?, r(&s[1])?, r(&d)?);
             return self.wv(&d, &format!("tb_fmac_half({a}, {b}, {acc}) | (tb_fmac_half({a} >> 16, {b} >> 16, {acc} >> 16) << 16)"));
         }
-        if m == "v_cvt_pknorm_u16_f32" {
-            return self.emit_pack_unorm16(d, ins);
+        if let Some(signed) = norm16::signed(&m) {
+            return self.emit_pack_norm16(d, s, ins, signed);
         }
         if m == "v_cvt_pk_u8_f32" {
             if ins.aux.mask & !9 != 0 || ins.raw[0] & 0xf800 != 0 || ins.aux.imm2 != 0 {
@@ -461,6 +502,7 @@ impl<'a> Emitter<'a> {
             self.line(&format!("if (exec_lo & 1u) {{ uint t{t} = {x}; {x} = {y}; {y} = t{t}; }}"));
             return Ok(());
         }
+        if permlane::emit(self, self.cur_idx, ins)? { return Ok(()); }
         if m == "v_permlanex16_b32" {
             return self.emit_permlanex16(s, d, ins);
         }
@@ -555,6 +597,20 @@ impl<'a> Emitter<'a> {
         if let Some(e) = fexpr {
             let e = self.fres(ins, e);
             return self.wv(&d, &e);
+        }
+        if matches!(m.as_str(), "v_frexp_mant_f32" | "v_frexp_exp_i32_f32") {
+            // Bit-exact on the input pattern, matching LLVM's constant folding of the
+            // amdgcn frexp intrinsics. Denormal inputs are decomposed exactly; the
+            // MODE register's input flushing is not modelled, as for the other f32 forms.
+            if ins.enc == Enc::Vop3 && (ins.aux.imm != 0 || ins.aux.imm2 != 0) {
+                return Err("unsupported frexp clamp or output modifier".into());
+            }
+            let bits = Self::select_source(ins, a.clone(), 0);
+            return self.wv(&d, &if m == "v_frexp_mant_f32" {
+                format!("tb_frexp_mant({bits})")
+            } else {
+                format!("asuint(tb_frexp_exp({bits}))")
+            });
         }
         let mask = if matches!(self.exec_snapshots.sites.get(&self.cur_idx), Some(exec_snapshot::Site::LaneMask(..))) {
             format!("select_mask{}", self.cur_idx)

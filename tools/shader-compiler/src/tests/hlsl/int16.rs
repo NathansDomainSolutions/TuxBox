@@ -40,9 +40,11 @@ fn inline_half_multiply_preserves_the_high_half() {
         assert!(hlsl.contains(&format!("(v4 & 0xffff0000u) | (({product}) & 0xffffu)")), "{hlsl}");
     }
 
-    // The inline case does not cover op_sel or a trailing literal word.
+    // A constant has no high half to select. A trailing literal is read like
+    // an inline integer (LLVM gfx1030: v_mul_lo_u16 v4, v0, 0x1234).
     assert!(translate(Stage::Compute, &[0xd705_1004, 0x0001_0f00]).is_err());
-    assert!(translate(Stage::Compute, &[0xd705_0004, 0x0001_ff00, 0x1234]).is_err());
+    let hlsl = translate(Stage::Compute, &[0xd705_0004, 0x0001_ff00, 0x1234]).unwrap();
+    assert!(hlsl.contains("(v4 & 0xffff0000u) | (((v0 & 0xffffu) * (0x1234u & 0xffffu)) & 0xffffu)"), "{hlsl}");
 }
 
 #[test]
@@ -64,7 +66,9 @@ fn ordinary_half_forms_preserve_the_other_half() {
         let expr=expression(&decode(first & !0x4000,0x0202_0b04)).unwrap().unwrap();
         assert!(expr.contains("v4 & 0xffff0000u"));
         assert!(expression(&decode(first | 0x8000,0x0202_0b04)).is_err());
-        assert!(expression(&decode(first,0x0202_0a04)).is_err());
+        // s4 is ordinary data; exec_lo holds only this lane's bit.
+        assert!(expression(&decode(first,0x0202_0a04)).unwrap().unwrap().contains("(s4 >> 16)"));
+        assert!(expression(&decode(first,0x0202_0a7e)).is_err());
     }
 }
 
@@ -98,8 +102,17 @@ fn new_16_bit_forms_select_halves_and_preserve_the_other_half() {
         if name.ends_with("_i16") && !name.contains("_nc_") && !name.starts_with("v_mad") {
             assert!(low.contains("asint("), "{name} compares signed");
         }
-        assert!(expression(&decode(first | 0x8000, second)).is_err(), "{name} clamp");
-        assert!(expression(&decode(first, (second & !511) | 4)).is_err(), "{name} sgpr");
+        if name.contains("_nc_i16") {
+            let clamped = expression(&decode(first | 0x8000, second)).unwrap().unwrap();
+            assert!(clamped.contains("0x7fff8000u, 0x80007fffu"), "{name}: {clamped}");
+        } else {
+            assert!(expression(&decode(first | 0x8000, second)).is_err(), "{name} clamp");
+        }
+        let scalar = expression(&decode(first, (second & !511) | 4)).unwrap().unwrap();
+        assert!(scalar.contains("(s4 & 0xffffu)"), "{name}: {scalar}");
+        for mask in [106, 107, 126, 127] {
+            assert!(expression(&decode(first, (second & !511) | mask)).is_err(), "{name} mask {mask}");
+        }
         assert!(expression(&decode(first | 0x100, second)).is_err(), "{name} abs");
     }
     // Source 2 selection for three-operand forms.
@@ -142,4 +155,43 @@ fn new_packed_integer_forms_accept_ordinary_sources_only() {
     let expr = expression(&disassemble(&bytes)[0]).unwrap().unwrap();
     assert!(expr.contains("(v6 & 0xffffu)"));
     assert!(expr.contains("(v6 >> 16)"));
+}
+
+#[test]
+fn ordinary_16_bit_scalar_constant_and_literal_sources() {
+    use crate::hlsl::float64::tests::translate;
+    use crate::Stage;
+    let ok = |words: &[u32], want: &str| {
+        let hlsl = translate(Stage::Compute, words).unwrap();
+        assert!(hlsl.contains(want), "{words:x?}: {hlsl}");
+    };
+    // LLVM gfx1030: v_max3_i16 v5, -1, v2, v3
+    ok(&[0xd755_0005, 0x040e_04c1], "max(max((asint((0xffffffffu & 0xffffu) << 16) >> 16)");
+    // LLVM gfx1030: v_med3_u16 v5, v1, s2, m0 op_sel:[0,1,0,1]
+    ok(&[0xd759_5005, 0x01f0_0501],
+        "v5 = ((v5 & 0xffffu) | (max(min((v1 & 0xffffu), (s2 >> 16)), min(max((v1 & 0xffffu), (s2 >> 16)), (m0 & 0xffffu))) << 16));");
+    // LLVM gfx1030: v_mad_u16 v5, 0x1234, v2, v3
+    ok(&[0xd740_0005, 0x040e_04ff, 0x1234], "(((0x1234u & 0xffffu) * (v2 & 0xffffu) + (v3 & 0xffffu)) & 0xffffu)");
+    // LLVM gfx1030: v_mul_lo_u16 v5, 0x1234, s2
+    ok(&[0xd705_0005, 0x0000_04ff, 0x1234], "(((0x1234u & 0xffffu) * (s2 & 0xffffu)) & 0xffffu)");
+    // LLVM gfx1030: v_add_nc_i16 v5, v1, -1 clamp
+    ok(&[0xd70d_8005, 0x0001_8301], "v5 = ((v5 & 0xffff0000u) | ((clamp((asuint(((asint((v1 & 0xffffu) << 16) >> 16) + (asint((0xffffffffu & 0xffffu) << 16) >> 16))) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u) & 0xffffu));");
+    // LLVM gfx1030: v_sub_nc_i16 v5, s1, v2 op_sel:[0,0,1] clamp
+    ok(&[0xd70e_c005, 0x0002_0401], "v5 = ((v5 & 0xffffu) | ((clamp((asuint(((asint((s1 & 0xffffu) << 16) >> 16) - (asint((v2 & 0xffffu) << 16) >> 16))) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u) << 16));");
+    let refused = |words: &[u32], why: &str| {
+        let err = translate(Stage::Compute, words).unwrap_err();
+        assert!(err.contains(why), "{words:x?}: {err}");
+    };
+    // LLVM gfx1030: v_min3_u16 v5, 1, v2, v3 op_sel:[1,0,0,0]
+    refused(&[0xd753_0805, 0x040e_0481], "high-half selection");
+    // LLVM gfx10 disassembler: v_max3_i16 v5, 0x3800, v2, v3 and v1, v2, 0xc400
+    refused(&[0xd755_0005, 0x040e_04f0], "inline float constant in a 16-bit integer operand");
+    refused(&[0xd755_0005, 0x03de_0501], "inline float constant in a 16-bit integer operand");
+    // LLVM gfx10 disassembler: v_max_u16 v5, exec_hi, v2
+    refused(&[0xd709_0005, 0x0002_047f], "source or encoding");
+    // LLVM gfx10 disassembler: v_max3_u16 v5, v1, v2, v3 clamp; v_mad_u16 ... clamp
+    refused(&[0xd756_8005, 0x040e_0501], "clamp");
+    refused(&[0xd740_8005, 0x040e_0501], "clamp");
+    // LLVM gfx10 disassembler: v_cmp_eq_i16_e64 s10, v1, 0x3800 (inline 0.5)
+    refused(&[0xd48a_000a, 0x0001_e101], "inline float constant in a 16-bit integer compare");
 }

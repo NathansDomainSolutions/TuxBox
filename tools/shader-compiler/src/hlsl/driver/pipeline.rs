@@ -149,10 +149,17 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && !wave_cull && !page_waves && !resolve_wave32 && !allocation_wave64
         && (ex.root_sig.is_some() || insns.iter().all(|i| !matches!(i.enc, Enc::Smem | Enc::Mubuf)))
         && wave_sum::straight_exchange(&mut insns, compute_group(ex));
+    // The guest wave width shown by the EXEC save of a recognized reduction.
+    let mut reduction_width = None;
     let required_wave_size = if wave_cull {
         fspx_wave.filter(|&width| width == 32)
     } else if straight_exchange { None }
-      else { lower_wave_reductions(&mut insns)? };
+      else {
+        let width = lower_wave_reductions(&mut insns)?;
+        dpp16::prepare(&mut insns)?;
+        reduction_width = width;
+        width
+    };
     let required_wave_size = if resolve_wave32 {
         if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
@@ -162,6 +169,13 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     let uses_bpermute = insns.iter().any(|ins| ins.mnemonic == "ds_bpermute_b32");
     if uses_bpermute && insns.iter().any(|ins| ins.enc == Enc::Sopp && Emitter::branch_cond(ins.op).is_some()) {
         return Err("backward permute with scalar branches needs verified convergent control flow".into());
+    }
+    // Row permutes other than the established plain permlanex16 read lanes of
+    // a converged wave32, like the backward permute. The cull and page-wave
+    // lowerings keep their own recognized cross-row exchanges.
+    let uses_permlane = !wave_cull && !page_waves && insns.iter().any(permlane::verified_form);
+    if uses_permlane && insns.iter().any(|ins| ins.enc == Enc::Sopp && Emitter::branch_cond(ins.op).is_some()) {
+        return Err("row permute with scalar branches needs verified convergent control flow".into());
     }
     let uses_quad_add = insns.iter().any(is_quad_exchange);
     let scan = if wave_cull { None } else { wave_scan::prepare(ex, &mut insns)? };
@@ -278,14 +292,14 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
     // a second wave. The fallback host width cannot resolve an asymmetric guest mask.
     if uses_quad_add && required_wave_size.is_none() && !em.one_word_vector_mask()
         && compute_group(ex).into_iter().fold(1u32, u32::saturating_mul) > 32
-        && em.insns.iter().filter(|i| is_quad_exchange(i) && i.enc == Enc::Vop1).any(|i| {
+        && em.insns.iter().filter(|i| is_quad_exchange(i) && i.enc == Enc::Vop1 && !dpp16::marked(i)).any(|i| {
             let rows = i.raw[1] >> 28;
             i.raw[1] & 0x0f00_0000 != 0 && rows & 3 != rows >> 2
         })
     {
         return Err("asymmetric DPP16 row mask requires a known guest wave width".into());
     }
-    let required_wave_size = required_wave_size.or((uses_quad_add && (!em.pixel_wave || em.insns.iter().any(is_row_move)) || uses_bpermute || group_extrema).then_some(32));
+    let required_wave_size = required_wave_size.or((uses_quad_add && (!em.pixel_wave || em.insns.iter().any(|i| is_row_move(i) || dpp16::marked(i))) || uses_bpermute || uses_permlane || group_extrema).then_some(32));
     // A ballot or minimum over active invocations also works in the final
     // partial subgroup. Keep the full-wave requirement for every other user.
     let partial_election = required_wave_size.is_none() && election == Some(ElectionLowering::Native32);
@@ -294,6 +308,11 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
             i.mnemonic == "tb_first_active_lane" || i.mnemonic == "s_ff1_i32_b64"))).then_some(32)
     });
     em.required_wave_size = required_wave_size;
+    // Host lanes are the guest lanes when the host wave has the guest's known width,
+    // or when a 32-thread group (lanes 0-31 of one guest wave) runs as one host wave.
+    let threads = compute_group(ex).into_iter().try_fold(1u32, u32::checked_mul);
+    dpp16::check_row_masks(&em.insns, ex.stage == Stage::Compute && required_wave_size.is_some()
+        && (required_wave_size == reduction_width || required_wave_size == Some(32) && threads == Some(32)))?;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
     em.compute_swizzle = ex.stage == Stage::Compute && scan_width.is_none() && !resolve_wave32
@@ -350,7 +369,7 @@ pub(in crate::hlsl) fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Opti
         && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
         && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
-        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !probe_trace
+        && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !uses_permlane && !probe_trace
         && scan_width.is_none() && !particle_sort && !hair_cluster_export && !hair_cluster
         && !instance_cull && !hzb_cull && view_cull.is_none() && !post_cull
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()

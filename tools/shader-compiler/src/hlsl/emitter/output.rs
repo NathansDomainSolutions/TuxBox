@@ -44,6 +44,9 @@ uint tb_quad_extrema(uint a, uint b, bool maximum, uint mode) {
         if self.insns.iter().any(|i| float64::handles(&i.mnemonic)) {
             h.push_str(float64::HELPERS);
         }
+        if self.insns.iter().any(|i| float64::soft(&i.mnemonic)) {
+            h.push_str(float64::ARITH_HELPERS);
+        }
         if self.insns.iter().any(|i| matches!(i.mnemonic.as_str(), "s_lshr_b64" | "s_ashr_i64" | "s_bfe_u64" | "s_bfe_i64")) {
             h.push_str(r#"
 uint2 tb_shr64(uint lo, uint hi, uint n, bool sign) {

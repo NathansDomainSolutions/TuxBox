@@ -13,12 +13,12 @@ impl<'a> Emitter<'a> {
                 let on = (en >> (i / 2 * 2)) & 1 != 0 || (en >> i) & 1 != 0;
                 comp.push(if on {
                     let word = format!("(({} >> {}) & 0xffffu)", r(src)?, (i % 2) * 16);
-                    if self.cur_idx.checked_sub(1).and_then(|idx| self.insns.get(idx))
-                        .is_some_and(|prior| prior.mnemonic == "v_cvt_pknorm_u16_f32" && prior.dst.first() == Some(src))
-                    {
-                        format!("((float){word} / 65535.0)")
-                    } else {
-                        format!("f16tof32({word})")
+                    let norm = self.cur_idx.checked_sub(1).and_then(|idx| self.insns.get(idx))
+                        .filter(|prior| prior.dst.first() == Some(src))
+                        .and_then(|prior| norm16::signed(&prior.mnemonic));
+                    match norm {
+                        Some(signed) => norm16::export(signed, &word),
+                        None => format!("f16tof32({word})"),
                     }
                 } else {
                     "0.0".into()

@@ -36,7 +36,7 @@ pub(super) fn sign_modifiers(mut bits: String, sign: u32, absolute: bool, negate
 }
 
 impl Emitter<'_> {
-    fn compare_pair(&mut self, operand: &Opnd, ty: &str) -> Result<(String, String), String> {
+    pub(super) fn compare_pair(&mut self, operand: &Opnd, ty: &str) -> Result<(String, String), String> {
         let constant = match *operand {
             Opnd::Literal(bits) => Some(match ty {
                 "f64" => u64::from(bits) << 32,

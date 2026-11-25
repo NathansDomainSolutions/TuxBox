@@ -220,7 +220,12 @@ impl<'a> Emitter<'a> {
                     self.end_guard(&mut open);
                     cur.clear();
                 }
-                if self.pixel_wave && !is_row_move(ins) {
+                if dpp16::marked(ins) {
+                    let skipped = (!active.is_empty()).then(|| {
+                        format!("({})", active.iter().map(|t| format!("j{t}")).collect::<Vec<_>>().join(" || "))
+                    });
+                    dpp16::fetch(self, i, ins, skipped.as_deref())?;
+                } else if self.pixel_wave && !is_row_move(ins) {
                     self.emit_pixel_quad_exchange(i, ins)?;
                 } else {
                     let source = r(&ins.src[0])?;

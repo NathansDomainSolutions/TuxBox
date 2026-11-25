@@ -88,7 +88,7 @@ impl<'a> Emitter<'a> {
             c.aux.imm = 1; // Saturate the full result before packing the destination.
         }
         // Reuse VOP3 floating modifiers after source selection and before destination packing.
-        let half_alu = half_binary || half_int_result || unary_op.is_some() || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16" | "v_cvt_f32_f16");
+        let half_alu = half_binary || half_int_result || unary_op.is_some() || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16" | "v_log_f16" | "v_cvt_f32_f16");
         let float_alu = half_alu || matches!(m.as_str(),
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_min_f32" | "v_max_f32" | "v_fract_f32" | "v_trunc_f32" | "v_ceil_f32"

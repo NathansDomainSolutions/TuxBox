@@ -69,6 +69,8 @@ impl<'a> Emitter<'a> {
         let (x, y) = match ty {
             "i16" | "u16" => {
                 let half = |o: &Opnd| -> Result<String, String> {
+                    // LLVM 18 gives no single value for these (see
+                    // int16::sixteen_bit_source), so they stay refused.
                     if matches!(o, Opnd::ConstF32(_)) {
                         return Err("inline float constant in a 16-bit integer compare".into());
                     }

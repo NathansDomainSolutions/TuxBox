@@ -31,6 +31,30 @@ pub(super) fn half(src: &Opnd, select: u32) -> Result<String, String> {
     })
 }
 
+/// Sources of the ordinary (non-packed) 16-bit forms. A scalar register
+/// holds 32 bits like a VGPR and either half can be selected. Integer inline
+/// constants and literals are 32-bit values whose low half is the 16-bit
+/// operand; selecting their high half is not modelled. EXEC and VCC hold
+/// only this lane's bit in the translator, not the wave mask, so they are
+/// not read as integer data.
+///
+/// Inline float constants stay refused: LLVM 18 does not agree with itself
+/// on their value for a 16-bit integer operand. The disassembler prints the
+/// half-precision pattern (getInlineImmVal16: 0.5 -> 0x3800), while
+/// SIInstrInfo::isInlineConstant never uses them for OPERAND_REG_*_INT16
+/// because they "appear to not work" and "seem" to read the low 16 bits of
+/// the 32-bit pattern (bugzilla 46302), and the encoder (getLit16IntEncoding)
+/// emits such values as literals.
+pub(super) fn sixteen_bit_source(source: &Opnd, high: bool) -> Result<(), String> {
+    match source {
+        Opnd::Vgpr(_) | Opnd::Sgpr(_) | Opnd::M0 => Ok(()),
+        Opnd::ConstInt(_) | Opnd::Literal(_) if !high => Ok(()),
+        Opnd::ConstInt(_) | Opnd::Literal(_) => Err("high-half selection of a 16-bit integer constant".into()),
+        Opnd::ConstF32(_) => Err("inline float constant in a 16-bit integer operand".into()),
+        _ => Err("unsupported ordinary 16-bit integer source or encoding".into()),
+    }
+}
+
 pub(super) fn new_half(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
         "v_mul_lo_u16" | "v_max_u16" | "v_min_u16" | "v_add_nc_i16" | "v_sub_nc_i16"
@@ -76,24 +100,30 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         return Err("unsupported packed integer source or encoding".into());
     }
     let (w0, w1) = (ins.raw[0], ins.raw[1]);
-    let allow_immediates = matches!(ins.mnemonic.as_str(), "v_add_nc_i16" | "v_sub_nc_i16");
-    // gfx1030 accepts inline integers for ordinary multiply without op_sel.
-    let inline_mul = ins.mnemonic == "v_mul_lo_u16" && w0 & 0x7800 == 0;
-    if new_half(ins) && (packed || !ins.src[..arity].iter().enumerate().all(|(i, src)| {
-        matches!(src, Opnd::Vgpr(_))
-            || (inline_mul && matches!(src, Opnd::ConstInt(_)))
-            || (allow_immediates
-                && matches!(src, Opnd::ConstInt(_) | Opnd::Literal(_))
-                && w0 & (1 << (11 + i)) == 0)
-    })) {
-        return Err("unsupported ordinary 16-bit integer source or encoding".into());
+    if new_half(ins) {
+        if packed {
+            return Err("unsupported ordinary 16-bit integer source or encoding".into());
+        }
+        for (i, source) in ins.src[..arity].iter().enumerate() {
+            sixteen_bit_source(source, (w0 >> (11 + i)) & 1 != 0)?;
+        }
+        // A two-source form has no source 2 selector (LLVM prints only
+        // op_sel:[src0, src1, dst]).
+        if arity == 2 && w0 & 0x2000 != 0 {
+            return Err("unsupported ordinary 16-bit integer modifiers".into());
+        }
     }
     // RDNA2 ISA sections 6.5 and 12.10: clamp arithmetic to the
     // representable signed/unsigned 16-bit interval, independently per half.
     let clamped = w0 & 0x8000 != 0;
     let saturating_arithmetic = packed && matches!(op,
         Operation::Add | Operation::Subtract | Operation::Multiply | Operation::MultiplyAdd);
-    if clamped && (!saturating_arithmetic
+    // LLVM 18 selects saddsat/ssubsat on i16 as V_ADD_I16/V_SUB_I16 with
+    // clamp (VOP3Instructions.td, OpSelBinOpClampPat): signed saturation of
+    // the selected halves. The sources were checked above.
+    let signed_saturating_half = !packed
+        && matches!(ins.mnemonic.as_str(), "v_add_nc_i16" | "v_sub_nc_i16");
+    if clamped && !signed_saturating_half && (!saturating_arithmetic
         || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
         return Err("unsupported packed integer clamp form or source".into());
     }
@@ -109,7 +139,7 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         let signed = |x: &str| format!("(asint({x} << 16) >> 16)");
         if clamped {
             let signed_op = matches!(ins.mnemonic.as_str(),
-                "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_mad_i16");
+                "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_mad_i16" | "v_add_nc_i16" | "v_sub_nc_i16");
             if signed_op {
                 let (a, b) = (signed(&a), signed(&b));
                 let value = match op {

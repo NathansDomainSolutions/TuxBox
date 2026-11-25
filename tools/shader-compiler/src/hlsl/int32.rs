@@ -1,9 +1,10 @@
 //! Ordinary VOP3 integer forms with a 32-bit result: the signed no-carry
-//! add/subtract, 16x16+32 multiply-add, saturating integer packs and sums of
-//! absolute differences over bytes, halves and words. Add/subtract and unsigned MAD
-//! accept integer immediates, and byte SAD accepts an inline zero accumulator.
-//! Signed add/subtract also support saturating arithmetic with clamp.
-use super::{int16::half, r, signed_add_overflow, Enc, Insn, Opnd};
+//! add/subtract, the 16x16+32 multiply-add, saturating integer packs and the
+//! sums of absolute differences (SAD) over bytes, halves and words. Sources may be VGPRs,
+//! SGPRs, M0, inline constants or a literal; EXEC and VCC are not read as
+//! data. Clamp is modelled only where LLVM 18 pins it (the signed add and
+//! subtract); other modifiers are refused.
+use super::{int16::{half, sixteen_bit_source}, r, Enc, Insn, Opnd};
 
 pub(super) fn handles(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
@@ -17,41 +18,33 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let mad = ins.mnemonic.starts_with("v_mad_");
-    let add_sub = matches!(ins.mnemonic.as_str(), "v_add_nc_i32" | "v_sub_nc_i32");
-    let pack = matches!(ins.mnemonic.as_str(), "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32");
-    let arity = if add_sub || pack { 2 } else { 3 };
-    if !ins.is_complete() || ins.raw.len() < 2 || ins.src.len() < arity
-        || !ins.src[..arity].iter().enumerate().all(|(index, s)| {
-            matches!(s, Opnd::Vgpr(_))
-                || (add_sub && matches!(s, Opnd::ConstInt(_) | Opnd::Literal(_)))
-                || (index == 2 && ins.mnemonic == "v_sad_u8" && matches!(s, Opnd::ConstInt(0)))
-                || (index == 2 && ins.mnemonic == "v_mad_u32_u16" && matches!(s, Opnd::ConstInt(_)))
-        }) {
+    let arity = if mad || ins.mnemonic.starts_with("v_sad_") { 3 } else { 2 };
+    if !ins.is_complete() || ins.raw.len() < 2 || ins.src.len() < arity {
         return Err("unsupported ordinary 32-bit integer source or encoding".into());
     }
     let (w0, w1) = (ins.raw[0], ins.raw[1]);
+    for (i, source) in ins.src[..arity].iter().enumerate() {
+        if mad && i < 2 {
+            // VOP_I32_I16_I16_I32: the multiplicands are 16-bit operands.
+            sixteen_bit_source(source, (w0 >> (11 + i)) & 1 != 0)?;
+        } else if !matches!(source, Opnd::Vgpr(_) | Opnd::Sgpr(_) | Opnd::M0
+            | Opnd::ConstInt(_) | Opnd::ConstF32(_) | Opnd::Literal(_)) {
+            // A 32-bit integer operand reads an inline float as its f32 bit
+            // pattern (LLVM 18 getInlineImmVal32, isInlinableLiteral32).
+            return Err("unsupported ordinary 32-bit integer source or encoding".into());
+        }
+    }
+    // LLVM 18 selects saddsat/ssubsat on i32 as V_ADD_I32/V_SUB_I32 with
+    // clamp (VOP3Instructions.td, VOPBinOpClampPat).
+    let clamped = w0 & 0x8000 != 0;
+    let saturating = matches!(ins.mnemonic.as_str(), "v_add_nc_i32" | "v_sub_nc_i32");
     // RDNA2 ISA 6.4: op_sel bits 11 and 12 pick the 16-bit half of the two
     // multiplicands. The 32-bit addend and result take no half selection.
     let allowed_select = if mad { 0x1800 } else { 0 };
-    let clamped = w0 & 0x8000 != 0;
-    if (clamped && !add_sub) || w0 & 0x0700 != 0 || w0 & 0x7800 & !allowed_select != 0 || w1 >> 27 != 0 {
+    if (clamped && !saturating) || w0 & 0x0700 != 0 || w0 & 0x7800 & !allowed_select != 0 || w1 >> 27 != 0 {
         return Err("unsupported ordinary 32-bit integer modifiers".into());
     }
     let (a, b) = (r(&ins.src[0])?, r(&ins.src[1])?);
-    if clamped {
-        // Use uint arithmetic so even overflowing inputs have a defined result.
-        let (result, overflow) = if ins.mnemonic == "v_add_nc_i32" {
-            let sum = format!("({a} + {b})");
-            let overflow = signed_add_overflow(&a, &b, &sum);
-            (sum, overflow)
-        } else {
-            let diff = format!("({a} - {b})");
-            let overflow = format!("((({a} ^ {b}) & ({a} ^ {diff})) >> 31)");
-            (diff, overflow)
-        };
-        // On signed overflow the first operand's sign determines which limit to use.
-        return Ok(Some(format!("({overflow} != 0u ? (0x7fffffffu + ({a} >> 31)) : {result})")));
-    }
     // |x - y| of unsigned fields, then the 32-bit accumulator S2 (modular).
     let sad = |width: u32| -> String {
         let mask = (1u64 << width) - 1;
@@ -73,7 +66,13 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         "v_sad_hi_u8" => format!("((({}) << 16) + {})", sad(8), r(&ins.src[2])?),
         "v_sad_u16" => format!("({} + {})", sad(16), r(&ins.src[2])?),
         "v_sad_u32" => format!("((max({a}, {b}) - min({a}, {b})) + {})", r(&ins.src[2])?),
-        // Without clamp these wrap exactly like the unsigned forms.
+        // Without clamp these wrap exactly like the unsigned forms. With
+        // clamp an overflowing result saturates towards the sign of S0:
+        // 0x7fffffff + (S0 >> 31) is INT_MAX or INT_MIN.
+        "v_add_nc_i32" if clamped => format!(
+            "((((~({a} ^ {b})) & ({a} ^ ({a} + {b}))) >> 31) != 0u ? (0x7fffffffu + ({a} >> 31)) : ({a} + {b}))"),
+        "v_sub_nc_i32" if clamped => format!(
+            "(((({a} ^ {b}) & ({a} ^ ({a} - {b}))) >> 31) != 0u ? (0x7fffffffu + ({a} >> 31)) : ({a} - {b}))"),
         "v_add_nc_i32" => format!("({a} + {b})"),
         "v_sub_nc_i32" => format!("({a} - {b})"),
         _ => {

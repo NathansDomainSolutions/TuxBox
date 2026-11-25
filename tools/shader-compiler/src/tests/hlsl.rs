@@ -302,6 +302,50 @@ fn dpp16_quad_perm_fi1_is_accepted_and_keeps_the_perm_in_aux_imm() {
 }
 
 #[test]
+fn half_log_is_base_2_with_half_modifiers() {
+    use crate::hlsl::float64::tests::translate;
+    let line = |words: &[u32]| -> String {
+        let hlsl = translate(Stage::Compute, words).unwrap();
+        hlsl.lines().find(|l| l.contains("log2(")).unwrap_or_else(|| panic!("{hlsl}")).to_string()
+    };
+    // LLVM gfx1030: v_log_f16_e32 v8, v4
+    let e = line(&[0x7e10_af04]);
+    assert!(e.contains("v8 = tb_f16_rne(log2(f16tof32((v4) & 0xffffu)))"), "{e}");
+    // v_log_f16_e64 v8, -|v4| clamp
+    let e = line(&[0xd5d7_8108, 0x2000_0104]);
+    assert!(e.contains("saturate(log2((-abs(f16tof32((v4) & 0xffffu)))))"), "{e}");
+    // v_log_f16_e64 v8, v4 mul:2
+    assert!(line(&[0xd5d7_0008, 0x0800_0104]).contains("* 2.0"));
+    // v_log_f16_sdwa v8, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1
+    let hlsl = translate(Stage::Compute, &[0x7e10_aef9, 0x0005_1504]).unwrap();
+    assert!(hlsl.contains("((v4 >> 16) & 0xffffu)") && hlsl.contains("log2("), "{hlsl}");
+    // v_log_f16_e32 v8, 0.5: the inline constant is the half-float 0.5.
+    let e = line(&[0x7e10_aef0]); assert!(e.contains("log2(asfloat(0x3f000000u))"), "{e}");
+}
+
+#[test]
+fn frexp_decomposes_the_input_bits() {
+    use crate::hlsl::float64::tests::translate;
+    let line = |words: &[u32]| -> String {
+        let hlsl = translate(Stage::Compute, words).unwrap();
+        hlsl.lines().find(|l| l.contains("1u) v8 = ")).unwrap_or_else(|| panic!("{hlsl}")).to_string()
+    };
+    // LLVM gfx1030: v_frexp_mant_f32_e32 v8, v4 and v_frexp_exp_i32_f32_e32 v8, v4
+    assert!(line(&[0x7e10_8104]).contains("v8 = tb_frexp_mant(v4)"));
+    assert!(line(&[0x7e10_7f04]).contains("v8 = asuint(tb_frexp_exp(v4))"));
+    // v_frexp_mant_f32_e64 v8, -|v4| and v_frexp_exp_i32_f32_e64 v8, |v4|
+    assert!(line(&[0xd5c0_0108, 0x2000_0104]).contains("tb_frexp_mant(((v4 & 0x7fffffffu) ^ 0x80000000u))"));
+    assert!(line(&[0xd5bf_0108, 0x0000_0104]).contains("tb_frexp_exp((v4 & 0x7fffffffu))"));
+    // Scalar and inline-constant sources: v_frexp_mant_f32 v8, s4 / -4.0
+    assert!(translate(Stage::Compute, &[0x7e10_8004]).is_ok());
+    assert!(line(&[0x7e10_80f7]).contains("tb_frexp_mant(0xc0800000u)"));
+    // clamp and mul:2 are refused.
+    let err = translate(Stage::Compute, &[0xd5c0_8008, 0x0000_0104]).unwrap_err();
+    assert!(err.contains("unsupported frexp clamp or output modifier"), "{err}");
+    assert!(translate(Stage::Compute, &[0xd5c0_0008, 0x0800_0104]).is_err());
+}
+
+#[test]
 fn dpp16_unimplemented_control_is_refused() {
     // Zero is outside the row_ror range. Quad moves with negation are also unsupported.
     let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x120, 0, 1, 0xf, 0xf))];
@@ -314,6 +358,37 @@ fn dpp16_unimplemented_control_is_refused() {
 fn dpp16_mov_missing_control_word_is_refused() {
     let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
     assert!(lower_wave_reductions(&mut insns).is_err());
+    assert!(dpp16::prepare(&mut insns).unwrap_err().contains("missing DPP16 control word"));
+}
+
+#[test]
+fn half_exponent_forms() {
+    use crate::hlsl::float64::tests::translate;
+    let line = |w: &[u32]| {
+        let hlsl = translate(Stage::Compute, w).unwrap();
+        hlsl.lines().rev().find(|l| l.contains("v8 =")).unwrap_or_default().to_string()
+    };
+    // LLVM gfx1030: v_ldexp_f16_e32 v8, v4, v5
+    let e = line(&[0x7610_0b04]);
+    assert!(e.contains("v8 = tb_f16_rne(tb_ldexp(f16tof32((v4) & 0xffffu), (asint((v5) << 16) >> 16)))"), "{e}");
+    // v_ldexp_f16_e64 v8, -|v4|, v5 clamp
+    let e = line(&[0xd53b_8108, 0x2002_0b04]);
+    assert!(e.contains("saturate(tb_ldexp((-abs(f16tof32((v4) & 0xffffu))), "), "{e}");
+    // v_ldexp_f16_e64 v8, v4, v5 mul:2
+    assert!(line(&[0xd53b_0008, 0x0802_0b04]).contains("* 2.0"));
+    // v_frexp_mant_f16_e32 v8, v4 and v_frexp_exp_i16_f16_e32 v8, v4
+    let hlsl = translate(Stage::Compute, &[0x7e10_b304]).unwrap();
+    assert!(hlsl.contains("= ((v4) & 0xffffu);") && hlsl.contains("v8 = tb_frexp_mant16(t"), "{hlsl}");
+    assert!(line(&[0x7e10_b504]).contains("v8 = (asuint(tb_frexp_exp16(t"));
+    // v_frexp_mant_f16_e64 v8, -|v4|: abs then neg on the sign bit.
+    let hlsl = translate(Stage::Compute, &[0xd5d9_0108, 0x2000_0104]).unwrap();
+    assert!(hlsl.contains("= ((((v4) & 0xffffu) & 0x7fffu) ^ 0x8000u);"), "{hlsl}");
+    // v_frexp_mant_f16_e32 v8, 0.5
+    assert!(translate(Stage::Compute, &[0x7e10_b2f0]).unwrap().contains("f32tof16("));
+    // Refused: clamp on a conversion, and the SDWA form.
+    for w in [&[0xd5d9_8008u32, 0x0000_0104][..], &[0x7e10_b2f9, 0x0005_1504]] {
+        assert!(translate(Stage::Compute, w).is_err(), "{w:x?}");
+    }
 }
 
 #[test]
@@ -511,6 +586,35 @@ fn f16_interp_descriptor_decodes_attr_channel_and_high() {
 }
 
 #[test]
+fn wide_group_shared_accesses_move_consecutive_dwords() {
+    use crate::hlsl::float64::tests::translate;
+    let lds = |w: [u32; 2]| translate(Stage::Compute, &w).unwrap();
+    // LLVM gfx1030: ds_read_b96 v[8:10], v1 offset:16
+    let hlsl = lds([0xdbf8_0010, 0x0800_0001]);
+    for (v, byte) in [(8, 16), (9, 20), (10, 24)] {
+        assert!(hlsl.contains(&format!("v{v} = tb_lds[((t")) && hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u]")), "{hlsl}");
+    }
+    assert!(!hlsl.contains("v11 ="), "{hlsl}");
+    // ds_read_b128 v[1:4], v1: the address is read before v1 is overwritten.
+    let hlsl = lds([0xdbfc_0000, 0x0100_0001]);
+    let snapshot = hlsl.find("addr = v1;").expect(&hlsl);
+    assert!(snapshot < hlsl.find("v1 = tb_lds").expect(&hlsl), "{hlsl}");
+    assert!(hlsl.contains("addr + 12u) >> 2) & 8191u]") && hlsl.contains("v4 = tb_lds"), "{hlsl}");
+    // ds_write_b96 v1, v[4:6] offset:12
+    let hlsl = lds([0xdb78_000c, 0x0000_0401]);
+    for (v, byte) in [(4, 12), (5, 16), (6, 20)] {
+        assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+    }
+    // ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2: 512-byte units.
+    let hlsl = lds([0xd93c_0201, 0x0006_0401]);
+    for (v, byte) in [(4, 512), (5, 516), (6, 1024), (7, 1028)] {
+        assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+    }
+    // ds_read_b128 v[8:11], v1 gds
+    assert!(translate(Stage::Compute, &[0xdbfe_0000, 0x0800_0001]).unwrap_err().contains("GDS"));
+}
+
+#[test]
 fn typed_buffer_16_16_16_16_uint_channels_read_16_bit_words_from_two_dwords() {
     // 8-byte element: [lo: ch0, ch1] [hi: ch2, ch3].
     assert_eq!(tbuf_16_16_16_16_uint_channel(0, "packed", "packed1"), "((packed >> 0u) & 65535u)");
@@ -542,6 +646,22 @@ fn typed_buffer_extraction_masks_to_16_bits() {
         let expr = tbuf_16_16_16_16_uint_channel(channel, "a", "b");
         assert!(expr.contains("& 65535u"), "channel {channel}: {expr}");
     }
+}
+
+#[test]
+fn remaining_saveexec_forms_combine_with_exec() {
+    use crate::hlsl::float64::tests::translate;
+    // LLVM gfx1030 (wave32): s_nor_saveexec_b32 s8, s4 / s_orn1_saveexec_b32 s8, s4
+    for (w, combine) in [(0xbe88_4204u32, "~(s4 | exec_lo)"), (0xbe88_4504, "~s4 | exec_lo")] {
+        let hlsl = translate(Stage::Compute, &[w]).unwrap();
+        let t = hlsl.find(&format!("l = {combine};")).expect(&hlsl);
+        let saved = hlsl.find("s8 = exec_lo;").expect(&hlsl);
+        assert!(t < saved && saved < hlsl.find("exec_lo = t").expect(&hlsl), "{hlsl}");
+    }
+    // s_xnor_saveexec_b64 s[8:9], s[4:5]
+    let hlsl = translate(Stage::Compute, &[0xbe88_2b04]).unwrap();
+    assert!(hlsl.contains("l = ~(s4 ^ exec_lo);") && hlsl.contains("h = ~(s5 ^ exec_hi);"), "{hlsl}");
+    assert!(hlsl.contains("s9 = exec_hi;") && hlsl.contains("exec_hi = t"), "{hlsl}");
 }
 
 #[test]

@@ -18,11 +18,12 @@ fn ordinary_32_bit_forms_accept_vgprs_without_modifiers() {
         let ins = native(first, second);
         assert_eq!(ins.mnemonic, name);
         assert!(expression(&ins).unwrap().unwrap().contains(want), "{name}");
-        if name.starts_with("v_mad_") {
-            assert!(expression(&native(first | 0x8000, second)).is_err(), "{name} clamp");
-        }
+        // Clamp only for the signed add/subtract; abs, neg and EXEC/VCC
+        // data remain refused. An SGPR is ordinary data.
+        assert_eq!(expression(&native(first | 0x8000, second)).is_ok(), name.contains("_nc_"), "{name} clamp");
         assert!(expression(&native(first | 0x100, second)).is_err(), "{name} abs");
-        assert!(expression(&native(first, (second & !511) | 4)).is_err(), "{name} sgpr");
+        assert!(expression(&native(first, (second & !511) | 4)).unwrap().unwrap().contains("s4"), "{name} sgpr");
+        assert!(expression(&native(first, (second & !511) | 126)).is_err(), "{name} exec");
         assert!(expression(&native(first, second | 1 << 29)).is_err(), "{name} neg");
         // Destination or addend half selection has no meaning here.
         assert!(expression(&native(first | 0x4000, second)).is_err(), "{name} dst sel");
@@ -40,9 +41,12 @@ fn unsigned_mad_accepts_a_full_width_inline_integer_accumulator() {
         let expr = expression(&native(0xd773_0004, sources)).unwrap().unwrap();
         assert_eq!(expr, format!("((v1 & 0xffffu) * (v2 & 0xffffu) + {addend})"));
     }
-    // v_mad_u32_u16 v4, 7, v2, v3 and v_mad_i32_i16 v4, v1, v2, 7
-    assert!(expression(&native(0xd773_0004, 0x040e_0487)).is_err());
-    assert!(expression(&native(0xd775_0004, 0x021e_0501)).is_err());
+    // v_mad_u32_u16 v4, 7, v2, v3 and v_mad_i32_i16 v4, v1, v2, 7: a 16-bit
+    // multiplicand takes the constant's low half; the addend is full width.
+    let expr = expression(&native(0xd773_0004, 0x040e_0487)).unwrap().unwrap();
+    assert_eq!(expr, "((0x7u & 0xffffu) * (v2 & 0xffffu) + v3)");
+    let expr = expression(&native(0xd775_0004, 0x021e_0501)).unwrap().unwrap();
+    assert!(expr.ends_with("+ asint(0x7u))"), "{expr}");
 }
 
 #[test]
@@ -94,18 +98,20 @@ fn signed_add_and_subtract_accept_immediate_operands() {
 }
 
 #[test]
-fn byte_sad_accepts_inline_zero_only_as_the_accumulator() {
+fn byte_sad_accepts_integer_constants() {
     // LLVM gfx1030: v_sad_u8 v4, v1, v2, 0
     let expr = expression(&native(0xd55a_0004, 0x0202_0501)).unwrap().unwrap();
     assert_eq!(expr.matches("max(").count(), 4);
     assert!(expr.ends_with("+ 0x0u)"), "{expr}");
 
-    for (opcode, sources) in [
-        (0xd55a_0004, 0x0206_0501), // v_sad_u8 v4, v1, v2, 1
-        (0xd55a_0004, 0x040e_0480), // v_sad_u8 v4, 0, v2, v3
-        (0xd55b_0004, 0x0202_0501), // v_sad_hi_u8 v4, v1, v2, 0
+    // Any integer constant is ordinary data in every SAD operand.
+    for (opcode, sources, tail) in [
+        (0xd55a_0004, 0x0206_0501, "+ 0x1u)"), // v_sad_u8 v4, v1, v2, 1
+        (0xd55a_0004, 0x040e_0480, "+ v3)"),   // v_sad_u8 v4, 0, v2, v3
+        (0xd55b_0004, 0x0202_0501, "+ 0x0u)"), // v_sad_hi_u8 v4, v1, v2, 0
     ] {
-        assert!(expression(&native(opcode, sources)).is_err());
+        let expr = expression(&native(opcode, sources)).unwrap().unwrap();
+        assert!(expr.ends_with(tail), "{expr}");
     }
 }
 
@@ -124,7 +130,8 @@ fn sums_of_absolute_differences_accumulate_into_source_2() {
         assert_eq!(name == "v_sad_hi_u8", expr.contains("<< 16"), "{name}");
         assert!(expression(&native(first | 0x8000, 0x041a_0b04)).is_err(), "{name} clamp");
         assert!(expression(&native(first | 0x0800, 0x041a_0b04)).is_err(), "{name} op_sel");
-        assert!(expression(&native(first, 0x041a_0b04 & !511 | 4)).is_err(), "{name} sgpr");
+        assert!(expression(&native(first, 0x041a_0b04 & !511 | 4)).unwrap().unwrap().contains("s4"), "{name} sgpr");
+        assert!(expression(&native(first, 0x041a_0b04 & !511 | 106)).is_err(), "{name} vcc");
     }
     // Masked and quad SADs remain refused.
     assert!(!handles(&native(0xd571_0007, 0x041a_0b04)));
@@ -143,4 +150,54 @@ fn signed_64_bit_multiply_add_needs_a_null_carry() {
     // The unsigned form now also accepts the null carry LLVM emits.
     let hlsl = translate(Stage::Compute, &[0xd576_7d0a, 0x0422_0b04]).unwrap();
     assert!(hlsl.contains("tb_mulhi_u32(v4, v5) + v9"), "{hlsl}");
+}
+
+#[test]
+fn scalar_constant_and_literal_sources() {
+    use crate::hlsl::float64::tests::translate;
+    use crate::Stage;
+    let ok = |words: &[u32], want: &str| {
+        let hlsl = translate(Stage::Compute, words).unwrap();
+        assert!(hlsl.contains(want), "{words:x?}: {hlsl}");
+    };
+    // LLVM gfx1030: v_sad_u8 v5, s1, v2, v3
+    ok(&[0xd55a_0005, 0x040e_0401], "((s1 >> 24u) & 0xffu)");
+    // LLVM gfx1030: v_sad_u8 v5, v1, -1, v3
+    ok(&[0xd55a_0005, 0x040d_8301], "((0xffffffffu >> 8u) & 0xffu)");
+    // LLVM gfx1030: v_sad_u8 v5, v1, v2, 0.5 (a 32-bit operand: f32 bits)
+    ok(&[0xd55a_0005, 0x03c2_0501], "+ 0x3f000000u)");
+    // LLVM gfx1030: v_sad_hi_u8 v5, m0, v2, 0x12345678
+    ok(&[0xd55b_0005, 0x03fe_047c, 0x1234_5678], "<< 16) + 0x12345678u)");
+    // LLVM gfx1030: v_sad_u16 v5, v1, -16, s3
+    ok(&[0xd55c_0005, 0x000d_a101], "((0xfffffff0u >> 16u) & 0xffffu))) + s3)");
+    // LLVM gfx1030: v_sad_u32 v5, v1, 4.0, s3
+    ok(&[0xd55d_0005, 0x000d_ed01], "v5 = ((max(v1, 0x40800000u) - min(v1, 0x40800000u)) + s3);");
+    // LLVM gfx1030: v_mad_u32_u16 v5, s1, v2, v3 op_sel:[1,0,0,0]
+    ok(&[0xd773_0805, 0x040e_0401], "v5 = ((s1 >> 16) * (v2 & 0xffffu) + v3);");
+    // LLVM gfx1030: v_mad_u32_u16 v5, 0x1234, v2, v3
+    ok(&[0xd773_0005, 0x040e_04ff, 0x1234], "v5 = ((0x1234u & 0xffffu) * (v2 & 0xffffu) + v3);");
+    // LLVM gfx1030: v_mad_i32_i16 v5, v1, -1, -4.0 (only the addend is 32-bit)
+    ok(&[0xd775_0005, 0x03dd_8301], "(asint((0xffffffffu & 0xffffu) << 16) >> 16) + asint(0xc0800000u))");
+    // LLVM gfx1030: v_mad_i32_i16 v5, 64, s2, m0
+    ok(&[0xd775_0005, 0x01f0_04c0], "(asint((s2 & 0xffffu) << 16) >> 16) + asint(m0))");
+    // LLVM gfx1030: v_add_nc_i32 v1, v2, v3 clamp
+    ok(&[0xd77f_8001, 0x0002_0702], "v1 = ((((~(v2 ^ v3)) & (v2 ^ (v2 + v3))) >> 31) != 0u ? (0x7fffffffu + (v2 >> 31)) : (v2 + v3));");
+    // LLVM gfx1030: v_sub_nc_i32 v1, v2, s3 clamp
+    ok(&[0xd776_8001, 0x0000_0702], "v1 = ((((v2 ^ s3) & (v2 ^ (v2 - s3))) >> 31) != 0u ? (0x7fffffffu + (v2 >> 31)) : (v2 - s3));");
+    let refused = |words: &[u32], why: &str| {
+        let err = translate(Stage::Compute, words).unwrap_err();
+        assert!(err.contains(why), "{words:x?}: {err}");
+    };
+    // LLVM gfx1030: v_mad_u32_u16 v5, 0x1234, v2, v3 op_sel:[1,0,0,0]
+    refused(&[0xd773_0805, 0x040e_04ff, 0x1234], "high-half selection");
+    // LLVM gfx10 disassembler: v_mad_i32_i16 v5, 0x3800, v2, v3 (inline 0.5)
+    refused(&[0xd775_0005, 0x040e_04f0], "inline float constant in a 16-bit integer operand");
+    // LLVM gfx10 disassembler: v_sad_u8 v5, exec_lo, v2, v3 and vcc_hi
+    refused(&[0xd55a_0005, 0x040e_047e], "source or encoding");
+    refused(&[0xd55a_0005, 0x040e_046b], "source or encoding");
+    // LLVM gfx10 disassembler: v_sad_u8 v5, ttmp11, v2, v3
+    assert!(translate(Stage::Compute, &[0xd55a_0005, 0x040e_0477]).is_err());
+    // LLVM gfx10 disassembler: v_mad_u32_u16 v5, v1, v2, v3 clamp / op_sel:[0,0,1,0]
+    refused(&[0xd773_8005, 0x040e_0501], "modifiers");
+    refused(&[0xd773_2005, 0x040e_0501], "modifiers");
 }

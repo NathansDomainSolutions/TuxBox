@@ -83,8 +83,14 @@ pub(in crate::hlsl) const HALF_HELPERS: &str = r#"uint tb_trig_f16(uint bits, bo
     return result | ((result != 0u && negative) ? 0x8000u : 0u);
 }
 uint tb_f16_rtz(float x) { return tb_f16_cvt(x, true); }
+uint tb_frexp_mant16(uint h) { uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu; if (e == 0x1fu) return m != 0u ? (h | 0x200u) : h; if (e == 0u) { if (m == 0u) return h; m = (m << (10u - firstbithigh(m))) & 0x3ffu; } return (h & 0x8000u) | 0x3800u | m; }
+int tb_frexp_exp16(uint h) { uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu; if (e == 0x1fu || (e == 0u && m == 0u)) return 0; return e == 0u ? (int)firstbithigh(m) - 23 : (int)e - 14; }
 bool tb_isnan(float x) { return (asuint(x) & 0x7fffffffu) > 0x7f800000u; }
 float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a < b ? a : b)); }
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
 float tb_med3(float a, float b, float c) { if (tb_isnan(a) || tb_isnan(b) || tb_isnan(c)) return tb_min(tb_min(a, b), c); float mx = tb_max(tb_max(a, b), c); if (mx == a) return tb_max(b, c); if (mx == b) return tb_max(a, c); return tb_max(a, b); }
+// frexp: the significand in [0.5, 1) with the input sign, and the matching exponent.
+// Infinity and NaN keep their value (NaN quieted) with exponent 0; zero gives zero and 0.
+uint tb_frexp_mant(uint b) { uint e = (b >> 23) & 0xffu, m = b & 0x7fffffu; if (e == 0xffu) return m != 0u ? (b | 0x400000u) : b; if (e == 0u) { if (m == 0u) return b; m = (m << (23u - firstbithigh(m))) & 0x7fffffu; } return (b & 0x80000000u) | 0x3f000000u | m; }
+int tb_frexp_exp(uint b) { uint e = (b >> 23) & 0xffu, m = b & 0x7fffffu; if (e == 0xffu || (e == 0u && m == 0u)) return 0; return e == 0u ? (int)firstbithigh(m) - 148 : (int)e - 126; }
 "#;

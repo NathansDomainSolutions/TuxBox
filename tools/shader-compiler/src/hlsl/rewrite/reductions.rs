@@ -75,8 +75,19 @@ pub(in crate::hlsl) fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Optio
             at = first + 1;
             continue;
         }
-        if red == "v_add_f32" && insns[first].src.first() == Some(&Opnd::Raw(250)) {
-            return Err(bad("unsupported DPP16 FP32 add controls"));
+        if matches!(insns[first].src.first(), Some(Opnd::Raw(233 | 234))) && !wave_sum::has_prologue(insns, first) {
+            // No EXEC save before it: an ordinary DPP8 operation; see `dpp16::prepare`.
+            at = first + 1;
+            continue;
+        }
+        if insns[first].src.first() == Some(&Opnd::Raw(250))
+            && !(matches!(red.as_str(), "v_min_f32" | "v_max_f32") && first >= 3 && (insns[first - 3].enc, insns[first - 3].op) == (Enc::Sop1, 0x29))
+        {
+            // Besides the quad shapes above, only the min/max reduction behind
+            // s_nand_saveexec_b64 starts with a DPP16 operation; the integer and
+            // masked reductions start with DPP8. Leave anything else to `dpp16`.
+            at = first + 1;
+            continue;
         }
         let saved_extrema = matches!(red.as_str(), "v_min_f32" | "v_max_f32")
             && (first.checked_sub(3).is_some_and(|p| matches!(insns[p].mnemonic.as_str(), "s_or_saveexec_b32" | "s_or_saveexec_b64"))

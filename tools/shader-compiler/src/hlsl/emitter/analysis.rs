@@ -519,9 +519,11 @@ impl<'a> Emitter<'a> {
             if setreg {
                 continue;
             }
-            if let Some(high) = float64::pair_source_highs(ins) {
-                if !written.contains(&format!("v{high}")) {
-                    live.insert((1, high));
+            for high in float64::pair_source_highs(ins) {
+                if let (Opnd::Sgpr(n) | Opnd::Vgpr(n), Ok(nm)) = (&high, name(&high)) {
+                    if !written.contains(&nm) {
+                        live.insert((u8::from(matches!(high, Opnd::Vgpr(_))), u32::from(*n)));
+                    }
                 }
             }
             let atomic = ins.mnemonic.starts_with("image_atomic_");

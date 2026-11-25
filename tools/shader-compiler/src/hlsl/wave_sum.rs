@@ -177,6 +177,15 @@ pub(super) fn masked_floating(insns: &[Insn], first: usize) -> bool {
     masked_prologue(insns, first, id).is_some()
 }
 
+/// Whether the DPP8 operation at `first` may start a reduction: an EXEC save
+/// within the six instructions before it (the longest prologue, the masked
+/// floating one, has four), or the masked prologue. Anything else is left to
+/// `dpp16`; a malformed reduction is still refused by `lower`.
+pub(super) fn has_prologue(insns: &[Insn], first: usize) -> bool {
+    insns[first.saturating_sub(6)..first].iter().any(|i| i.mnemonic.contains("saveexec") || (i.enc == Enc::Sop1 && i.op == 0x29))
+        || masked_identity(&insns[first].mnemonic).is_some_and(|id| masked_prologue(insns, first, id).is_some())
+}
+
 pub(super) fn lower(insns: &mut [Insn], first: usize) -> Result<(u32, usize), &'static str> {
     let start = first.checked_sub(2).ok_or("missing reduction prologue")?;
     let tail = &insns[start..];

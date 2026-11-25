@@ -9,6 +9,7 @@ pub(in crate::hlsl) fn is_quad_exchange(i: &Insn) -> bool {
     (i.enc == Enc::Vop2 && i.op == OP_DPP_BINARY)
         || (i.enc == Enc::Vop1 && i.op == OP_QUAD_MOVE)
         || is_row_move(i)
+        || dpp16::marked(i)
 }
 
 pub(in crate::hlsl) fn lower_dpp_binary(ins: &mut Insn) {

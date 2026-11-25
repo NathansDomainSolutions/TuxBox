@@ -20,6 +20,9 @@ fn shape(m: &str) -> Option<Shape> {
         "s_brev_b64" => (2, 2, false, false),
         "s_bitset0_b64" | "s_bitset1_b64" => (1, 2, true, false),
         "s_bitcmp0_b64" | "s_bitcmp1_b64" => (2, 0, false, true),
+        "s_quadmask_b32" => (1, 1, false, false),
+        "s_quadmask_b64" => (2, 2, false, false),
+        "s_bitreplicate_b64_b32" => (1, 2, false, false),
         _ => return None,
     };
     Some(Shape { src, dst, reads_dst, indexed })
@@ -113,6 +116,11 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
                     && ins.dst.first().is_some_and(|o| ordinary(&known,o,1)) => 1,
                 "s_cmov_b64" if compute && known_scc && src(0,2)
                     && ins.dst.first().is_some_and(|o| ordinary(&known,o,2)) => 2,
+                // Row-permute lane selectors; the vector result defines no SGPR.
+                "v_permlane16_b32" | "v_permlanex16_b32" if src(1,1) && src(2,1) => {
+                    sites.insert(at);
+                    0
+                }
                 _ if ins.enc == Enc::Smem
                     && matches!(em.res.get(&at).map(Vec::as_slice), Some([Res::Cb(_) | Res::CodeTbl]))
                     && (ins.op <= 4 || (8..=12).contains(&ins.op)) => 1usize << (ins.op & 7),
@@ -138,14 +146,15 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
             | "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32" | "s_lshl_b64" | "s_lshr_b64"
             | "s_ashr_i64" | "s_not_b32" | "s_not_b64" | "s_bcnt1_i32_b32"
             | "s_bcnt1_i32_b64" | "s_bcnt0_i32_b32" | "s_bcnt0_i32_b64"
-            | "s_abs_i32" | "s_bfe_u32" | "s_bfe_i32" =>
+            | "s_abs_i32" | "s_bfe_u32" | "s_bfe_i32"
+            | "s_quadmask_b32" | "s_quadmask_b64" =>
                 width>0 && ins.dst.first().and_then(|d| register(d,width)).is_some(),
             "s_mov_b32" | "s_mov_b64" | "s_movk_i32" | "s_cmov_b32" | "s_cmov_b64"
             | "s_cselect_b32" | "s_cselect_b64" | "s_brev_b32" | "s_brev_b64"
             | "s_ff0_i32_b32" | "s_ff0_i32_b64" | "s_ff1_i32_b32"
             | "s_flbit_i32_b32" | "s_flbit_i32_b64" | "s_flbit_i32" | "s_flbit_i32_i64"
             | "s_sext_i32_i8" | "s_sext_i32_i16" | "s_bitset0_b32" | "s_bitset1_b32"
-            | "s_bitset0_b64" | "s_bitset1_b64" | "s_mul_i32" =>
+            | "s_bitset0_b64" | "s_bitset1_b64" | "s_mul_i32" | "s_bitreplicate_b64_b32" =>
                 known_scc && width>0 && ins.dst.first().and_then(|d| register(d,width)).is_some(),
             _ => false,
         };
@@ -159,6 +168,12 @@ fn ordinary_sites(em: &Emitter<'_>) -> BTreeSet<usize> {
         if let Some(d) = dest { known[d..d+width].fill(true); }
     }
     sites
+}
+
+/// Whether both lane selectors of the row permute at `idx` are proven
+/// ordinary scalar values, not lane masks or unknown words.
+pub(super) fn ordinary_selectors(em: &Emitter<'_>, idx: usize) -> bool {
+    em.ordinary_bit_sites.get_or_init(|| ordinary_sites(em)).contains(&idx)
 }
 
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn) -> Result<bool, String> {
@@ -199,6 +214,41 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn) -> Result<bool,
             em.line(&format!("uint {index} = {a} & 63u;"));
             em.line(&format!("uint {low} = {dl} {op} ({index} < 32u ? (1u << ({index} & 31u)) : 0u);"));
             em.line(&format!("uint {high} = {dh} {op} ({index} >= 32u ? (1u << ({index} & 31u)) : 0u);"));
+            em.ws(dst, &low)?;
+            em.ws(&hi(dst), &high)?;
+        }
+        // LLVM folds s_quadmask(0x85003092) to 0xcb and the b64 form of
+        // 0x67d000fc85f00a90 to 0xe3e6 (high word 0): result bit i is set
+        // when source nibble i is nonzero. LLVM main lists SCC as an implicit
+        // def; its value, D != 0, follows the RDNA ISA pseudocode.
+        "s_quadmask_b32" | "s_quadmask_b64" => {
+            let quad = |word: &str, var: &str| [
+                format!("uint {var} = ({word} | ({word} >> 1) | ({word} >> 2) | ({word} >> 3)) & 0x11111111u;"),
+                format!("{var} = ({var} | ({var} >> 3)) & 0x03030303u;"),
+                format!("{var} = ({var} | ({var} >> 6)) & 0x000f000fu;"),
+                format!("{var} = ({var} | ({var} >> 12)) & 0xffu;"),
+            ];
+            for line in quad(&a, &low) { em.line(&line); }
+            if form.src == 2 {
+                for line in quad(&upper, &high) { em.line(&line); }
+                em.line(&format!("{low} |= {high} << 8;"));
+            }
+            em.line(&format!("scc = uint({low} != 0u);"));
+            em.ws(dst, &low)?;
+            if form.dst == 2 { em.ws(&hi(dst), "0u")?; }
+        }
+        // Source bit i becomes result bits 2i and 2i+1; LLVM folds
+        // 0x85fe3a92 to 0xc033fffc_0fccc30c. SCC is not written.
+        "s_bitreplicate_b64_b32" => {
+            let spread = |half: String, var: &str| [
+                format!("uint {var} = {half};"),
+                format!("{var} = ({var} | ({var} << 8)) & 0x00ff00ffu;"),
+                format!("{var} = ({var} | ({var} << 4)) & 0x0f0f0f0fu;"),
+                format!("{var} = ({var} | ({var} << 2)) & 0x33333333u;"),
+                format!("{var} = (({var} | ({var} << 1)) & 0x55555555u) * 3u;"),
+            ];
+            for line in spread(format!("{a} & 0xffffu"), &low) { em.line(&line); }
+            for line in spread(format!("{a} >> 16"), &high) { em.line(&line); }
             em.ws(dst, &low)?;
             em.ws(&hi(dst), &high)?;
         }

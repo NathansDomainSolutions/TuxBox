@@ -225,3 +225,111 @@ fn scalar_bit_cpu_oracle_fixture() {
         println!("BEGIN_SCALAR {name}\n{hlsl}END_SCALAR {name}");
     }
 }
+
+// LLVM gfx1030 words for the quad-mask and bit-replicate forms, including
+// destinations that alias the source.
+const QUAD_OPS: [(&str, u32); 6] = [
+    ("s_quadmask_b32", 0xbe82_2c02),          // s_quadmask_b32 s2, s2
+    ("s_quadmask_b32", 0xbe84_2c02),          // s_quadmask_b32 s4, s2
+    ("s_quadmask_b64", 0xbe82_2d02),          // s_quadmask_b64 s[2:3], s[2:3]
+    ("s_quadmask_b64", 0xbe84_2d02),          // s_quadmask_b64 s[4:5], s[2:3]
+    ("s_bitreplicate_b64_b32", 0xbe82_3b03),  // s_bitreplicate_b64_b32 s[2:3], s3
+    ("s_bitreplicate_b64_b32", 0xbe84_3b02),  // s_bitreplicate_b64_b32 s[4:5], s2
+];
+
+/// Statements emitted for the operation alone, after the ordinary setup.
+fn op_body(op: u32) -> String {
+    let words = program(op, 0x8500_3092, 0x67d0_00fc, 1);
+    let ex = extract(&words);
+    let ops = disassemble(&ex.isa);
+    let mut em = Emitter::new(&ex, ops.clone());
+    em.emit_insn(4, &ops[4], false, None).unwrap_or_else(|e| panic!("{op:#x}: {e}"));
+    em.body.clone()
+}
+
+#[test]
+fn quad_mask_and_bit_replicate_translate_with_flag_rules() {
+    for (name, op) in QUAD_OPS {
+        let ex = extract(&program(op, 0x8500_3092, 0x67d0_00fc, 1));
+        let ops = disassemble(&ex.isa);
+        assert_eq!(ops[4].mnemonic, name);
+        super::super::translate(&ex).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let body = op_body(op);
+        // Quad masks write SCC = D != 0; bit replication leaves SCC alone.
+        assert_eq!(body.contains("scc = "), name.starts_with("s_quadmask"), "{name}\n{body}");
+        let dst = (op >> 16) & 127;
+        assert!(body.contains(&format!("s{dst} = tb_bit")), "{name}\n{body}");
+        if name != "s_quadmask_b32" {
+            let high = if name == "s_quadmask_b64" { "0u".to_string() } else { "tb_bit".to_string() };
+            assert!(body.contains(&format!("s{} = {high}", dst + 1)), "{name}\n{body}");
+        } else {
+            assert!(!body.contains(&format!("s{} =", dst + 1)), "{name}\n{body}");
+        }
+    }
+    // Constant forms: a 32-bit literal is a complete b32 operand.
+    for words in [
+        vec![0xbe82_2cff, 0x8500_3092, 0xbf81_0000], // s_quadmask_b32 s2, 0x85003092
+        vec![0xbe82_3bff, 0x85fe_3a92, 0xbf81_0000], // s_bitreplicate_b64_b32 s[2:3], 0x85fe3a92
+        vec![0xbe82_2dc1, 0xbf81_0000],              // s_quadmask_b64 s[2:3], -1
+    ] {
+        super::super::translate(&extract(&words)).unwrap_or_else(|e| panic!("{words:x?}: {e}"));
+    }
+}
+
+#[test]
+fn quad_mask_and_bit_replicate_refuse_wave_masks_and_unknown_words() {
+    for words in [
+        vec![0xbe82_2c7e, 0xbf81_0000],              // s_quadmask_b32 s2, exec_lo
+        vec![0xbe82_2c6a, 0xbf81_0000],              // s_quadmask_b32 s2, vcc_lo
+        vec![0xbe82_2d7e, 0xbf81_0000],              // s_quadmask_b64 s[2:3], exec
+        vec![0xbe82_2d6a, 0xbf81_0000],              // s_quadmask_b64 s[2:3], vcc
+        vec![0xbe82_3b7e, 0xbf81_0000],              // s_bitreplicate_b64_b32 s[2:3], exec_lo
+        vec![0xbe82_2c02, 0xbf81_0000],              // s_quadmask_b32 s2, s2 (no definition)
+        // Known low word but an unknown high word.
+        vec![0xbe82_03ff, 1, 0xbe82_2d02, 0xbf81_0000],
+        // Copied EXEC does not become an ordinary value.
+        vec![0xbe82_047e, 0xbe82_2d02, 0xbf81_0000],
+        // A branch into the operation skips the definition.
+        vec![0xbf82_0002, 0xbe82_03ff, 1, 0xbe82_3b02, 0xbf81_0000],
+    ] {
+        let ex = extract(&words);
+        let ops = disassemble(&ex.isa);
+        let at = ops.iter().position(|i| matches!(i.mnemonic.as_str(),
+            "s_quadmask_b32" | "s_quadmask_b64" | "s_bitreplicate_b64_b32")).unwrap();
+        let mut emitter = Emitter::new(&ex, ops.clone());
+        let err = emit(&mut emitter, at, &ops[at]).unwrap_err();
+        assert!(err.contains("not a wave mask"), "{words:x?}: {err}");
+        assert!(super::super::translate(&ex).is_err(), "{words:x?}");
+    }
+}
+
+#[test]
+fn quad_mask_sets_known_flags_and_bit_replicate_keeps_them() {
+    // s_mov_b32 s2, 1; s_mov_b32 s3, 2; <op>; s_cselect_b32 s5, 1, 0; s_ff0_i32_b32 s6, s5.
+    // The selected value is ordinary only if SCC is proven at the select.
+    for (op, cmp, accepted) in [
+        (0xbe84_2c02, None, true),                   // s_quadmask_b32 s4, s2 defines SCC
+        (0xbe84_2d02, None, true),                   // s_quadmask_b64 s[4:5], s[2:3]
+        (0xbe84_3b02, Some(0xbf06_8002), true),      // s_bitreplicate after s_cmp_eq_u32 s2, 0
+        (0xbe84_3b02, None, false),                  // s_bitreplicate after no comparison
+    ] {
+        let mut words = vec![0xbe82_0381, 0xbe83_0382];
+        words.extend(cmp);
+        words.extend([op, 0x8505_8081, 0xbe86_1105, 0xbf81_0000]);
+        let ex = extract(&words);
+        let ops = disassemble(&ex.isa);
+        let ff0 = ops.len() - 2;
+        assert_eq!(ops[ff0].mnemonic, "s_ff0_i32_b32");
+        let em = Emitter::new(&ex, ops);
+        assert_eq!(ordinary_sites(&em).contains(&ff0), accepted, "{op:#x}");
+    }
+}
+
+#[test]
+fn quad_mask_and_bit_replicate_cpu_model_fixture() {
+    // Consumed by the external Python evaluator, which runs these exact
+    // statements on random inputs and compares them with the ISA rules.
+    for (name, op) in QUAD_OPS {
+        println!("BEGIN_QUAD {name} {op:#x}\n{}END_QUAD", op_body(op));
+    }
+}

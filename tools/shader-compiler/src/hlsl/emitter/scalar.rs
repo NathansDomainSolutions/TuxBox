@@ -383,6 +383,9 @@ impl<'a> Emitter<'a> {
                         Some("andn2") => format!("{src} & ~{exec}"),
                         Some("orn2") => format!("{src} | ~{exec}"),
                         Some("andn1") => format!("~{src} & {exec}"),
+                        Some("orn1") => format!("~{src} | {exec}"),
+                        Some("nor") => format!("~({src} | {exec})"),
+                        Some("xnor") => format!("~({src} ^ {exec})"),
                         _ => return Err("unsupported saveexec".into()),
                     })
                 };

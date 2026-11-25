@@ -115,6 +115,7 @@ impl<'a> Emitter<'a> {
             exec_snapshots: Default::default(),
             reflected_lds_words: None,
             hoisted_swizzle: None,
+            dpp16_fetched: BTreeSet::new(),
             indexed_lane: false,
             single_wave32: false,
             resolve_wave32: false,
