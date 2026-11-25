@@ -6182,13 +6182,15 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let lo = format!("tb_trig_f16({bits}, {})", m == "v_cos_f16");
             return self.wv(&d, &format!("(({} & 0xffff0000u) | {lo})", r(&d)?));
         }
-        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
+        if ins.aux.sdwa.is_none() && matches!(m.as_str(), "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_exp_f16" | "v_log_f16" | "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" | "v_fract_f16") {
             let a = h16(&s[0])?;
             let e = match m.as_str() {
                 "v_rcp_f16" => format!("1.0 / {a}"),
                 "v_sqrt_f16" => format!("sqrt({a})"),
                 "v_rsq_f16" => format!("rsqrt({a})"),
                 "v_exp_f16" => format!("exp2({a})"),
+                // Base-2 like v_log_f32: 0 gives -inf and a negative input NaN.
+                "v_log_f16" => format!("log2({a})"),
                 "v_floor_f16" => format!("floor({a})"),
                 "v_ceil_f16" => format!("ceil({a})"),
                 "v_trunc_f16" => format!("trunc({a})"),
@@ -6605,7 +6607,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             c.aux.sdwa = None;
             // The selected half operands now occupy the low word. Apply the
             // floating modifiers through the ordinary VOP3 half-float path.
-            let half_alu = half_binary || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16");
+            let half_alu = half_binary || matches!(m.as_str(), "v_rcp_f16" | "v_exp_f16" | "v_log_f16");
             if half_alu {
                 c.enc = Enc::Vop3;
                 c.aux.imm = i64::from((sd >> 13) & 1);
@@ -9556,6 +9558,28 @@ mod tests {
         let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x140, 1, 1, 0xf, 0xf))];
         let err = lower_wave_reductions(&mut insns).expect_err("refused");
         assert!(err.contains("unsupported DPP16 move"));
+    }
+
+    #[test]
+    fn half_log_is_base_2_with_half_modifiers() {
+        use crate::hlsl::float64::tests::translate;
+        let line = |words: &[u32]| -> String {
+            let hlsl = translate(Stage::Compute, words).unwrap();
+            hlsl.lines().find(|l| l.contains("log2(")).unwrap_or_else(|| panic!("{hlsl}")).to_string()
+        };
+        // LLVM gfx1030: v_log_f16_e32 v8, v4
+        let e = line(&[0x7e10_af04]);
+        assert!(e.contains("v8 = tb_f16_rne(log2(f16tof32((v4) & 0xffffu)))"), "{e}");
+        // v_log_f16_e64 v8, -|v4| clamp
+        let e = line(&[0xd5d7_8108, 0x2000_0104]);
+        assert!(e.contains("saturate(log2((-abs(f16tof32((v4) & 0xffffu)))))"), "{e}");
+        // v_log_f16_e64 v8, v4 mul:2
+        assert!(line(&[0xd5d7_0008, 0x0800_0104]).contains("* 2.0"));
+        // v_log_f16_sdwa v8, v4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1
+        let hlsl = translate(Stage::Compute, &[0x7e10_aef9, 0x0005_1504]).unwrap();
+        assert!(hlsl.contains("((v4 >> 16) & 0xffffu)") && hlsl.contains("log2("), "{hlsl}");
+        // v_log_f16_e32 v8, 0.5: the inline constant is the half-float 0.5.
+        let e = line(&[0x7e10_aef0]); assert!(e.contains("log2(asfloat(0x3f000000u))"), "{e}");
     }
 
     #[test]
