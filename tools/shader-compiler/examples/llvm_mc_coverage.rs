@@ -5,7 +5,8 @@
 //! Fetch the inputs with `tools/fetch_llvm_amdgpu_mc_tests.sh`. Each test file
 //! pairs a `# GFX10: <asm> ; encoding: [...]` check line with the bytes that
 //! produce it. Every encoding runs through the decoder and then through the
-//! HLSL translator as a compute shader (two literal moves, the instruction,
+//! HLSL translator as a compute shader with a 64-thread group, so complete
+//! 32- and 64-lane waves (two literal moves, the instruction,
 //! `s_endpgm`). The report counts which instructions decode as LLVM does,
 //! which translate and which are refused, and ranks the refusals.
 //!
@@ -85,7 +86,7 @@ fn shader(body: &[u32]) -> ShaderExtract {
         flat_inputs: Vec::new(), flat_outputs: Vec::new(), stage: Stage::Compute, shader_model: (6, 0),
         required_features: None, bitcode_stripped: true, fspx_config: None, ps09_pixel_inputs: None,
         fssm: Vec::new(), entry: Some("main".into()), isa_data: isa.clone(), isa, isa_offset_in_fssm: 0,
-        psv_threads: None, isa_preamble: [0, 1, 1, 1], has_input_sig: false, has_output_sig: false,
+        psv_threads: None, isa_preamble: [0, 64, 1, 1], has_input_sig: false, has_output_sig: false,
         has_psv0: false, has_root_sig: false, input_sig: Vec::new(), output_sig: Vec::new(),
         resources: Vec::new(), gs_info: None, mesh_info: None, primitive_sig: Vec::new(), root_sig: None,
     }
