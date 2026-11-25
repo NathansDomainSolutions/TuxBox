@@ -1561,13 +1561,16 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         if bytes == 0 || bytes + 4*threads > 32768 { return Err("guest LDS and exchange exceed the group shared budget".into()); }
         em.reflected_lds_words = Some(bytes/4);
     }
-    if let Some(width) = required_wave_size {
-        wave_sum::check_control_flow(&em.insns, width)?;
+    let active_reductions = if let Some(width) = required_wave_size {
+        let list = wave_sum::check_control_flow(&em.insns, width)?;
         let [x, y, z] = compute_group(ex);
         if ex.stage != Stage::Compute || !x.checked_mul(y).and_then(|n| n.checked_mul(z)).is_some_and(|n| n % width == 0) {
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
-    }
+        list
+    } else {
+        Vec::new()
+    };
     em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
         && compute_group(ex) == [64, 1, 1]))
         && ex.stage == Stage::Compute
@@ -1581,6 +1584,9 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
+    }
+    if !em.portable_wave64 && !active_reductions.is_empty() {
+        wave_sum::rewrite_to_active(&mut em.insns, required_wave_size.unwrap(), &active_reductions)?;
     }
     if is_ps {
         em.find_export_epilogs();
@@ -4416,6 +4422,17 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 micropoly::emit_vote(self, ins, &active)?;
                 return Ok(());
             }
+            if ins.enc == Enc::Vop3 && ins.op == wave_sum::WAVE_ACTIVE {
+                self.end_guard(&mut open);
+                cur.clear();
+                for o in ins.src.iter().chain(ins.dst.iter()) {
+                    self.touch(o);
+                }
+                let active_expr = (!active.is_empty()).then(|| {
+                    active.iter().map(|t| format!("!j{t}")).collect::<Vec<_>>().join(" && ")
+                });
+                self.emit_wave_sum_active(ins, active_expr.as_deref(), true)?;
+            }
             if is_quad_exchange(ins) {
                 if self.loop_depth != 0 && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
                     return Err("DPP16 exchange inside backward control flow".into());
@@ -4532,6 +4549,224 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         Ok(())
     }
 
+    fn emit_wave_sum_active(
+        &mut self,
+        ins: &Insn,
+        active_expr: Option<&str>,
+        check_any: bool,
+    ) -> Result<(), String> {
+        let vin = r(&ins.src[0])?;
+        let mask = r(&ins.src[1])?;
+        let ident = ins.aux.imm as u32;
+        let cond = match active_expr {
+            Some(a) => format!("(({a}) && (({mask} & 1u) != 0u))"),
+            None => format!("(({mask} & 1u) != 0u)"),
+        };
+        let expr = match ins.mnemonic.as_str() {
+            "v_or_b32" => format!("WaveActiveBitOr({cond} ? {vin} : 0u)"),
+            "v_and_b32" => format!("WaveActiveBitAnd({cond} ? {vin} : 0xffffffffu)"),
+            "v_min_u32" => format!("WaveActiveMin({cond} ? {vin} : 0xffffffffu)"),
+            "v_max_u32" => format!("WaveActiveMax({cond} ? {vin} : 0u)"),
+            "v_add_nc_u32" => format!("WaveActiveSum({cond} ? {vin} : 0u)"),
+            "v_add_f32" => format!("asuint(WaveActiveSum({cond} ? asfloat({vin}) : 0.0))"),
+            "v_min_f32" => format!("asuint(WaveActiveMin({cond} ? asfloat({vin}) : asfloat({ident:#x}u)))"),
+            "v_max_f32" => format!("asuint(WaveActiveMax({cond} ? asfloat({vin}) : asfloat({ident:#x}u)))"),
+            _ => return Err("unsupported wave active reduction".into()),
+        };
+        if let (true, Some(a)) = (check_any, active_expr) {
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = {expr};"));
+            self.line(&format!("if (WaveActiveAnyTrue({a})) {{"));
+            self.ws(&ins.dst[0], &format!("t{t}"))?;
+            self.line("}");
+        } else {
+            self.ws(&ins.dst[0], &expr)?;
+        }
+        Ok(())
+    }
+
+    /// Bourdoncle weak topological ordering (WTO) of basic blocks reachable from `entry`.
+    /// Acyclic join points follow all predecessors; loop SCCs precede their exits.
+    fn wto_order(entry: usize, succs: &[Vec<usize>]) -> Vec<usize> {
+        fn visit(
+            u: usize,
+            allowed: &[bool],
+            succs: &[Vec<usize>],
+            idx: &mut usize,
+            dfn: &mut [usize],
+            low: &mut [usize],
+            stack: &mut Vec<usize>,
+            on_stack: &mut [bool],
+            sccs: &mut Vec<Vec<usize>>,
+        ) {
+            *idx += 1;
+            dfn[u] = *idx;
+            low[u] = *idx;
+            stack.push(u);
+            on_stack[u] = true;
+            for &v in &succs[u] {
+                if !allowed[v] { continue; }
+                if dfn[v] == 0 {
+                    visit(v, allowed, succs, idx, dfn, low, stack, on_stack, sccs);
+                    low[u] = low[u].min(low[v]);
+                } else if on_stack[v] {
+                    low[u] = low[u].min(dfn[v]);
+                }
+            }
+            if low[u] == dfn[u] {
+                let mut comp = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == u { break; }
+                }
+                sccs.push(comp);
+            }
+        }
+        fn decompose(roots: &[usize], allowed: &[bool], succs: &[Vec<usize>], out: &mut Vec<usize>) {
+            let n = succs.len();
+            let mut dfn = vec![0; n];
+            let mut low = vec![0; n];
+            let mut on_stack = vec![false; n];
+            let mut stack = Vec::new();
+            let mut idx = 0;
+            let mut sccs = Vec::new();
+            for &r in roots {
+                if allowed[r] && dfn[r] == 0 {
+                    visit(r, allowed, succs, &mut idx, &mut dfn, &mut low, &mut stack, &mut on_stack, &mut sccs);
+                }
+            }
+            sccs.reverse();
+            for scc in sccs {
+                if scc.len() == 1 && !succs[scc[0]].contains(&scc[0]) {
+                    out.push(scc[0]);
+                } else {
+                    // Pick the lowest-indexed block entered from outside the SCC (natural header).
+                    let mut in_scc = vec![false; n];
+                    for &u in &scc { in_scc[u] = true; }
+                    let head = scc.iter().copied().filter(|&v| {
+                        (0..n).any(|u| !in_scc[u] && succs[u].contains(&v))
+                    }).min().unwrap_or_else(|| *scc.iter().min().unwrap());
+                    out.push(head);
+                    let mut sub_allowed = vec![false; n];
+                    for &u in &scc {
+                        if u != head { sub_allowed[u] = true; }
+                    }
+                    let mut sub_roots: Vec<usize> = succs[head].iter().copied().filter(|&v| sub_allowed[v]).collect();
+                    let mut rest: Vec<usize> = scc.iter().copied().filter(|&u| u != head).collect();
+                    rest.sort_unstable();
+                    sub_roots.extend(rest);
+                    decompose(&sub_roots, &sub_allowed, succs, out);
+                }
+            }
+        }
+        let n = succs.len();
+        let allowed = vec![true; n];
+        let mut out = Vec::new();
+        decompose(&[entry], &allowed, succs, &mut out);
+        out
+    }
+
+    fn emit_body_dispatch_wave_sync(
+        &mut self,
+        is_ps: bool,
+        entry: usize,
+        starts: &[usize],
+        tgt: &HashMap<usize, usize>,
+    ) -> Result<(), String> {
+        let n = self.insns.len();
+        let nb = starts.len();
+        let start2block: HashMap<usize, usize> = starts.iter().enumerate().map(|(b, &s)| (s, b)).collect();
+        let mut succs = vec![Vec::new(); nb];
+        for (b, _) in starts.iter().enumerate() {
+            let end = starts.get(b + 1).copied().unwrap_or(n);
+            let last = &self.insns[end - 1];
+            let is_sopp = last.enc == Enc::Sopp;
+            if let Some(&t) = tgt.get(&(end - 1)) {
+                if t < n {
+                    if let Some(&tb) = start2block.get(&t) {
+                        succs[b].push(tb);
+                    }
+                }
+            }
+            let falls = !(is_sopp && (last.op == 1 || last.op == 2));
+            if falls && end < n {
+                if let Some(&eb) = start2block.get(&end) {
+                    succs[b].push(eb);
+                }
+            }
+        }
+        let entry_blk = start2block[&entry];
+        let order = Self::wto_order(entry_blk, &succs);
+        let exit_rank = order.len();
+        let mut block2rank = vec![exit_rank; nb];
+        for (rank, &b) in order.iter().enumerate() {
+            block2rank[b] = rank;
+        }
+        let rank_of = |idx: usize| -> usize {
+            if idx >= n { exit_rank } else { start2block.get(&idx).map_or(exit_rank, |&b| block2rank[b]) }
+        };
+        let init_rank = block2rank[entry_blk];
+        self.loop_depth = 0;
+        if entry == 0 {
+            self.line(&format!("uint tb_pc = {init_rank}u; uint tb_guard = 0u;"));
+            self.line(&format!("[loop] while (WaveActiveAnyTrue(tb_pc != {exit_rank}u) && tb_guard++ < 1000000u) {{"));
+        } else {
+            self.line(&format!("uint tb_pc = {init_rank}u; [loop] while (WaveActiveAnyTrue(tb_pc != {exit_rank}u)) {{"));
+        }
+        self.loop_depth += 1;
+        self.line("uint tb_sel = WaveActiveMin(tb_pc);");
+        let insns = self.insns.clone();
+        for (rank, &b) in order.iter().enumerate() {
+            let start = starts[b];
+            let end = starts.get(b + 1).copied().unwrap_or(n);
+            self.line(&format!("if (tb_sel == {rank}u) {{"));
+            self.drop_heap_handles();
+            for i in start..end {
+                let ins = &insns[i];
+                for o in ins.src.iter().chain(ins.dst.iter()) {
+                    self.touch(o);
+                }
+                if ins.enc == Enc::Vop3 && ins.op == wave_sum::WAVE_ACTIVE {
+                    self.line("}");
+                    self.line(&format!("if (WaveActiveAnyTrue(tb_sel == {rank}u)) {{"));
+                    let act = format!("(tb_sel == {rank}u)");
+                    self.emit_wave_sum_active(ins, Some(&act), false)?;
+                    self.line("}");
+                    self.line(&format!("if (tb_sel == {rank}u) {{"));
+                    continue;
+                }
+                let is_ctl = ins.enc == Enc::Sopp && (Self::branch_cond(ins.op).is_some() || ins.op == 1);
+                if !is_ctl || ins.mnemonic == "s_swappc_b64" {
+                    self.emit_insn(i, ins, is_ps, None)
+                        .map_err(|e| format!("{e} [{} @ {:#x}]", ins.mnemonic, ins.offset))?;
+                }
+            }
+            let last = &insns[end - 1];
+            let next = if last.enc == Enc::Sopp && last.op == 1 {
+                format!("{exit_rank}u")
+            } else if let (Some(c), Some(&t)) = (
+                if last.enc == Enc::Sopp { Self::branch_cond(last.op) } else { None },
+                tgt.get(&(end - 1)),
+            ) {
+                if self.wave_cull { wave_cull::prepare_insn(self, end - 1, last)?; }
+                let c = wave_cull::branch_condition(self, last, c);
+                let tr = rank_of(t);
+                let fr = rank_of(end);
+                if last.op == 2 { format!("{tr}u") } else { format!("({c}) ? {tr}u : {fr}u") }
+            } else {
+                format!("{}u", rank_of(end))
+            };
+            self.line(&format!("tb_pc = {next}; }}"));
+        }
+        self.line(&format!("if (tb_pc >= {exit_rank}u) tb_pc = {exit_rank}u;"));
+        self.line("}");
+        self.drop_heap_handles();
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        Ok(())
+    }
+
     fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         self.dispatched = true;
         let n = self.insns.len();
@@ -4563,6 +4798,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
         }
         let starts: Vec<usize> = leaders.into_iter().filter(|&s| s < n).collect();
+        if self.insns.iter().any(|i| i.enc == Enc::Vop3 && i.op == wave_sum::WAVE_ACTIVE) {
+            return self.emit_body_dispatch_wave_sync(is_ps, entry, &starts, &tgt);
+        }
         self.loop_depth = 0;
         if entry == 0 {
             self.line("uint tb_pc = 0u; uint tb_guard = 0u;");
@@ -6068,6 +6306,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
 
     fn emit_vec(&mut self, ins: &Insn) -> Result<(), String> {
         let mut m = ins.mnemonic.clone();
+        if m == "v_nop" {
+            return Ok(());
+        }
         let s = &ins.src;
         let d = ins.dst.first().cloned().ok_or("no dst")?;
         if self.required_wave_size == Some(64) && self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
@@ -6075,9 +6316,6 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         }
         if m == "tb_reflection_prefix32" {
             return self.wv(&d, &format!("WavePrefixSum({})", r(&s[0])?));
-        }
-        if m == "v_nop" {
-            return Ok(());
         }
         if matches!(m.as_str(), "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16") {
             return self.emit_f16_interp(ins);
@@ -6160,6 +6398,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             }
             if ins.op != OP_QUAD_ADD_F32 { return self.wv(&d, &format!("q{}", self.cur_idx)); }
             return self.wv(&d, &format!("asuint(asfloat(q{}) + {})", self.cur_idx, f(&s[1])?));
+        }
+        if ins.enc == Enc::Vop3 && ins.op == wave_sum::WAVE_ACTIVE {
+            return Ok(());
         }
         if ins.op == OP_WAVE_REDUCE && ins.enc == Enc::Vop3 {
             // See `lower_wave_reductions`. Every invocation computes the same value; lanes

@@ -4,6 +4,7 @@ use super::{Emitter, Enc, Insn, Opnd};
 
 pub(super) const DPP_REDUCE: u32 = 0x7ff1;
 pub(super) const READ_LANE: u32 = 0x7ff2;
+pub(super) const WAVE_ACTIVE: u32 = 0x7ff6;
 // A straight-line DPP8 exchange is not a reduction. Preserve the actual
 // partner, and do not let the approximate single-lane retry erase it.
 pub(super) const DPP8_EXCHANGE: u32 = 0x7fe7;
@@ -450,70 +451,12 @@ fn uniform_forward_guard(
     true
 }
 
-/// The branch emitter predicates regions per host invocation. HLSL lane reads
-/// require the source invocation to participate, including lane zero when guest
-/// EXEC has masked it. A branch around or into the region can violate that.
-/// Whole-wave forward skip. Either a proven scalar/unconditional skip, or
-/// an EXEC-empty skip of a masked full-mask region. The EXEC-empty case is
-/// only sound when the region's prologue actually verified itself as a
-/// masked (self-contained) full-mask reduction; otherwise the region would
-/// run with a partial mask and stale values.
-fn execz_forward_guard(
-    insns: &[Insn],
-    branch_index: usize,
-    region_start: usize,
-    reduction_end: usize,
-    first: usize,
-    operation: &str,
-    verified_reads: &[usize],
-) -> bool {
-    let branch = &insns[branch_index];
-    if branch.op == 8 {
-        let masked = masked_identity(operation)
-            .map(|id| masked_prologue(insns, first, id).is_some())
-            .unwrap_or(false);
-        if !masked {
-            return false;
-        }
-        let pc = branch.offset as i64;
-        let target = pc + 4 + 4 * branch.aux.imm;
-        if target <= reduction_end as i64 {
-            return false;
-        }
-        // Branches between the guard and the region whose edges skip or
-        // enter the region (or lands exactly at the region start) are
-        // non-uniform and would make the whole-wave reduction execute
-        // partially. Anything else in the window is a local conditional that
-        // cannot skip the region; branches after the region are independent
-        // of its execution (the guard skips it wholesale). Indirect edges
-        // are never statically bounded.
-        for (index, op) in insns.iter().enumerate() {
-            if index == branch_index {
-                continue;
-            }
-            if matches!(op.mnemonic.as_str(),
-                "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap")
-            {
-                return false;
-            }
-            if op.enc == Enc::Sopp && (Emitter::branch_cond(op.op).is_some() || op.op == 1) {
-                let from = op.offset as i64;
-                if from < pc || from >= region_start as i64 {
-                    continue;
-                }
-                let target_edge = from + 4 + 4 * op.aux.imm;
-                if target_edge >= region_start as i64 {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-    uniform_forward_guard(insns, branch_index, reduction_end, verified_reads)
-}
-
-pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), String> {
+pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<Vec<usize>, String> {
+    let has_indirect = insns.iter().any(|op| {
+        matches!(op.mnemonic.as_str(), "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap")
+    });
     let mut verified_reads = Vec::new();
+    let mut active_reductions = Vec::new();
     for (first, ins) in insns.iter().enumerate() {
         if ins.op != DPP_REDUCE || ins.aux.imm != 0 {
             continue;
@@ -523,37 +466,113 @@ pub(super) fn check_control_flow(insns: &[Insn], width: u32) -> Result<(), Strin
         } else {
             2
         };
-        let start = if let Some(neutral) = masked_identity(&ins.mnemonic) {
-            masked_prologue(insns, first, neutral)
-                .map(|(index, _, _)| index)
-                .unwrap_or(first - prologue_len)
-        } else {
-            first - prologue_len
-        };
-        let start = insns[start].offset as i64;
+        let masked = masked_identity(&ins.mnemonic).and_then(|id| masked_prologue(insns, first, id));
+        let start_idx = masked.map(|(index, _, _)| index).unwrap_or(first - prologue_len);
+        let start = insns[start_idx].offset as i64;
         let last_read = first + if width == 32 { 6 } else { 8 };
         // The readlane is the last collective; the following restore is
         // part of the protected region too.
         let restore = first + if width == 32 { 7 } else { 9 };
         let end = insns[restore].offset as i64;
+        if has_indirect {
+            return Err(format!("wave reduction at {start:#x} may execute in divergent control flow"));
+        }
+        let mut needs_active = false;
         for (branch_index, branch) in insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp) {
             let pc = branch.offset as i64;
-            if branch.op == 1 && pc < start {
-                return Err(format!("wave reduction at {start:#x} after an early exit"));
+            if branch.op == 1 {
+                if pc >= start && pc <= end {
+                    return Err(format!("wave reduction at {start:#x} may execute in divergent control flow"));
+                }
+                if pc < start {
+                    if masked.is_none() {
+                        return Err(format!("wave reduction at {start:#x} after an early exit"));
+                    }
+                    needs_active = true;
+                }
+                continue;
             }
             if Emitter::branch_cond(branch.op).is_some() {
                 let target = pc + 4 + 4 * branch.aux.imm;
-                if ((pc < start && target >= start) || (pc > end && target <= end)
-                    || (pc >= start && pc <= end))
-                    && !(pc < start && execz_forward_guard(insns, branch_index, start as usize, end as usize, first, &ins.mnemonic, &verified_reads))
-                {
-                    return Err(format!(
-                        "wave reduction at {start:#x} may execute in divergent control flow"
-                    ));
+                if (target > start && target <= end) || (pc >= start && pc <= end) {
+                    return Err(format!("wave reduction at {start:#x} may execute in divergent control flow"));
+                }
+                if (pc < start && target > end) || (pc > end && target <= start) {
+                    let uniform = pc < start
+                        && target > end
+                        && uniform_forward_guard(insns, branch_index, end as usize, &verified_reads);
+                    if !uniform {
+                        if masked.is_none() {
+                            return Err(format!(
+                                "wave reduction at {start:#x} may execute in divergent control flow"
+                            ));
+                        }
+                        needs_active = true;
+                    }
                 }
             }
         }
+        if needs_active {
+            if let Some((save_idx, _, _)) = masked {
+                if let (Some(Opnd::Sgpr(saved)), Some(Opnd::Sgpr(res))) =
+                    (insns[save_idx].dst.first(), insns[last_read].dst.first())
+                {
+                    if *res == *saved || (width == 64 && *res == *saved + 1) {
+                        return Err(format!(
+                            "wave reduction at {start:#x} clobbers its saved EXEC register"
+                        ));
+                    }
+                }
+            }
+            active_reductions.push(first);
+        }
         verified_reads.push(last_read);
+    }
+    Ok(active_reductions)
+}
+
+/// Lower masked reductions that may execute in divergent control flow to a
+/// single participation-independent `WaveActive*` op (`WAVE_ACTIVE`).
+pub(super) fn rewrite_to_active(insns: &mut [Insn], width: u32, firsts: &[usize]) -> Result<(), String> {
+    for &first in firsts {
+        let op_name = insns[first].mnemonic.clone();
+        let id = masked_identity(&op_name).ok_or("unsupported wave active reduction op")?;
+        let (save_idx, mask, _) =
+            masked_prologue(insns, first, id).ok_or("missing masked reduction prologue")?;
+        let cndmask_idx = first - 1;
+        let last_read = first + if width == 32 { 6 } else { 8 };
+        let Some(vin @ Opnd::Vgpr(_)) = insns[cndmask_idx].src.get(1).copied() else {
+            return Err("invalid masked reduction input".into());
+        };
+        let Some(res @ Opnd::Sgpr(_)) = insns[last_read].dst.first().copied() else {
+            return Err("invalid masked reduction result".into());
+        };
+        let ident_bits: u32 = match op_name.as_str() {
+            "v_or_b32" | "v_max_u32" | "v_add_nc_u32" | "v_add_f32" => 0,
+            "v_and_b32" | "v_min_u32" => u32::MAX,
+            "v_min_f32" => f32::INFINITY.to_bits(),
+            "v_max_f32" => f32::NEG_INFINITY.to_bits(),
+            _ => return Err("unsupported wave active reduction op".into()),
+        };
+        insns[save_idx].mnemonic = if width == 32 { "s_mov_b32" } else { "s_mov_b64" }.into();
+        insns[save_idx].op = if width == 32 { 3 } else { 4 };
+        insns[save_idx].src = vec![Opnd::ExecLo];
+        for ins in &mut insns[cndmask_idx..last_read] {
+            ins.enc = Enc::Vop1;
+            ins.op = 0;
+            ins.mnemonic = "v_nop".into();
+            ins.dst.clear();
+            ins.src.clear();
+            ins.aux = Default::default();
+        }
+        let x = &mut insns[last_read];
+        x.enc = Enc::Vop3;
+        x.op = WAVE_ACTIVE;
+        x.mnemonic = op_name;
+        x.dst = vec![res];
+        x.src = vec![vin, mask];
+        x.aux = Default::default();
+        x.aux.imm = ident_bits as i64;
     }
     Ok(())
 }
@@ -732,7 +751,7 @@ mod tests {
         let and_mnemonic = if width == 32 { "s_and_b32" } else { "s_and_b64" };
         let mut ops = vec![
             insn(save_mnemonic, Enc::Sop1, 0, vec![Opnd::Sgpr(8)], vec![Opnd::ConstInt(-1)]),
-            insn(and_mnemonic, Enc::Sop1, 0, vec![Opnd::Sgpr(9)], vec![Opnd::Sgpr(7), Opnd::Sgpr(8)]),
+            insn(and_mnemonic, Enc::Sop2, 0, vec![Opnd::Sgpr(9)], vec![Opnd::Sgpr(7), Opnd::Sgpr(8)]),
             insn("v_cndmask_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(1)], vec![Opnd::ConstInt(0), Opnd::Vgpr(1), Opnd::Sgpr(9)]),
             insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
             insn("v_or_b32", Enc::Vop2, DPP_REDUCE, vec![Opnd::Vgpr(1)], vec![Opnd::Vgpr(1)]),
@@ -836,17 +855,19 @@ mod tests {
             } else {
                 assert!(translated.hlsl.contains("WaveReadLaneAt("));
             }
-            // Replace the proven scalar with an unproven entry register.
+            // Replace the proven scalar with an unproven entry register: a masked
+            // reduction falls back to participation-independent WaveActiveSum.
             words[cmp] = 0xbf06_8008;
             ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
             ex.isa_data = ex.isa.clone();
-            let refusal = super::super::translate(&ex).err().unwrap();
-            assert!(refusal.contains("divergent control flow"), "{refusal}");
+            let active = super::super::translate(&ex).unwrap();
+            assert_eq!(active.required_wave_size, Some(width));
+            assert!(active.hlsl.contains("WaveActiveSum("), "{}", active.hlsl);
         }
     }
 
     #[test]
-    fn native_literal_scalar_guard_translates_and_unknown_source_refuses() {
+    fn native_literal_scalar_guard_translates_and_unknown_source_uses_wave_active() {
         for width in [32, 64] {
             let (mut ex, mut words, cmp) = fixture::shader(width);
             // s_mov_b32 s7, 1; the following comparison and branch are unchanged.
@@ -855,12 +876,13 @@ mod tests {
             ex.isa_data = ex.isa.clone();
             let translated = super::super::translate(&ex).unwrap();
             assert!(translated.hlsl.contains("s7 = 1u;") || translated.hlsl.contains("s7 = 0x1u;") || translated.hlsl.contains("s7 = 0x00000001u;"), "{}", translated.hlsl);
-            // s_mov_b32 s7, s8 (unknown input) must still be rejected.
+            // s_mov_b32 s7, s8 (unknown input) lowers the masked reduction via WaveActiveSum.
             words[cmp] = 0xbe87_0308;
             ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
             ex.isa_data = ex.isa.clone();
-            let reason = super::super::translate(&ex).err().unwrap();
-            assert!(reason.contains("divergent control flow"), "{reason}");
+            let active = super::super::translate(&ex).unwrap();
+            assert_eq!(active.required_wave_size, Some(width));
+            assert!(active.hlsl.contains("WaveActiveSum("), "{}", active.hlsl);
         }
     }
 
@@ -1049,17 +1071,17 @@ mod tests {
             let after = ops.len();
             ops.push(nop());
             edge(&mut ops, 1, after, 8);
-            assert!(check_control_flow(&ops, width).is_ok());
-            // Another branch enters the skipped interval after the guard.
-            edge(&mut ops, 0, 2, 8);
+            assert!(!check_control_flow(&ops, width).unwrap().is_empty());
+            // Another branch enters the middle of the protected region (after saveexec).
+            edge(&mut ops, 0, 3, 8);
             assert!(check_control_flow(&ops, width).is_err());
-            // A backward edge from after the region re-enters it.
+            // A backward edge from after the region re-enters mid-region.
             let mut ops = vec![nop(), branch(8)];
             ops.extend(masked_reduction(width, 7));
             let after = ops.len();
             ops.push(nop());
             edge(&mut ops, 1, after, 8);
-            edge(&mut ops, after, 2, 8);
+            edge(&mut ops, after, 3, 8);
             assert!(check_control_flow(&ops, width).is_err());
         }
     }
@@ -1112,16 +1134,24 @@ mod tests {
     }
 
     #[test]
-    fn execz_forward_skip_rejects_branch_skipping_the_region() {
-        // A second branch inside the skip interval that skips (or lands on)
-        // the region would bypass its whole-wave execution.
+    fn execz_forward_skip_lowers_nested_branch_skipping_masked_region() {
+        // Nested forward skips around a masked region are lowered to a
+        // participation-independent WaveActive op, whereas an unmasked
+        // region stays refused.
         for width in [32, 64] {
             let mut ops = vec![nop(), branch(8), nop()];
             ops.extend(masked_reduction(width, 7));
             let end = ops.len();
             edge(&mut ops, 1, end, 8);
-            edge(&mut ops, 2, 3, 4);
-            assert!(check_control_flow(&ops, width).is_err());
+            edge(&mut ops, 2, end, 4);
+            assert_eq!(check_control_flow(&ops, width).unwrap().len(), 1);
+
+            let mut unmasked = vec![nop(), branch(8), nop()];
+            unmasked.extend(reduction(width, 7));
+            let uend = unmasked.len();
+            edge(&mut unmasked, 1, uend, 8);
+            edge(&mut unmasked, 2, uend, 4);
+            assert!(check_control_flow(&unmasked, width).is_err());
         }
     }
 
@@ -1146,6 +1176,52 @@ mod tests {
         ops[0] = insn("s_endpgm", Enc::Sopp, 1, vec![], vec![]);
         offsets(&mut ops);
         assert!(check_control_flow(&ops, 64).is_err());
+    }
+
+    #[test]
+    fn wave_active_lowering_broadcasts_outside_forward_guard_and_supports_interleaved_loops() {
+        let (mut ex, _, _) = fixture::shader(32);
+        // Forward execz skip around a masked v_or_b32 reduction + early s_endpgm.
+        let mut ops = vec![
+            insn("s_endpgm", Enc::Sopp, 1, vec![], vec![]),
+            branch(8),
+        ];
+        ops.extend(masked_reduction(32, 7));
+        let after = ops.len();
+        ops.push(nop());
+        ops.push(insn("s_endpgm", Enc::Sopp, 1, vec![], vec![]));
+        edge(&mut ops, 1, after, 8);
+        let active = check_control_flow(&ops, 32).unwrap();
+        assert_eq!(active.len(), 1);
+        rewrite_to_active(&mut ops, 32, &active).unwrap();
+        let mut em = Emitter::new(&ex, ops);
+        em.required_wave_size = Some(32);
+        em.emit_body(false).unwrap();
+        assert!(em.body.contains("WaveActiveBitOr("), "{}", em.body);
+        assert!(em.body.contains("WaveActiveAnyTrue("), "{}", em.body);
+        // Result write is guarded by WaveActiveAnyTrue outside the j-skip guard.
+        assert!(em.body.contains("if (WaveActiveAnyTrue(!j"), "{}", em.body);
+
+        // Interleaved loops fall back to WTO WaveActiveMin block dispatch.
+        // Layout: 0 (H1) -> 1 (H2) -> 2 (masked_reduction) -> 3 (back to H1) -> 4 (back to H2) -> 5 (end)
+        let mut inter = vec![nop(), nop()];
+        inter.extend(masked_reduction(32, 7));
+        let b1 = inter.len();
+        inter.push(nop());
+        let b2 = inter.len();
+        inter.push(nop());
+        inter.push(insn("s_endpgm", Enc::Sopp, 1, vec![], vec![]));
+        edge(&mut inter, b1, 0, 4);
+        edge(&mut inter, b2, 1, 4);
+        let active = check_control_flow(&inter, 32).unwrap();
+        rewrite_to_active(&mut inter, 32, &active).unwrap();
+        let mut em_inter = Emitter::new(&ex, inter);
+        em_inter.required_wave_size = Some(32);
+        em_inter.emit_body(false).unwrap();
+        assert!(em_inter.body.contains("WaveActiveMin(tb_pc)"), "{}", em_inter.body);
+        assert!(em_inter.body.contains("WaveActiveAnyTrue(tb_sel =="), "{}", em_inter.body);
+        assert!(em_inter.body.contains("WaveActiveBitOr("), "{}", em_inter.body);
+        ex.isa.clear();
     }
 }
 
