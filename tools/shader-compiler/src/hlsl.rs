@@ -5736,7 +5736,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     }
                 }
             }
-            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8" | "ds_read_u16_d16" | "ds_read_u16_d16_hi") => {
+            Enc::Ds if self.is_cs && matches!(m, "ds_write_b16" | "ds_write_b16_d16_hi" | "ds_write_b8" | "ds_write_b8_d16_hi"
+                | "ds_read_u16" | "ds_read_i16" | "ds_read_u8" | "ds_read_i8" | "ds_read_u16_d16" | "ds_read_u16_d16_hi"
+                | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi") => {
                 // Sub-word accesses to group-shared memory: tb_lds is addressed in dwords, so
                 // read-modify-write the containing dword.
                 if ins.raw[0] & (1 << 17) != 0 {
@@ -5744,7 +5746,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 }
                 self.uses_lds = true;
                 let off = ins.aux.imm as u32 & 0xffff;
-                let bits = if m.contains("16") { 16u32 } else { 8 };
+                let bits = if m.contains("_u8") || m.contains("_i8") || m.contains("_b8") { 8u32 } else { 16 };
                 let mask = (1u32 << bits) - 1;
                 let t = self.tmp;
                 self.tmp += 1;
@@ -5752,10 +5754,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let word = format!("tb_lds[(t{t}a >> 2) & 8191u]");
                 if m.starts_with("ds_write") {
                     let mut data = r(&s[1])?;
-                    if m == "ds_write_b16_d16_hi" {
-                        if ins.raw[0] & (1 << 17) != 0 {
-                            return Err("unsupported global data store halfword write".into());
-                        }
+                    // The _d16_hi stores take the value from bits 16 and up of the data VGPR
+                    // (LLVM: store_hi16 / truncstorei8_hi16).
+                    if m.ends_with("_d16_hi") {
                         data = format!("({data} >> 16)");
                     }
                     // Adjacent lanes can target different halves of the same word.
@@ -5767,12 +5768,19 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     return Ok(());
                 }
                 let v = format!("(({word} >> t{t}s) & {mask:#x}u)");
+                // Sign-extended to 32 bits for the _i forms, zero-extended otherwise.
+                let x = if m.contains("_i") { format!("asuint(asint({v} << {}) >> {})", 32 - bits, 32 - bits) } else { v };
                 let dst = d.ok_or("no dst")?;
-                let e = match m {
-                    "ds_read_u16_d16" => format!("(({} & 0xffff0000u) | {v})", r(&dst)?),
-                    "ds_read_u16_d16_hi" => format!("(({} & 0xffffu) | ({v} << 16))", r(&dst)?),
-                    _ if m.contains("_i") => format!("asuint(asint({v} << {}) >> {})", 32 - bits, 32 - bits),
-                    _ => v,
+                // The _d16 forms load into one half of the destination and keep the other
+                // half (LLVM selects them only with D16PreservesUnusedBits); the 8-bit ones
+                // extend the byte to 16 bits first.
+                let e = if m.ends_with("_d16") {
+                    let low = if m.contains("_i") { format!("({x} & 0xffffu)") } else { x };
+                    format!("(({} & 0xffff0000u) | {low})", r(&dst)?)
+                } else if m.ends_with("_d16_hi") {
+                    format!("(({} & 0xffffu) | ({x} << 16))", r(&dst)?)
+                } else {
+                    x
                 };
                 return self.wv(&dst, &e);
             }
@@ -5851,6 +5859,28 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 }
                 Ok(())
             }
+            Enc::Ds if self.is_cs && matches!(m, "ds_wrxchg2_rtn_b32" | "ds_wrxchg2st64_rtn_b32") => {
+                // Two independent dword exchanges (see hlsl/lds_atomics.rs), each atomic on
+                // its own dword like ds_wrxchg_rtn_b32.
+                if ins.raw[0] & (1 << 17) != 0 { return Err("GDS is unsupported".into()); }
+                if self.insns.iter().any(|op| op.enc == Enc::Sopp && Self::branch_cond(op.op).is_some()) {
+                    return Err("LDS exchange with unverified branch convergence".into());
+                }
+                let (off0, off1) = lds_atomics::pair_offsets(m, ins.aux.imm as u32)?;
+                let Some(Opnd::Vgpr(vd)) = d else { return Err("bad vdst".into()) };
+                let vd1 = vd.checked_add(1).ok_or("LDS register span exceeds v255")?;
+                self.uses_lds = true;
+                let t = self.tmp;
+                self.tmp += 1;
+                // Snapshot the address and data before the destination can overwrite them.
+                self.line(&format!("uint t{t}a = 0u, t{t}b = 0u; if (exec_lo & 1u) {{ uint t{t}p = {}; uint t{t}d = {}; uint t{t}e = {};",
+                    r(&s[0])?, r(&s[1])?, r(&s[2])?));
+                self.line(&format!("InterlockedExchange(tb_lds[((t{t}p + {off0:#x}u) >> 2) & 8191u], t{t}d, t{t}a);"));
+                self.line(&format!("InterlockedExchange(tb_lds[((t{t}p + {off1:#x}u) >> 2) & 8191u], t{t}e, t{t}b); }}"));
+                self.wv(&Opnd::Vgpr(vd), &format!("t{t}a"))?;
+                self.wv(&Opnd::Vgpr(vd1), &format!("t{t}b"))
+            }
+            Enc::Ds if lds_atomics::refusal(m).is_some() => Err(lds_atomics::refusal(m).unwrap_or_default().into()),
             Enc::Ds if m == "ds_bpermute_b32" => {
                 if self.required_wave_size != Some(32) || ins.raw[0] & 0x3ff00 != 0 {
                     return Err("backward permute requires a verified wave32 compute layout".into());

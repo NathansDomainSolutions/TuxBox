@@ -8,6 +8,10 @@
 //! `udec_wrap`, `ds_add_f32`/`ds_min_f32`/`ds_max_f32` implement `fadd`,
 //! `fmin` and `fmax`, and `ds_cmpst_b32` takes the compare value in data0 and
 //! the new value in data1 (the opposite of the buffer compare-swap order).
+//!
+//! The two-address exchanges (`ds_wrxchg2_rtn_b32`, `ds_wrxchg2st64_rtn_b32`) are
+//! two independent `InterlockedExchange`s. 64-bit atomics, `ds_cmpst_f32` and
+//! `ds_permute_b32` are refused with the reason given in [`refusal`].
 
 /// The new dword written for `old`, given data0 `d` and (for the two-data
 /// forms) data1 `e`, or `None` when the mnemonic isn't one of these forms.
@@ -36,6 +40,47 @@ pub(super) fn two_data(mnemonic: &str) -> bool {
     matches!(mnemonic.replace("_rtn", "").as_str(), "ds_mskor_b32" | "ds_cmpst_b32")
 }
 
+/// Byte offsets of the two dwords `ds_wrxchg2_rtn_b32` / `ds_wrxchg2st64_rtn_b32`
+/// exchange, from the instruction's 16-bit offset field. These share the
+/// two-address layout of `ds_write2_b32` / `ds_write2st64_b32` (LLVM's
+/// `DS_1A2D_Off8_RET`: offset0 in bits 0-7, offset1 in bits 8-15), counting 4-byte
+/// elements, or 64 of them (256 bytes) for st64. Each returns the dword it replaced:
+/// vdst gets offset0's old value and vdst+1 offset1's.
+///
+/// When both offsets name the same dword of `tb_lds` (after the 8192-dword wrap the
+/// translator applies to every LDS address) the result depends on which exchange the
+/// hardware applies first, which isn't documented, so that case is refused.
+pub(super) fn pair_offsets(mnemonic: &str, offset: u32) -> Result<(u32, u32), String> {
+    let scale = if mnemonic.contains("2st64") { 64 } else { 1 };
+    let (e0, e1) = ((offset & 0xff) * scale, ((offset >> 8) & 0xff) * scale);
+    if e0.abs_diff(e1) % 8192 == 0 {
+        return Err("two-address LDS exchange of one dword twice (order not documented)".into());
+    }
+    Ok((e0 * 4, e1 * 4))
+}
+
+/// Why an LDS form the translator knows about is refused, or `None` for any other
+/// mnemonic.
+pub(super) fn refusal(mnemonic: &str) -> Option<&'static str> {
+    let base = mnemonic.replace("_rtn", "");
+    Some(match base.as_str() {
+        // tb_lds is `groupshared uint[]`: HLSL can't alias it as uint64_t, and two 32-bit
+        // atomics would let another lane see (or update) one dword between them.
+        "ds_add_u64" | "ds_sub_u64" | "ds_rsub_u64" | "ds_inc_u64" | "ds_dec_u64" | "ds_min_i64" | "ds_max_i64"
+        | "ds_min_u64" | "ds_max_u64" | "ds_and_b64" | "ds_or_b64" | "ds_xor_b64" | "ds_mskor_b64" | "ds_cmpst_b64"
+        | "ds_cmpst_f64" | "ds_min_f64" | "ds_max_f64" | "ds_wrxchg_b64" | "ds_wrxchg2_b64" | "ds_wrxchg2st64_b64" => {
+            "64-bit LDS atomics need one atomic across two tb_lds dwords (not available on a uint groupshared array)"
+        }
+        // LLVM has no selection pattern for these, so nothing pins whether the compare is
+        // a float compare (-0 == +0, NaN never equal) or bitwise.
+        "ds_cmpst_f32" => "ds_cmpst_f32 compare semantics (float or bitwise) are not pinned",
+        // LLVM's int_amdgcn_ds_permute documents neither which lane wins when several
+        // write the same lane nor what an unwritten lane receives.
+        "ds_permute_b32" => "forward permute conflict and unwritten-lane results are not pinned",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hlsl::float64::tests::translate;
@@ -52,7 +97,11 @@ mod tests {
     /// Renames the loop's temporary to t0, so expectations don't depend on
     /// how many temporaries the prologue used.
     fn renumber(hlsl: &str) -> String {
-        let marker = "if (exec_lo & 1u) { uint t";
+        renumber_at(hlsl, "if (exec_lo & 1u) { uint t")
+    }
+
+    /// Like `renumber`, for the temporary whose number follows `marker`.
+    fn renumber_at(hlsl: &str, marker: &str) -> String {
         let at = hlsl.find(marker).expect(hlsl) + marker.len();
         let n: String = hlsl[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
         let name = format!("t{n}");
@@ -144,6 +193,71 @@ mod tests {
     }
 
     #[test]
+    fn paired_exchanges_swap_two_dwords() {
+        // LLVM gfx1030: ds_wrxchg2_rtn_b32 v[8:9], v1, v2, v3 offset0:1 offset1:7
+        let hlsl = renumber(&compute([0x01, 0x07, 0xb8, 0xd8, 0x01, 0x02, 0x03, 0x08]).unwrap());
+        assert!(hlsl.contains("if (exec_lo & 1u) { uint t0p = v1; uint t0d = v2; uint t0e = v3;"), "{hlsl}");
+        assert!(hlsl.contains("InterlockedExchange(tb_lds[((t0p + 0x4u) >> 2) & 8191u], t0d, t0a);"), "{hlsl}");
+        assert!(hlsl.contains("InterlockedExchange(tb_lds[((t0p + 0x1cu) >> 2) & 8191u], t0e, t0b); }"), "{hlsl}");
+        assert!(hlsl.contains("if (exec_lo & 1u) v8 = t0a;") && hlsl.contains("if (exec_lo & 1u) v9 = t0b;"), "{hlsl}");
+        // LLVM gfx1030: ds_wrxchg2st64_rtn_b32 v[8:9], v1, v2, v3 offset0:2 offset1:255
+        let hlsl = compute([0x02, 0xff, 0xbc, 0xd8, 0x01, 0x02, 0x03, 0x08]).unwrap();
+        assert!(hlsl.contains("p + 0x200u) >> 2) & 8191u]") && hlsl.contains("p + 0xff00u) >> 2) & 8191u]"), "{hlsl}");
+    }
+
+    #[test]
+    fn paired_exchange_reads_operands_before_writing_the_destination() {
+        // LLVM gfx1030: ds_wrxchg2_rtn_b32 v[2:3], v2, v3, v2 offset1:1
+        let hlsl = compute([0x00, 0x01, 0xb8, 0xd8, 0x02, 0x03, 0x02, 0x02]).unwrap();
+        let read = hlsl.find("p = v2; uint t").expect(&hlsl);
+        assert!(read < hlsl.find("v2 = t").expect(&hlsl) && read < hlsl.find("v3 = t").expect(&hlsl), "{hlsl}");
+    }
+
+    #[test]
+    fn paired_exchanges_of_one_dword_are_refused() {
+        // LLVM gfx1030: ds_wrxchg2_rtn_b32 v[8:9], v1, v2, v3 offset0:5 offset1:5
+        let err = compute([0x05, 0x05, 0xb8, 0xd8, 0x01, 0x02, 0x03, 0x08]).unwrap_err();
+        assert!(err.contains("one dword twice"), "{err}");
+        // LLVM gfx1030: ds_wrxchg2st64_rtn_b32 v[8:9], v1, v2, v3 offset0:1 offset1:129
+        // (64 * 128 dwords apart: the same dword after the 8192-dword wrap)
+        let err = compute([0x01, 0x81, 0xbc, 0xd8, 0x01, 0x02, 0x03, 0x08]).unwrap_err();
+        assert!(err.contains("one dword twice"), "{err}");
+        // LLVM gfx1030: ds_wrxchg2_rtn_b32 v[8:9], v1, v2, v3 offset1:1 gds
+        let err = compute([0x00, 0x01, 0xba, 0xd8, 0x01, 0x02, 0x03, 0x08]).unwrap_err();
+        assert!(err.contains("GDS"), "{err}");
+    }
+
+    #[test]
+    fn paired_exchange_keeps_the_branch_convergence_rule() {
+        let [a, b] = words([0x01, 0x07, 0xb8, 0xd8, 0x01, 0x02, 0x03, 0x08]);
+        // LLVM gfx1030: s_cbranch_scc0 0, then ds_wrxchg2_rtn_b32 v[8:9], v1, v2, v3 offset0:1 offset1:7
+        let err = translate(Stage::Compute, &[0xbf84_0000, a, b]).unwrap_err();
+        assert!(err.contains("branch convergence"), "{err}");
+    }
+
+    #[test]
+    fn unpinned_and_wide_forms_are_refused_with_a_reason() {
+        let cases: [([u8; 8], &str); 6] = [
+            // LLVM gfx1030: ds_add_u64 v1, v[2:3]
+            ([0x00, 0x00, 0x00, 0xd9, 0x01, 0x02, 0x00, 0x00], "64-bit LDS atomics"),
+            // LLVM gfx1030: ds_cmpst_rtn_b64 v[4:5], v1, v[2:3], v[6:7]
+            ([0x00, 0x00, 0xc0, 0xd9, 0x01, 0x02, 0x06, 0x04], "64-bit LDS atomics"),
+            // LLVM gfx1030: ds_wrxchg2_rtn_b64 v[4:7], v1, v[2:3], v[8:9] offset1:1
+            ([0x00, 0x01, 0xb8, 0xd9, 0x01, 0x02, 0x08, 0x04], "64-bit LDS atomics"),
+            // LLVM gfx1030: ds_cmpst_f32 v1, v2, v3
+            ([0x00, 0x00, 0x44, 0xd8, 0x01, 0x02, 0x03, 0x00], "not pinned"),
+            // LLVM gfx1030: ds_cmpst_rtn_f32 v4, v1, v2, v3
+            ([0x00, 0x00, 0xc4, 0xd8, 0x01, 0x02, 0x03, 0x04], "not pinned"),
+            // LLVM gfx1030: ds_permute_b32 v4, v1, v2
+            ([0x00, 0x00, 0xc8, 0xda, 0x01, 0x02, 0x00, 0x04], "forward permute"),
+        ];
+        for (bytes, reason) in cases {
+            let err = compute(bytes).unwrap_err();
+            assert!(err.contains(reason), "{reason}: {err}");
+        }
+    }
+
+    #[test]
     fn global_data_share_is_refused_by_the_native_forms_too() {
         let cases: [[u8; 8]; 4] = [
             // LLVM gfx1030: ds_add_u32 v1, v2 gds
@@ -159,5 +273,29 @@ mod tests {
             let err = compute(bytes).unwrap_err();
             assert!(err.contains("GDS"), "{err}");
         }
+    }
+
+    #[test]
+    fn byte_loads_fill_one_half_of_the_destination() {
+        let cases: [([u8; 8], &str); 4] = [
+            // LLVM gfx1030: ds_read_u8_d16 v5, v1 offset:3
+            ([0x03, 0x00, 0x88, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffff0000u) | ((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu));"),
+            // LLVM gfx1030: ds_read_u8_d16_hi v5, v1
+            ([0x00, 0x00, 0x8c, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffffu) | (((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 16));"),
+            // LLVM gfx1030: ds_read_i8_d16 v5, v1 offset:1
+            ([0x01, 0x00, 0x90, 0xda, 0x01, 0x00, 0x00, 0x05],
+             "v5 = ((v5 & 0xffff0000u) | (asuint(asint(((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 24) >> 24) & 0xffffu));"),
+            // LLVM gfx1030: ds_read_i8_d16_hi v5, v1 offset:2
+            ([0x02, 0x00, 0x94, 0xda, 0x01, 0x00, 0x00, 0x05],
+             "v5 = ((v5 & 0xffffu) | (asuint(asint(((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 24) >> 24) << 16));"),
+        ];
+        for (bytes, expect) in cases {
+            let hlsl = renumber_at(&compute(bytes).unwrap(), &format!("(v1) + {:#x}u; uint t", bytes[0]));
+            assert!(hlsl.contains(expect), "{expect}\n{hlsl}");
+        }
+        // LLVM gfx1030: ds_write_b8_d16_hi v1, v2 offset:1
+        let hlsl = compute([0x01, 0x00, 0x80, 0xda, 0x01, 0x02, 0x00, 0x00]).unwrap();
+        assert!(hlsl.contains("((((v2 >> 16)) & 0xffu) << t"), "{hlsl}");
+        assert!(hlsl.contains("a = (v1) + 0x1u;"), "{hlsl}");
     }
 }
