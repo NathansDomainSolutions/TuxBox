@@ -9499,13 +9499,19 @@ fn heap_descriptor(sym: &HashMap<u16, Sym>, base: u16, n: u16) -> bool {
         && heap_words(sym, base, n)
 }
 
-/// Root-less pixel shaders receive descriptor heap bases like compute: the user SGPR
+/// Pixel shaders receive descriptor heap bases like compute: the user SGPR
 /// named by one FSSM user-data row (class 5 the resource heap, 6 the sampler heap),
-/// when SFI0 declares that heap directly indexed (bits 25 and 26). The row sits next
-/// to the pixel stage's table rows, which count SGPRs the same way.
+/// when SFI0 declares that heap directly indexed (bits 25 and 26). Rooted pixel
+/// shaders also allow class 5 when `RESOURCE_HEAP_DIRECTLY_INDEXED` (0x400) is set
+/// and `sampler_heap::resource_base` does not already claim the root layout.
 fn pixel_heap_base(ex: &ShaderExtract, class: u32) -> Option<u8> {
-    if ex.stage != Stage::Pixel || ex.root_sig.is_some() || ex.required_features? & (1 << (20 + class)) == 0 {
+    if ex.stage != Stage::Pixel || ex.required_features? & (1 << (20 + class)) == 0 {
         return None;
+    }
+    if let Some(root) = ex.root_sig.as_ref() {
+        if class != 5 || root.flags & 0x400 == 0 || sampler_heap::resource_base(ex).is_some() {
+            return None;
+        }
     }
     let mut rows = tuxbox_dxbc::compute_table::user_data_records(&ex.fssm)?.filter(|&[c, ..]| c == class);
     let [_, 0, 1, 0, loc @ 0..=0xff] = rows.next()? else { return None };
@@ -9599,6 +9605,53 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn pixel_heap_base_accepts_rooted_resource_heap_without_heap_map() {
+        let mut fssm = vec![0u8; 0x124];
+        fssm[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+        let len = (fssm.len() - 16) as u32;
+        fssm[8..12].copy_from_slice(&len.to_le_bytes());
+        fssm[0xe8..0xf0].copy_from_slice(&0x100u64.to_le_bytes());
+        fssm[0xf8..0xfc].copy_from_slice(&1u32.to_le_bytes());
+        for (k, v) in [5u32, 0, 1, 0, 10].into_iter().enumerate() {
+            fssm[0x110 + k * 4..0x114 + k * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: Some(1 << 25 | 1 << 26),
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm,
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        assert_eq!(pixel_heap_base(&ex, 5), Some(10));
+        ex.root_sig = Some(crate::meta::RootSig { version: 2, flags: 0x401, params: vec![], num_static_samplers: 0, static_samplers: vec![] });
+        assert_eq!(pixel_heap_base(&ex, 5), Some(10));
+        assert_eq!(pixel_heap_base(&ex, 6), None);
+        ex.root_sig.as_mut().unwrap().flags = 0x1;
+        assert_eq!(pixel_heap_base(&ex, 5), None);
     }
 
     #[test]
