@@ -31,6 +31,30 @@ pub(super) fn half(src: &Opnd, select: u32) -> Result<String, String> {
     })
 }
 
+/// Sources of the ordinary (non-packed) 16-bit forms. A scalar register
+/// holds 32 bits like a VGPR and either half can be selected. Integer inline
+/// constants and literals are 32-bit values whose low half is the 16-bit
+/// operand; selecting their high half is not modelled. EXEC and VCC hold
+/// only this lane's bit in the translator, not the wave mask, so they are
+/// not read as integer data.
+///
+/// Inline float constants stay refused: LLVM 18 does not agree with itself
+/// on their value for a 16-bit integer operand. The disassembler prints the
+/// half-precision pattern (getInlineImmVal16: 0.5 -> 0x3800), while
+/// SIInstrInfo::isInlineConstant never uses them for OPERAND_REG_*_INT16
+/// because they "appear to not work" and "seem" to read the low 16 bits of
+/// the 32-bit pattern (bugzilla 46302), and the encoder (getLit16IntEncoding)
+/// emits such values as literals.
+pub(super) fn sixteen_bit_source(source: &Opnd, high: bool) -> Result<(), String> {
+    match source {
+        Opnd::Vgpr(_) | Opnd::Sgpr(_) | Opnd::M0 => Ok(()),
+        Opnd::ConstInt(_) | Opnd::Literal(_) if !high => Ok(()),
+        Opnd::ConstInt(_) | Opnd::Literal(_) => Err("high-half selection of a 16-bit integer constant".into()),
+        Opnd::ConstF32(_) => Err("inline float constant in a 16-bit integer operand".into()),
+        _ => Err("unsupported ordinary 16-bit integer source or encoding".into()),
+    }
+}
+
 pub(super) fn new_half(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
         "v_mul_lo_u16" | "v_max_u16" | "v_min_u16" | "v_add_nc_i16" | "v_sub_nc_i16"
@@ -76,16 +100,31 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
     if new_packed && (!packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
         return Err("unsupported packed integer source or encoding".into());
     }
-    if new_half(ins) && (packed || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
-        return Err("unsupported ordinary 16-bit integer source or encoding".into());
-    }
     let (w0, w1) = (ins.raw[0], ins.raw[1]);
+    if new_half(ins) {
+        if packed {
+            return Err("unsupported ordinary 16-bit integer source or encoding".into());
+        }
+        for (i, source) in ins.src[..arity].iter().enumerate() {
+            sixteen_bit_source(source, (w0 >> (11 + i)) & 1 != 0)?;
+        }
+        // A two-source form has no source 2 selector (LLVM prints only
+        // op_sel:[src0, src1, dst]).
+        if arity == 2 && w0 & 0x2000 != 0 {
+            return Err("unsupported ordinary 16-bit integer modifiers".into());
+        }
+    }
     // RDNA2 ISA sections 6.5 and 12.10: clamp arithmetic to the
     // representable signed/unsigned 16-bit interval, independently per half.
     let clamped = w0 & 0x8000 != 0;
     let saturating_arithmetic = packed && matches!(op,
         Operation::Add | Operation::Subtract | Operation::Multiply | Operation::MultiplyAdd);
-    if clamped && (!saturating_arithmetic
+    // LLVM 18 selects saddsat/ssubsat on i16 as V_ADD_I16/V_SUB_I16 with
+    // clamp (VOP3Instructions.td, OpSelBinOpClampPat): signed saturation of
+    // the selected halves. The sources were checked above.
+    let signed_saturating_half = !packed
+        && matches!(ins.mnemonic.as_str(), "v_add_nc_i16" | "v_sub_nc_i16");
+    if clamped && !signed_saturating_half && (!saturating_arithmetic
         || !ins.src[..arity].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
         return Err("unsupported packed integer clamp form or source".into());
     }
@@ -101,7 +140,7 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         let signed = |x: &str| format!("(asint({x} << 16) >> 16)");
         if clamped {
             let signed_op = matches!(ins.mnemonic.as_str(),
-                "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_mad_i16");
+                "v_pk_add_i16" | "v_pk_sub_i16" | "v_pk_mad_i16" | "v_add_nc_i16" | "v_sub_nc_i16");
             if signed_op {
                 let (a, b) = (signed(&a), signed(&b));
                 let value = match op {
@@ -202,7 +241,9 @@ mod tests {
             let expr=expression(&decode(first & !0x4000,0x0202_0b04)).unwrap().unwrap();
             assert!(expr.contains("v4 & 0xffff0000u"));
             assert!(expression(&decode(first | 0x8000,0x0202_0b04)).is_err());
-            assert!(expression(&decode(first,0x0202_0a04)).is_err());
+            // s4 is ordinary data; exec_lo holds only this lane's bit.
+            assert!(expression(&decode(first,0x0202_0a04)).unwrap().unwrap().contains("(s4 >> 16)"));
+            assert!(expression(&decode(first,0x0202_0a7e)).is_err());
         }
     }
 
@@ -236,8 +277,17 @@ mod tests {
             if name.ends_with("_i16") && !name.contains("_nc_") && !name.starts_with("v_mad") {
                 assert!(low.contains("asint("), "{name} compares signed");
             }
-            assert!(expression(&decode(first | 0x8000, second)).is_err(), "{name} clamp");
-            assert!(expression(&decode(first, (second & !511) | 4)).is_err(), "{name} sgpr");
+            if name.contains("_nc_i16") {
+                let clamped = expression(&decode(first | 0x8000, second)).unwrap().unwrap();
+                assert!(clamped.contains("0x7fff8000u, 0x80007fffu"), "{name}: {clamped}");
+            } else {
+                assert!(expression(&decode(first | 0x8000, second)).is_err(), "{name} clamp");
+            }
+            let scalar = expression(&decode(first, (second & !511) | 4)).unwrap().unwrap();
+            assert!(scalar.contains("(s4 & 0xffffu)"), "{name}: {scalar}");
+            for mask in [106, 107, 126, 127] {
+                assert!(expression(&decode(first, (second & !511) | mask)).is_err(), "{name} mask {mask}");
+            }
             assert!(expression(&decode(first | 0x100, second)).is_err(), "{name} abs");
         }
         // Source 2 selection for three-operand forms.
@@ -280,5 +330,44 @@ mod tests {
         let expr = expression(&disassemble(&bytes)[0]).unwrap().unwrap();
         assert!(expr.contains("(v6 & 0xffffu)"));
         assert!(expr.contains("(v6 >> 16)"));
+    }
+
+    #[test]
+    fn ordinary_16_bit_scalar_constant_and_literal_sources() {
+        use crate::hlsl::float64::tests::translate;
+        use crate::Stage;
+        let ok = |words: &[u32], want: &str| {
+            let hlsl = translate(Stage::Compute, words).unwrap();
+            assert!(hlsl.contains(want), "{words:x?}: {hlsl}");
+        };
+        // LLVM gfx1030: v_max3_i16 v5, -1, v2, v3
+        ok(&[0xd755_0005, 0x040e_04c1], "max(max((asint((0xffffffffu & 0xffffu) << 16) >> 16)");
+        // LLVM gfx1030: v_med3_u16 v5, v1, s2, m0 op_sel:[0,1,0,1]
+        ok(&[0xd759_5005, 0x01f0_0501],
+            "v5 = ((v5 & 0xffffu) | (max(min((v1 & 0xffffu), (s2 >> 16)), min(max((v1 & 0xffffu), (s2 >> 16)), (m0 & 0xffffu))) << 16));");
+        // LLVM gfx1030: v_mad_u16 v5, 0x1234, v2, v3
+        ok(&[0xd740_0005, 0x040e_04ff, 0x1234], "(((0x1234u & 0xffffu) * (v2 & 0xffffu) + (v3 & 0xffffu)) & 0xffffu)");
+        // LLVM gfx1030: v_mul_lo_u16 v5, 0x1234, s2
+        ok(&[0xd705_0005, 0x0000_04ff, 0x1234], "(((0x1234u & 0xffffu) * (s2 & 0xffffu)) & 0xffffu)");
+        // LLVM gfx1030: v_add_nc_i16 v5, v1, -1 clamp
+        ok(&[0xd70d_8005, 0x0001_8301], "v5 = ((v5 & 0xffff0000u) | ((clamp((asuint(((asint((v1 & 0xffffu) << 16) >> 16) + (asint((0xffffffffu & 0xffffu) << 16) >> 16))) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u) & 0xffffu));");
+        // LLVM gfx1030: v_sub_nc_i16 v5, s1, v2 op_sel:[0,0,1] clamp
+        ok(&[0xd70e_c005, 0x0002_0401], "v5 = ((v5 & 0xffffu) | ((clamp((asuint(((asint((s1 & 0xffffu) << 16) >> 16) - (asint((v2 & 0xffffu) << 16) >> 16))) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u) << 16));");
+        let refused = |words: &[u32], why: &str| {
+            let err = translate(Stage::Compute, words).unwrap_err();
+            assert!(err.contains(why), "{words:x?}: {err}");
+        };
+        // LLVM gfx1030: v_min3_u16 v5, 1, v2, v3 op_sel:[1,0,0,0]
+        refused(&[0xd753_0805, 0x040e_0481], "high-half selection");
+        // LLVM gfx10 disassembler: v_max3_i16 v5, 0x3800, v2, v3 and v1, v2, 0xc400
+        refused(&[0xd755_0005, 0x040e_04f0], "inline float constant in a 16-bit integer operand");
+        refused(&[0xd755_0005, 0x03de_0501], "inline float constant in a 16-bit integer operand");
+        // LLVM gfx10 disassembler: v_max_u16 v5, exec_hi, v2
+        refused(&[0xd709_0005, 0x0002_047f], "source or encoding");
+        // LLVM gfx10 disassembler: v_max3_u16 v5, v1, v2, v3 clamp; v_mad_u16 ... clamp
+        refused(&[0xd756_8005, 0x040e_0501], "clamp");
+        refused(&[0xd740_8005, 0x040e_0501], "clamp");
+        // LLVM gfx10 disassembler: v_cmp_eq_i16_e64 s10, v1, 0x3800 (inline 0.5)
+        refused(&[0xd48a_000a, 0x0001_e101], "inline float constant in a 16-bit integer compare");
     }
 }
