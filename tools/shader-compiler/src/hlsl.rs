@@ -4424,14 +4424,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     self.end_guard(&mut open);
                     cur.clear();
                 }
-                let source = r(&ins.src[0])?;
                 if self.pixel_wave && ins.op != OP_ROW_MIRROR {
-                    // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
-                    let perm = ins.aux.imm;
-                    self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
-                    self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
-                    self.line(&format!("uint q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+                    self.emit_pixel_quad_exchange(i, ins)?;
                 } else if ins.op == OP_ROW_MIRROR {
+                    let source = r(&ins.src[0])?;
                     // FI=0: a source lane inactive in EXEC contributes 0. row_mirror
                     // mirrors local lanes within a 16-lane row.
                     self.line(&format!("uint q{i}lane = WaveGetLaneIndex();"));
@@ -4439,6 +4435,7 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     self.line(&format!("uint q{i}act = q{i}src < 32u ? (exec_lo >> q{i}src) & 1u : (exec_hi >> (q{i}src - 32u)) & 1u;"));
                     self.line(&format!("uint q{i} = q{i}act != 0u ? WaveReadLaneAt({source}, q{i}src) : 0u;"));
                 } else {
+                    let source = r(&ins.src[0])?;
                     // FI=1 fetches the saved VGPR even from an EXEC-disabled lane. All
                     // host lanes must reach the exchange, including those skipping this
                     // block. Reapply the branch and EXEC guards to the destination write.
@@ -4525,6 +4522,16 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     /// (`tb_pc`). The id one past the last instruction terminates the program.
     /// (Implicit-derivative sampling cannot live inside this loop — FXC rejects it, and the
     /// shader then fails to compile rather than silently changing meaning.)
+    fn emit_pixel_quad_exchange(&mut self, i: usize, ins: &Insn) -> Result<(), String> {
+        let source = r(&ins.src[0])?;
+        let perm = ins.aux.imm;
+        // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
+        self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
+        self.line(&format!("uint q{i}x = QuadReadAcrossX({source}), q{i}y = QuadReadAcrossY({source}), q{i}d = QuadReadAcrossDiagonal({source});"));
+        self.line(&format!("uint q{i} = q{i}src == 0u ? {source} : q{i}src == 1u ? q{i}x : q{i}src == 2u ? q{i}y : q{i}d;"));
+        Ok(())
+    }
+
     fn emit_body_dispatch(&mut self, is_ps: bool, entry: usize) -> Result<(), String> {
         self.dispatched = true;
         let n = self.insns.len();
@@ -4576,6 +4583,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 let ins = &insns[i];
                 for o in ins.src.iter().chain(ins.dst.iter()) {
                     self.touch(o);
+                }
+                if is_quad_exchange(ins) && self.pixel_wave && ins.op != OP_ROW_MIRROR {
+                    self.emit_pixel_quad_exchange(i, ins)?;
                 }
                 let is_ctl = ins.enc == Enc::Sopp && (Self::branch_cond(ins.op).is_some() || ins.op == 1);
                 if !is_ctl || ins.mnemonic == "s_swappc_b64" {
@@ -6145,7 +6155,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             return self.ws(&d, &read);
         }
         if is_quad_exchange(ins) {
-            if self.dispatched { return Err("quad exchange in a block-dispatched program".into()); }
+            if self.dispatched && !(self.pixel_wave && ins.op != OP_ROW_MIRROR) {
+                return Err("quad exchange in a block-dispatched program".into());
+            }
             if ins.op != OP_QUAD_ADD_F32 { return self.wv(&d, &format!("q{}", self.cur_idx)); }
             return self.wv(&d, &format!("asuint(asfloat(q{}) + {})", self.cur_idx, f(&s[1])?));
         }
@@ -9652,6 +9664,48 @@ mod tests {
         assert_eq!(pixel_heap_base(&ex, 6), None);
         ex.root_sig.as_mut().unwrap().flags = 0x1;
         assert_eq!(pixel_heap_base(&ex, 5), None);
+    }
+
+    #[test]
+    fn pixel_wave_quad_exchange_works_in_block_dispatch() {
+        let ex = ShaderExtract {
+            stage: Stage::Pixel,
+            shader_model: (6, 6),
+            required_features: None,
+            bitcode_stripped: true,
+            fspx_config: None,
+            ps09_pixel_inputs: None,
+            fssm: Vec::new(),
+            entry: Some("main".into()),
+            isa_data: Vec::new(),
+            isa: Vec::new(),
+            isa_offset_in_fssm: 0,
+            psv_threads: None,
+            flat_inputs: Vec::new(),
+            flat_outputs: Vec::new(),
+            isa_preamble: [0, 64, 1, 1],
+            has_input_sig: false,
+            has_output_sig: false,
+            has_psv0: false,
+            has_root_sig: false,
+            input_sig: Vec::new(),
+            output_sig: Vec::new(),
+            resources: Vec::new(),
+            gs_info: None,
+            mesh_info: None,
+            primitive_sig: vec![],
+            root_sig: None,
+        };
+        let mut insns = vec![Insn { offset: 0x0, ..dpp16_move_insn(dpp16_word(0, 0xb1, 1, 1, 0xf, 0xf)) }];
+        lower_wave_reductions(&mut insns).unwrap();
+        let mut em = Emitter::new(&ex, insns.clone());
+        em.pixel_wave = true;
+        em.emit_body_dispatch(true, 0).expect("pixel_wave block dispatch quad exchange");
+        assert!(em.body.contains("QuadReadAcrossX("));
+
+        let mut em_non_pw = Emitter::new(&ex, insns);
+        let err = em_non_pw.emit_body_dispatch(true, 0).expect_err("non-pixel_wave refused");
+        assert!(err.contains("quad exchange in a block-dispatched program"), "{err}");
     }
 
     #[test]
