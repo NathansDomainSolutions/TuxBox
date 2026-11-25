@@ -9571,6 +9571,16 @@ mod tests {
     }
 
     #[test]
+    fn f16_interp_descriptor_decodes_attr_channel_and_high() {
+        // attr=1, chan=0, high=1 (0b00000001 01_00 00_01)
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020101), (1, 0, true));
+        // attr=1, chan=1, high=0
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020041), (1, 1, false));
+        // attr=1, chan=0, high=0
+        assert_eq!(Emitter::f16_interp_descriptor(0x00020001), (1, 0, false));
+    }
+
+    #[test]
     fn wide_group_shared_accesses_move_consecutive_dwords() {
         use crate::hlsl::float64::tests::translate;
         let lds = |w: [u32; 2]| translate(Stage::Compute, &w).unwrap();
@@ -9597,16 +9607,6 @@ mod tests {
         }
         // ds_read_b128 v[8:11], v1 gds
         assert!(translate(Stage::Compute, &[0xdbfe_0000, 0x0800_0001]).unwrap_err().contains("GDS"));
-    }
-
-    #[test]
-    fn f16_interp_descriptor_decodes_attr_channel_and_high() {
-        // attr=1, chan=0, high=1 (0b00000001 01_00 00_01)
-        assert_eq!(Emitter::f16_interp_descriptor(0x00020101), (1, 0, true));
-        // attr=1, chan=1, high=0
-        assert_eq!(Emitter::f16_interp_descriptor(0x00020041), (1, 1, false));
-        // attr=1, chan=0, high=0
-        assert_eq!(Emitter::f16_interp_descriptor(0x00020001), (1, 0, false));
     }
 
     #[test]
