@@ -1,5 +1,5 @@
 //! Exactly specified double-precision forms on register pairs: rounding to
-//! an integral value and conversions between f64 and 32-bit integers.
+//! an integral value and conversions between f64 and 32-bit integers or f32.
 //! Like the f64 comparisons they use bit operations on `uint2` (low, high)
 //! pairs, so no host FP64 support is required. Each result is exact; the
 //! only mode dependence is whether f64 input denormals are flushed.
@@ -59,16 +59,54 @@ uint2 tb_i32_to_f64(uint v, bool signedInput) {
     uint2 m = sh >= 32u ? uint2(0u, rest << (sh - 32u)) : uint2(rest << sh, rest >> (32u - sh));
     return uint2(m.x, sign | ((1023u + p) << 20) | m.y);
 }
+uint2 tb_f32_to_f64(uint b, bool keepDenormals) {
+    // Exact widening; NaN is quieted and keeps its payload's top bits.
+    uint sign = b & 0x80000000u, e = (b >> 23) & 0xffu, m = b & 0x7fffffu, E;
+    if (e == 0xffu) return uint2(m << 29, sign | 0x7ff00000u | (m != 0u ? 0x80000u : 0u) | (m >> 3));
+    if (e == 0u) {
+        if (m == 0u || !keepDenormals) return uint2(0u, sign);
+        uint p = firstbithigh(m);
+        m = (m << (23u - p)) & 0x7fffffu;
+        E = p + 874u;
+    } else {
+        E = e + 896u;
+    }
+    return uint2(m << 29, sign | (E << 20) | (m >> 3));
+}
+uint tb_f64_to_f32(uint2 x, bool keepDenormals) {
+    // Round to nearest even. An f64 denormal is below half the smallest f32
+    // denormal, so it gives zero whatever the input denormal mode.
+    uint sign = x.y & 0x80000000u, e = (x.y >> 20) & 0x7ffu, mh = x.y & 0xfffffu;
+    if (e == 0x7ffu) return ((mh | x.x) != 0u) ? (sign | 0x7fc00000u | (mh << 3) | (x.x >> 29)) : (sign | 0x7f800000u);
+    if (e == 0u) return sign;
+    uint m24 = ((mh | 0x100000u) << 3) | (x.x >> 29), rem = x.x & 0x1fffffffu, bits;
+    int eb = (int)e - 896;
+    bool up;
+    if (eb >= 255) return sign | 0x7f800000u;
+    if (eb > 0) {
+        bits = ((uint)eb << 23) | (m24 & 0x7fffffu);
+        up = rem > 0x10000000u || (rem == 0x10000000u && (bits & 1u) != 0u);
+    } else {
+        uint k = (uint)(1 - eb);
+        if (k > 24u) return sign;
+        bits = k < 24u ? m24 >> k : 0u;
+        uint dropped = m24 & ((1u << k) - 1u), half = 1u << (k - 1u);
+        up = dropped > half || (dropped == half && (rem != 0u || (bits & 1u) != 0u));
+    }
+    bits += up ? 1u : 0u;
+    if (!keepDenormals && (bits & 0x7f800000u) == 0u) bits = 0u;
+    return sign | bits;
+}
 "#;
 
 /// Forms whose source is an f64 register pair.
 fn pair_source(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64")
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_cvt_f32_f64")
 }
 
 /// Forms whose result is an f64 register pair.
 pub(super) fn pair_result(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32")
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32" | "v_cvt_f64_f32")
 }
 
 pub(super) fn handles(m: &str) -> bool {
@@ -117,6 +155,10 @@ impl Emitter<'_> {
             r(&Opnd::Vgpr(src))?
         };
         let keep = if self.regs.contains("tb_fp_mode") { "(tb_fp_mode & 0x40u) != 0u" } else { "true" };
+        // The f32 side follows MODE's f32 denormal field: bit 4 keeps input denormals and
+        // bit 5 keeps results. Its default (MODE 0xc0) flushes both.
+        let tracked = self.regs.contains("tb_fp_mode");
+        let keep32 = |bit: u32| if tracked { format!("(tb_fp_mode & {bit:#x}u) != 0u") } else { "false".into() };
         let value = match m {
             "v_trunc_f64" => format!("tb_f64_round({source}, 0u, {keep})"),
             "v_floor_f64" => format!("tb_f64_round({source}, 1u, {keep})"),
@@ -124,6 +166,8 @@ impl Emitter<'_> {
             "v_rndne_f64" => format!("tb_f64_round({source}, 3u, {keep})"),
             "v_cvt_f64_i32" => format!("tb_i32_to_f64({source}, true)"),
             "v_cvt_f64_u32" => format!("tb_i32_to_f64({source}, false)"),
+            "v_cvt_f64_f32" => format!("tb_f32_to_f64({source}, {})", keep32(0x10)),
+            "v_cvt_f32_f64" => format!("tb_f64_to_f32({source}, {})", keep32(0x20)),
             "v_cvt_i32_f64" => format!("tb_f64_to_i32({source}, true)"),
             _ => format!("tb_f64_to_i32({source}, false)"),
         };
@@ -177,6 +221,23 @@ pub(super) mod tests {
         assert!(translate(Stage::Compute, &[0x7e10_0704]).unwrap().contains("tb_f64_to_i32(uint2(v4, v5), true)"));
         // v_cvt_f64_u32_e32 v[8:9], v4
         assert!(translate(Stage::Compute, &[0x7e10_2d04]).unwrap().contains("tb_i32_to_f64(v4, false)"));
+    }
+
+    #[test]
+    fn f32_conversions_round_and_follow_the_f32_denormal_mode() {
+        // LLVM gfx1030: v_cvt_f64_f32_e32 v[8:9], v4
+        let hlsl = translate(Stage::Compute, &[0x7e10_2104]).unwrap();
+        assert!(hlsl.contains("= tb_f32_to_f64(v4, false);"), "{hlsl}");
+        assert!(hlsl.contains("v8 = t") && hlsl.contains("v9 = t"), "{hlsl}");
+        // v_cvt_f32_f64_e32 v8, v[4:5]
+        assert!(translate(Stage::Compute, &[0x7e10_1f04]).unwrap().contains("v8 = tb_f64_to_f32(uint2(v4, v5), false)"));
+        // s_denorm_mode 0 makes the mode dynamic.
+        let hlsl = translate(Stage::Compute, &[0xbfa5_0000, 0x7e10_2104, 0x7e14_1f04]).unwrap();
+        assert!(hlsl.contains("tb_f32_to_f64(v4, (tb_fp_mode & 0x10u) != 0u)"), "{hlsl}");
+        assert!(hlsl.contains("v10 = tb_f64_to_f32(uint2(v4, v5), (tb_fp_mode & 0x20u) != 0u)"), "{hlsl}");
+        // Modifiers stay refused: v_cvt_f64_f32_e64 v[8:9], -v4 and v_cvt_f32_f64_e64 ... clamp
+        assert!(translate(Stage::Compute, &[0xd590_0008, 0x2000_0104]).is_err());
+        assert!(translate(Stage::Compute, &[0xd58f_8008, 0x0000_0104]).is_err());
     }
 
     #[test]
