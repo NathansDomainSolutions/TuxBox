@@ -3940,9 +3940,11 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            if let Some(high) = float64::pair_source_highs(ins) {
-                if !written.contains(&format!("v{high}")) {
-                    live.insert((1, high));
+            for high in float64::pair_source_highs(ins) {
+                if let (Opnd::Sgpr(n) | Opnd::Vgpr(n), Ok(nm)) = (&high, name(&high)) {
+                    if !written.contains(&nm) {
+                        live.insert((u8::from(matches!(high, Opnd::Vgpr(_))), u32::from(*n)));
+                    }
                 }
             }
             let atomic = ins.mnemonic.starts_with("image_atomic_");
@@ -4083,6 +4085,9 @@ impl<'a> Emitter<'a> {
         }
         if self.insns.iter().any(|i| float64::handles(&i.mnemonic)) {
             h.push_str(float64::HELPERS);
+        }
+        if self.insns.iter().any(|i| float64::arith(&i.mnemonic)) {
+            h.push_str(float64::ARITH_HELPERS);
         }
         if self.insns.iter().any(|i| matches!(i.mnemonic.as_str(), "s_lshr_b64" | "s_ashr_i64" | "s_bfe_u64" | "s_bfe_i64")) {
             h.push_str(r#"
