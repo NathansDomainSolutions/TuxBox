@@ -43,6 +43,35 @@ pub(super) fn reflected(
     if let Some(pixel) = pixel {
         collect_pixel_accesses(&root, &layout, pixel, &mut lengths, &mut accessed_views, &mut mirrored)?;
     }
+    // The pixel stage is translated against the guest root, so it can read any
+    // register of a pixel-visible table, not only the ones its guest resource
+    // list names. Mirror every pixel-visible table the mesh layout rewrote.
+    if pixel.is_some() {
+        for (index, param) in root.params.iter().enumerate() {
+            let RootParamKind::Table(ranges) = &param.kind else { continue };
+            if !layout.replacements.contains_key(&index)
+                || !matches!(param.visibility, 0 | 5)
+                || mirrored.contains(&index)
+            {
+                continue;
+            }
+            mirrored.push(index);
+            let target = root.params.len() + mirrored.len() - 1;
+            if lengths.len() <= target {
+                lengths.resize(target + 1, 0);
+            }
+            let mut next = 0u64;
+            for range in ranges {
+                let start = if range.offset_in_table == u32::MAX { next } else { u64::from(range.offset_in_table) };
+                next = start + u64::from(range.num);
+                let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(next)) else { continue };
+                lengths[target] = lengths[target].max(end);
+                if matches!(range.range_type, 0 | 1) {
+                    accessed_views.push((target, start..end));
+                }
+            }
+        }
+    }
     let bytes = original.serialized();
     // SAFETY: the deserializer owns the source pointers throughout serialization.
     // Replacement tables stay live until the serialized native root is built.
