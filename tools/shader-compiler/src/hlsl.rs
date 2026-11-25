@@ -5197,6 +5197,9 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                                 Some("andn2") => format!("{src} & ~{exec}"),
                                 Some("orn2") => format!("{src} | ~{exec}"),
                                 Some("andn1") => format!("~{src} & {exec}"),
+                                Some("orn1") => format!("~{src} | {exec}"),
+                                Some("nor") => format!("~({src} | {exec})"),
+                                Some("xnor") => format!("~({src} ^ {exec})"),
                                 _ => return Err("unsupported saveexec".into()),
                             })
                         };
@@ -9562,6 +9565,22 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn remaining_saveexec_forms_combine_with_exec() {
+        use crate::hlsl::float64::tests::translate;
+        // LLVM gfx1030 (wave32): s_nor_saveexec_b32 s8, s4 / s_orn1_saveexec_b32 s8, s4
+        for (w, combine) in [(0xbe88_4204u32, "~(s4 | exec_lo)"), (0xbe88_4504, "~s4 | exec_lo")] {
+            let hlsl = translate(Stage::Compute, &[w]).unwrap();
+            let t = hlsl.find(&format!("l = {combine};")).expect(&hlsl);
+            let saved = hlsl.find("s8 = exec_lo;").expect(&hlsl);
+            assert!(t < saved && saved < hlsl.find("exec_lo = t").expect(&hlsl), "{hlsl}");
+        }
+        // s_xnor_saveexec_b64 s[8:9], s[4:5]
+        let hlsl = translate(Stage::Compute, &[0xbe88_2b04]).unwrap();
+        assert!(hlsl.contains("l = ~(s4 ^ exec_lo);") && hlsl.contains("h = ~(s5 ^ exec_hi);"), "{hlsl}");
+        assert!(hlsl.contains("s9 = exec_hi;") && hlsl.contains("exec_hi = t"), "{hlsl}");
     }
 
     #[test]
