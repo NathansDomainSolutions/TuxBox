@@ -6326,7 +6326,10 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         }
         if let Some(signed) = norm16::signed(&m) {
             let kind = if signed { "SNORM16" } else { "UNORM16" };
-            if ins.raw[0] & 0xfc00 != 0 || ins.raw[1] & 0x98000000 != 0 {
+            // The half-float forms may select either half of each source (op_sel bits 11 and 12).
+            let half = m.ends_with("_f16");
+            let select = if half { 0x1800 } else { 0 };
+            if ins.raw[0] & 0xfc00 & !select != 0 || ins.raw[1] & 0x98000000 != 0 {
                 return Err(format!("unsupported {kind} pack modifiers"));
             }
             if self.ex.stage == Stage::Pixel {
@@ -6342,7 +6345,20 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     return Err(format!("unresolved packed {kind} pixel export"));
                 }
             }
-            let (lo, hi) = (self.fm(ins, 0)?, self.fm(ins, 1)?);
+            let (lo, hi) = if half {
+                let source = |i: usize| -> Result<String, String> {
+                    let high = ins.raw[0] & (0x800 << i) != 0;
+                    let x = match &s[i] {
+                        Opnd::ConstF32(_) if high => return Err("high-half selection on inline float".into()),
+                        Opnd::ConstF32(_) => f(&s[i])?,
+                        o => format!("f16tof32(({} >> {}u) & 0xffffu)", r(o)?, if high { 16 } else { 0 }),
+                    };
+                    Ok(Self::float_source(x, ins.aux.mask, i))
+                };
+                (source(0)?, source(1)?)
+            } else {
+                (self.fm(ins, 0)?, self.fm(ins, 1)?)
+            };
             if !signed {
                 return self.wv(&d, &norm16::pack(false, &lo, &hi));
             }
