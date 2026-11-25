@@ -275,6 +275,10 @@ float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a 
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
 float tb_med3(float a, float b, float c) { if (tb_isnan(a) || tb_isnan(b) || tb_isnan(c)) return tb_min(tb_min(a, b), c); float mx = tb_max(tb_max(a, b), c); if (mx == a) return tb_max(b, c); if (mx == b) return tb_max(a, c); return tb_max(a, b); }
 float tb_ldexp(float x, int n) { n = clamp(n, -320, 320); int k1 = clamp(n, -126, 127); n -= k1; int k2 = clamp(n, -126, 127); n -= k2; int k3 = clamp(n, -126, 127); precise float r = x * asfloat((uint)(k1 + 127) << 23); r = r * asfloat((uint)(k2 + 127) << 23); r = r * asfloat((uint)(k3 + 127) << 23); return r; }
+// frexp: the significand in [0.5, 1) with the input sign, and the matching exponent.
+// Infinity and NaN keep their value (NaN quieted) with exponent 0; zero gives zero and 0.
+uint tb_frexp_mant(uint b) { uint e = (b >> 23) & 0xffu, m = b & 0x7fffffu; if (e == 0xffu) return m != 0u ? (b | 0x400000u) : b; if (e == 0u) { if (m == 0u) return b; m = (m << (23u - firstbithigh(m))) & 0x7fffffu; } return (b & 0x80000000u) | 0x3f000000u | m; }
+int tb_frexp_exp(uint b) { uint e = (b >> 23) & 0xffu, m = b & 0x7fffffu; if (e == 0xffu || (e == 0u && m == 0u)) return 0; return e == 0u ? (int)firstbithigh(m) - 148 : (int)e - 126; }
 "#;
 
 /// Number of VGPRs occupied by the MIMG data operand. Gather selects a channel
@@ -6969,6 +6973,20 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let e = self.fres(ins, e);
             return self.wv(&d, &e);
         }
+        if matches!(m.as_str(), "v_frexp_mant_f32" | "v_frexp_exp_i32_f32") {
+            // Bit-exact on the input pattern, matching LLVM's constant folding of the
+            // amdgcn frexp intrinsics. Denormal inputs are decomposed exactly; the
+            // MODE register's input flushing is not modelled, as for the other f32 forms.
+            if ins.enc == Enc::Vop3 && (ins.aux.imm != 0 || ins.aux.imm2 != 0) {
+                return Err("unsupported frexp clamp or output modifier".into());
+            }
+            let bits = Self::select_source(ins, a.clone(), 0);
+            return self.wv(&d, &if m == "v_frexp_mant_f32" {
+                format!("tb_frexp_mant({bits})")
+            } else {
+                format!("asuint(tb_frexp_exp({bits}))")
+            });
+        }
         let mask = if self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
             let upper = if self.required_wave_size == Some(64) {
                 r(&hi(&s[2]))?
@@ -9670,6 +9688,28 @@ mod tests {
         assert!(hlsl.contains("((v4 >> 16) & 0xffffu)") && hlsl.contains("log2("), "{hlsl}");
         // v_log_f16_e32 v8, 0.5: the inline constant is the half-float 0.5.
         let e = line(&[0x7e10_aef0]); assert!(e.contains("log2(asfloat(0x3f000000u))"), "{e}");
+    }
+
+    #[test]
+    fn frexp_decomposes_the_input_bits() {
+        use crate::hlsl::float64::tests::translate;
+        let line = |words: &[u32]| -> String {
+            let hlsl = translate(Stage::Compute, words).unwrap();
+            hlsl.lines().find(|l| l.contains("1u) v8 = ")).unwrap_or_else(|| panic!("{hlsl}")).to_string()
+        };
+        // LLVM gfx1030: v_frexp_mant_f32_e32 v8, v4 and v_frexp_exp_i32_f32_e32 v8, v4
+        assert!(line(&[0x7e10_8104]).contains("v8 = tb_frexp_mant(v4)"));
+        assert!(line(&[0x7e10_7f04]).contains("v8 = asuint(tb_frexp_exp(v4))"));
+        // v_frexp_mant_f32_e64 v8, -|v4| and v_frexp_exp_i32_f32_e64 v8, |v4|
+        assert!(line(&[0xd5c0_0108, 0x2000_0104]).contains("tb_frexp_mant(((v4 & 0x7fffffffu) ^ 0x80000000u))"));
+        assert!(line(&[0xd5bf_0108, 0x0000_0104]).contains("tb_frexp_exp((v4 & 0x7fffffffu))"));
+        // Scalar and inline-constant sources: v_frexp_mant_f32 v8, s4 / -4.0
+        assert!(translate(Stage::Compute, &[0x7e10_8004]).is_ok());
+        assert!(line(&[0x7e10_80f7]).contains("tb_frexp_mant(0xc0800000u)"));
+        // clamp and mul:2 are refused.
+        let err = translate(Stage::Compute, &[0xd5c0_8008, 0x0000_0104]).unwrap_err();
+        assert!(err.contains("unsupported frexp clamp or output modifier"), "{err}");
+        assert!(translate(Stage::Compute, &[0xd5c0_0008, 0x0800_0104]).is_err());
     }
 
     #[test]
