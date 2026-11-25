@@ -1,6 +1,9 @@
 //! Exactly specified double-precision forms on register pairs: rounding to
 //! an integral value, conversions between f64 and 32-bit integers or f32,
-//! and the IEEE-754 binary64 add, multiply, fused multiply-add and ldexp.
+//! the IEEE-754 binary64 add, multiply, fused multiply-add and ldexp, and
+//! fract and frexp as LLVM 18 constant-folds the amdgcn intrinsics (fract
+//! is x - floor(x) rounded, at most 0x3fefffffffffffff, NaN for infinities;
+//! frexp normalizes denormals and gives exponent 0 for inf/NaN).
 //! Like the f64 comparisons they use bit operations on `uint2` (low, high)
 //! pairs, so no host FP64 support is required. Each result is exact; the
 //! only mode dependence is whether f64 denormals are flushed (MODE bit 6
@@ -11,6 +14,8 @@
 //! ignored; output flushing tests the rounded result and keeps its sign; a
 //! NaN operand is returned quieted (the first NaN operand, in source order,
 //! payload kept), and an invalid operation returns +qNaN 0x7ff8000000000000.
+//! The same NaN rule and the flushing modes apply to fract and frexp. VOP3
+//! abs and neg act on the sign bit of a floating-point source, a NaN's too.
 use super::{r, Emitter, Enc, Insn, Opnd};
 
 pub(super) const HELPERS: &str = r#"
@@ -331,21 +336,63 @@ uint2 tb_f64_ldexp(uint2 a, int n, bool keepIn, bool keepOut) {
     sig = tb_f64_normalize(sig, e);
     return tb_f64_pack(sign, e - 1 + clamp(n, -2200, 2200), tb_u64_shl(sig, 10u), keepOut);
 }
+uint2 tb_f64_fract(uint2 x, bool keepIn, bool keepOut) {
+    // x - floor(x), rounded to nearest even, but at most 0x3fefffffffffffff
+    // (the largest f64 below 1.0). Infinities give +qNaN (inf - inf).
+    uint2 f = tb_f64_round(x, 1u, keepIn);
+    uint2 d = tb_f64_add(x, uint2(f.x, f.y ^ 0x80000000u), keepIn, keepOut);
+    return !tb_f64_nan(d) && tb_u64_less(uint2(0xffffffffu, 0x3fefffffu), d) ? uint2(0xffffffffu, 0x3fefffffu) : d;
+}
+uint2 tb_f64_frexp_mant(uint2 x, bool keepIn) {
+    // Significand scaled into [0.5, 1) with x's sign; zeros and infinities
+    // are returned as they are and a NaN is quieted.
+    if (tb_f64_nan(x)) return uint2(x.x, x.y | 0x80000u);
+    if ((x.y & 0x7ff00000u) == 0x7ff00000u) return x;
+    uint sign = x.y & 0x80000000u;
+    uint2 sig = tb_f64_sig(x, keepIn);
+    if ((sig.x | sig.y) == 0u) return uint2(0u, sign);
+    int e = tb_f64_exp(x);
+    sig = tb_f64_normalize(sig, e);
+    return uint2(sig.x, sign | 0x3fe00000u | (sig.y & 0xfffffu));
+}
+uint tb_f64_frexp_exp(uint2 x, bool keepIn) {
+    // The matching exponent; 0 for zeros, infinities and NaNs.
+    if ((x.y & 0x7ff00000u) == 0x7ff00000u) return 0u;
+    uint2 sig = tb_f64_sig(x, keepIn);
+    if ((sig.x | sig.y) == 0u) return 0u;
+    int e = tb_f64_exp(x);
+    sig = tb_f64_normalize(sig, e);
+    return asuint(e - 1022);
+}
 "#;
 
 /// Forms whose first source is an f64 register pair.
 fn pair_source(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_cvt_f32_f64") || arith(m)
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_cvt_f32_f64")
+        || extras(m)
+        || arith(m)
 }
 
 /// Forms whose result is an f64 register pair.
 pub(super) fn pair_result(m: &str) -> bool {
-    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32" | "v_cvt_f64_f32") || arith(m)
+    matches!(m, "v_trunc_f64" | "v_floor_f64" | "v_ceil_f64" | "v_rndne_f64" | "v_cvt_f64_i32" | "v_cvt_f64_u32" | "v_cvt_f64_f32")
+        || matches!(m, "v_fract_f64" | "v_frexp_mant_f64")
+        || arith(m)
 }
 
 /// Soft-float arithmetic forms, which use `ARITH_HELPERS`.
 pub(super) fn arith(m: &str) -> bool {
     matches!(m, "v_add_f64" | "v_mul_f64" | "v_fma_f64" | "v_ldexp_f64")
+}
+
+/// Single-source forms whose helpers live in `ARITH_HELPERS`.
+fn extras(m: &str) -> bool {
+    matches!(m, "v_fract_f64" | "v_frexp_mant_f64" | "v_frexp_exp_i32_f64")
+}
+
+/// Forms that need `ARITH_HELPERS`.
+pub(super) fn soft(m: &str) -> bool {
+    arith(m) || extras(m)
 }
 
 /// Number of leading f64 register-pair sources.
@@ -371,47 +418,72 @@ pub(super) fn pair_source_highs(ins: &Insn) -> Vec<Opnd> {
     }).collect()
 }
 
+/// Apply VOP3 source abs and neg (`mask` bits 0 and 3) to the word holding the sign bit.
+fn sign_modifiers(word: String, mask: u8) -> String {
+    let word = if mask & 1 != 0 { format!("({word} & 0x7fffffffu)") } else { word };
+    if mask & 8 != 0 { format!("({word} ^ 0x80000000u)") } else { word }
+}
+
 impl Emitter<'_> {
     pub(super) fn lower_f64(&mut self, ins: &Insn) -> Result<bool, String> {
         let m = ins.mnemonic.as_str();
+        if matches!(m, "v_min_f64" | "v_max_f64") {
+            // LLVM 18 maps these to fminnum_ieee/fmaxnum_ieee in IEEE mode (a
+            // signalling NaN gives a quiet NaN) and to fminnum/fmaxnum otherwise
+            // (it gives the other operand). MODE.IEEE comes from PGM_RSRC1, which
+            // is not tracked (LLVM defaults it off for graphics shaders), and
+            // neither mapping pins the result for -0 against +0.
+            return Err("f64 min/max not modelled: NaN and signed-zero results depend on MODE.IEEE, which is not tracked".into());
+        }
         if !handles(m) {
             return Ok(false);
         }
         if arith(m) {
             return self.lower_f64_arith(ins).map(|()| true);
         }
-        // Ordinary VGPR operands only; the VOP3 form without abs, neg,
-        // clamp or omod. Verified in compute shaders only.
-        let plain = match ins.enc {
-            Enc::Vop1 => ins.aux.sdwa.is_none() && ins.raw.len() == 1,
-            Enc::Vop3 => ins.raw.len() == 2 && ins.raw[0] & 0xff00 == 0 && ins.raw[1] >> 27 == 0,
-            _ => false,
-        };
-        let (Some(Opnd::Vgpr(dst)), Some(Opnd::Vgpr(src))) = (ins.dst.first(), ins.src.first()) else {
-            return Err("unsupported f64 operand".into());
-        };
-        if !plain || !ins.is_complete() {
+        // VOP1, or VOP3 without clamp, omod or op_sel. Abs and neg act on the
+        // sign bit of a floating-point source (not the integer converts').
+        let float_source = m != "v_cvt_f64_i32" && m != "v_cvt_f64_u32";
+        match ins.enc {
+            Enc::Vop1 if ins.aux.sdwa.is_none() => {}
+            Enc::Vop3 if ins.raw.len() >= 2 => {
+                if ins.aux.imm != 0 || ins.aux.imm2 != 0 || ins.raw[0] & 0x7800 != 0 {
+                    return Err("unsupported f64 clamp, output modifier or op_sel".into());
+                }
+                if ins.aux.mask & !(if float_source { 0x09 } else { 0 }) != 0 {
+                    return Err("unsupported f64 source modifier".into());
+                }
+            }
+            _ => return Err("unsupported f64 encoding or modifiers".into()),
+        }
+        if !ins.is_complete() {
             return Err("unsupported f64 encoding or modifiers".into());
         }
         if self.ex.stage != super::Stage::Compute {
             return Err("unverified f64 shader stage".into());
         }
-        let (dst, src) = (*dst, *src);
-        if (pair_result(m) && dst == u8::MAX) || (pair_source(m) && src == u8::MAX) {
+        let (Some(&Opnd::Vgpr(dst)), Some(src)) = (ins.dst.first(), ins.src.first()) else {
+            return Err("unsupported f64 operand".into());
+        };
+        if pair_result(m) && dst == u8::MAX {
             return Err("VGPR pair overflows".into());
         }
+        let mask = if ins.enc == Enc::Vop3 { ins.aux.mask } else { 0 };
+        // Register pairs, inline constants (f64 values, or 64-bit integers)
+        // and literals (the high word) as f64 sources; any 32-bit operand
+        // r() models as the source of the 32-bit converts.
         let source = if pair_source(m) {
-            let high = Opnd::Vgpr(src + 1);
-            self.touch(&high);
-            format!("uint2({}, {})", r(&Opnd::Vgpr(src))?, r(&high)?)
+            let (low, high) = self.compare_pair(src, "f64")?;
+            format!("uint2({low}, {})", sign_modifiers(high, mask))
         } else {
-            r(&Opnd::Vgpr(src))?
+            sign_modifiers(r(src)?, mask)
         };
-        let keep = if self.regs.contains("tb_fp_mode") { "(tb_fp_mode & 0x40u) != 0u" } else { "true" };
+        let mode = self.regs.contains("tb_fp_mode");
+        let keep = if mode { "(tb_fp_mode & 0x40u) != 0u" } else { "true" };
+        let keep_out = if mode { "(tb_fp_mode & 0x80u) != 0u" } else { "true" };
         // The f32 side follows MODE's f32 denormal field: bit 4 keeps input denormals and
         // bit 5 keeps results. Its default (MODE 0xc0) flushes both.
-        let tracked = self.regs.contains("tb_fp_mode");
-        let keep32 = |bit: u32| if tracked { format!("(tb_fp_mode & {bit:#x}u) != 0u") } else { "false".into() };
+        let keep32 = |bit: u32| if mode { format!("(tb_fp_mode & {bit:#x}u) != 0u") } else { "false".into() };
         let value = match m {
             "v_trunc_f64" => format!("tb_f64_round({source}, 0u, {keep})"),
             "v_floor_f64" => format!("tb_f64_round({source}, 1u, {keep})"),
@@ -422,7 +494,11 @@ impl Emitter<'_> {
             "v_cvt_f64_f32" => format!("tb_f32_to_f64({source}, {})", keep32(0x10)),
             "v_cvt_f32_f64" => format!("tb_f64_to_f32({source}, {})", keep32(0x20)),
             "v_cvt_i32_f64" => format!("tb_f64_to_i32({source}, true)"),
-            _ => format!("tb_f64_to_i32({source}, false)"),
+            "v_cvt_u32_f64" => format!("tb_f64_to_i32({source}, false)"),
+            "v_fract_f64" => format!("tb_f64_fract({source}, {keep}, {keep_out})"),
+            "v_frexp_mant_f64" => format!("tb_f64_frexp_mant({source}, {keep})"),
+            "v_frexp_exp_i32_f64" => format!("tb_f64_frexp_exp({source}, {keep})"),
+            _ => return Err("unsupported f64 operation".into()),
         };
         if !pair_result(m) {
             self.wv(&Opnd::Vgpr(dst), &value)?;
@@ -545,8 +621,10 @@ pub(super) mod tests {
         let hlsl = translate(Stage::Compute, &[0xbfa5_0000, 0x7e10_2104, 0x7e14_1f04]).unwrap();
         assert!(hlsl.contains("tb_f32_to_f64(v4, (tb_fp_mode & 0x10u) != 0u)"), "{hlsl}");
         assert!(hlsl.contains("v10 = tb_f64_to_f32(uint2(v4, v5), (tb_fp_mode & 0x20u) != 0u)"), "{hlsl}");
-        // Modifiers stay refused: v_cvt_f64_f32_e64 v[8:9], -v4 and v_cvt_f32_f64_e64 ... clamp
-        assert!(translate(Stage::Compute, &[0xd590_0008, 0x2000_0104]).is_err());
+        // LLVM gfx1030: v_cvt_f64_f32_e64 v[8:9], -v4 (neg flips the f32 sign bit)
+        let hlsl = translate(Stage::Compute, &[0xd590_0008, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("= tb_f32_to_f64((v4 ^ 0x80000000u), false);"), "{hlsl}");
+        // Clamp stays refused: v_cvt_f32_f64_e64 v8, v[4:5] clamp
         assert!(translate(Stage::Compute, &[0xd58f_8008, 0x0000_0104]).is_err());
     }
 
@@ -641,11 +719,111 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn modifiers_scalar_sources_and_other_stages_are_refused() {
-        // v_floor_f64_e64 v[8:9], -v[4:5]
-        assert!(translate(Stage::Compute, &[0xd59a_0008, 0x2201_0104]).is_err());
-        // v_floor_f64_e32 v[8:9], s[4:5]
-        assert!(translate(Stage::Compute, &[0x7e10_3404]).is_err());
+    fn rounding_and_converts_accept_scalar_pairs_constants_and_literals() {
+        // LLVM gfx1030: v_floor_f64_e32 v[8:9], s[4:5]  ; encoding: [0x04,0x34,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_3404]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(s4, s5), 1u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_ceil_f64_e32 v[8:9], 0.5  ; encoding: [0xf0,0x30,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_30f0]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(0x0u, 0x3fe00000u), 2u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_rndne_f64_e32 v[8:9], 0x3ff80000 (the literal is the high word)
+        let hlsl = translate(Stage::Compute, &[0x7e10_32ff, 0x3ff8_0000]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(0x0u, 0x3ff80000u), 3u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_trunc_f64_e32 v[8:9], -1 (a 64-bit integer pattern)
+        let hlsl = translate(Stage::Compute, &[0x7e10_2ec1]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(0xffffffffu, 0xffffffffu), 0u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_u32_f64_e32 v8, vcc  ; encoding: [0x6a,0x2a,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_2a6a]).unwrap();
+        assert!(hlsl.contains("tb_f64_to_i32(uint2(vcc_lo, vcc_hi), false)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_f64_i32_e32 v[8:9], s4  ; encoding: [0x04,0x08,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_0804]).unwrap();
+        assert!(hlsl.contains("tb_i32_to_f64(s4, true)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_f64_u32_e32 v[8:9], 0xaf123456
+        let hlsl = translate(Stage::Compute, &[0x7e10_2cff, 0xaf12_3456]).unwrap();
+        assert!(hlsl.contains("tb_i32_to_f64(0xaf123456u, false)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_f64_i32_e32 v[8:9], -4.0 (the f32 bit pattern as an integer)
+        let hlsl = translate(Stage::Compute, &[0x7e10_08f7]).unwrap();
+        assert!(hlsl.contains("tb_i32_to_f64(0xc0800000u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_f64_f32_e32 v[8:9], m0  ; encoding: [0x7c,0x20,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_207c]).unwrap();
+        assert!(hlsl.contains("tb_f32_to_f64(m0, false)"), "{hlsl}");
+    }
+
+    #[test]
+    fn rounding_and_converts_apply_source_abs_and_neg() {
+        // LLVM gfx1030: v_floor_f64_e64 v[8:9], -v[4:5]
+        let hlsl = translate(Stage::Compute, &[0xd59a_0008, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(v4, (v5 ^ 0x80000000u)), 1u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_trunc_f64_e64 v[8:9], |v[4:5]|
+        let hlsl = translate(Stage::Compute, &[0xd597_0108, 0x0000_0104]).unwrap();
+        assert!(hlsl.contains("tb_f64_round(uint2(v4, (v5 & 0x7fffffffu)), 0u, true)"), "{hlsl}");
+        // LLVM gfx1030: v_cvt_i32_f64_e64 v8, -|v[4:5]|
+        let hlsl = translate(Stage::Compute, &[0xd583_0108, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("tb_f64_to_i32(uint2(v4, ((v5 & 0x7fffffffu) ^ 0x80000000u)), true)"), "{hlsl}");
+    }
+
+    #[test]
+    fn modifiers_and_other_stages_are_refused() {
+        // LLVM gfx1030: v_floor_f64_e64 v[8:9], v[4:5] clamp
+        assert!(translate(Stage::Compute, &[0xd59a_8008, 0x0000_0104]).is_err());
+        // LLVM gfx1030: v_floor_f64_e64 v[8:9], v[4:5] mul:2
+        assert!(translate(Stage::Compute, &[0xd59a_0008, 0x0800_0104]).is_err());
+        // LLVM gfx1030: v_cvt_f64_i32_e64 v[8:9], v4 clamp
+        assert!(translate(Stage::Compute, &[0xd584_8008, 0x0000_0104]).is_err());
+        // v_cvt_f64_i32_e64 v[8:9], -v4 (llvm-mc rejects it; neg bit set by hand on an integer source)
+        assert!(translate(Stage::Compute, &[0xd584_0008, 0x2000_0104]).is_err());
+        // v_floor_f64_e64 v[8:9], v[4:5] with op_sel bit 11 set by hand
+        assert!(translate(Stage::Compute, &[0xd59a_0808, 0x0000_0104]).is_err());
         assert!(translate(Stage::Pixel, &[0x7e10_3504]).is_err());
+    }
+
+    #[test]
+    fn fract_and_frexp_call_soft_float_helpers() {
+        // LLVM gfx1030: v_fract_f64_e32 v[8:9], v[4:5]  ; encoding: [0x04,0x7d,0x10,0x7e]
+        let hlsl = translate(Stage::Compute, &[0x7e10_7d04]).unwrap();
+        assert!(hlsl.contains("= tb_f64_fract(uint2(v4, v5), true, true);"), "{hlsl}");
+        assert!(hlsl.contains("uint2 tb_f64_fract(uint2 x, bool keepIn, bool keepOut)"), "{hlsl}");
+        assert!(hlsl.contains("v8 = t") && hlsl.contains("v9 = t"), "{hlsl}");
+        // LLVM gfx1030: v_fract_f64_e64 v[8:9], -|v[4:5]|
+        let hlsl = translate(Stage::Compute, &[0xd5be_0108, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("tb_f64_fract(uint2(v4, ((v5 & 0x7fffffffu) ^ 0x80000000u)), true, true)"), "{hlsl}");
+        // LLVM gfx1030: v_fract_f64_e32 v[8:9], s[4:5]
+        let hlsl = translate(Stage::Compute, &[0x7e10_7c04]).unwrap();
+        assert!(hlsl.contains("tb_f64_fract(uint2(s4, s5), true, true)"), "{hlsl}");
+        // LLVM gfx1030: v_frexp_mant_f64_e32 v[8:9], v[4:5]
+        let hlsl = translate(Stage::Compute, &[0x7e10_7b04]).unwrap();
+        assert!(hlsl.contains("= tb_f64_frexp_mant(uint2(v4, v5), true);"), "{hlsl}");
+        assert!(hlsl.contains("v8 = t") && hlsl.contains("v9 = t"), "{hlsl}");
+        // LLVM gfx1030: v_frexp_mant_f64_e64 v[8:9], -v[4:5]
+        let hlsl = translate(Stage::Compute, &[0xd5bd_0008, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("tb_f64_frexp_mant(uint2(v4, (v5 ^ 0x80000000u)), true)"), "{hlsl}");
+        // LLVM gfx1030: v_frexp_exp_i32_f64_e32 v8, v[4:5] (one result register)
+        let hlsl = translate(Stage::Compute, &[0x7e10_7904]).unwrap();
+        assert!(hlsl.contains("v8 = tb_f64_frexp_exp(uint2(v4, v5), true)"), "{hlsl}");
+        assert!(!hlsl.contains("v9 ="), "{hlsl}");
+        // LLVM gfx1030: v_frexp_exp_i32_f64_e64 v8, |v[4:5]|
+        let hlsl = translate(Stage::Compute, &[0xd5bc_0108, 0x0000_0104]).unwrap();
+        assert!(hlsl.contains("v8 = tb_f64_frexp_exp(uint2(v4, (v5 & 0x7fffffffu)), true)"), "{hlsl}");
+        // LLVM gfx1030: v_frexp_exp_i32_f64_e32 v8, 1.0
+        let hlsl = translate(Stage::Compute, &[0x7e10_78f2]).unwrap();
+        assert!(hlsl.contains("v8 = tb_f64_frexp_exp(uint2(0x0u, 0x3ff00000u), true)"), "{hlsl}");
+        // s_denorm_mode 0, then v_fract_f64_e32 v[8:9], v[4:5] and v_frexp_exp_i32_f64_e32 v10, v[4:5]
+        let hlsl = translate(Stage::Compute, &[0xbfa5_0000, 0x7e10_7d04, 0x7e14_7904]).unwrap();
+        assert!(hlsl.contains("tb_f64_fract(uint2(v4, v5), (tb_fp_mode & 0x40u) != 0u, (tb_fp_mode & 0x80u) != 0u)"), "{hlsl}");
+        assert!(hlsl.contains("tb_f64_frexp_exp(uint2(v4, v5), (tb_fp_mode & 0x40u) != 0u)"), "{hlsl}");
+    }
+
+    #[test]
+    fn fract_frexp_modifiers_and_unpinned_f64_ops_are_refused() {
+        // LLVM gfx1030: v_fract_f64_e64 v[8:9], v[4:5] clamp
+        assert!(translate(Stage::Compute, &[0xd5be_8008, 0x0000_0104]).is_err());
+        // LLVM gfx1030: v_frexp_mant_f64_e64 v[8:9], v[4:5] mul:2
+        assert!(translate(Stage::Compute, &[0xd5bd_0008, 0x0800_0104]).is_err());
+        assert!(translate(Stage::Pixel, &[0x7e10_7d04]).is_err());
+        // LLVM gfx1030: v_rcp_f64_e32 v[8:9], v[4:5] (hardware result not exactly specified)
+        assert!(translate(Stage::Compute, &[0x7e10_5f04]).is_err());
+        // LLVM gfx1030: v_min_f64 v[8:9], v[4:5], v[6:7] (NaN and signed-zero results depend on MODE.IEEE)
+        let err = translate(Stage::Compute, &[0xd566_0008, 0x0002_0d04]).unwrap_err();
+        assert!(err.contains("MODE.IEEE"), "{err}");
     }
 }
