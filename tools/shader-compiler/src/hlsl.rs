@@ -268,6 +268,8 @@ const HALF_HELPERS: &str = r#"uint tb_trig_f16(uint bits, bool cosine) {
     return result | ((result != 0u && negative) ? 0x8000u : 0u);
 }
 uint tb_f16_rtz(float x) { return tb_f16_cvt(x, true); }
+uint tb_frexp_mant16(uint h) { uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu; if (e == 0x1fu) return m != 0u ? (h | 0x200u) : h; if (e == 0u) { if (m == 0u) return h; m = (m << (10u - firstbithigh(m))) & 0x3ffu; } return (h & 0x8000u) | 0x3800u | m; }
+int tb_frexp_exp16(uint h) { uint e = (h >> 10) & 0x1fu, m = h & 0x3ffu; if (e == 0x1fu || (e == 0u && m == 0u)) return 0; return e == 0u ? (int)firstbithigh(m) - 23 : (int)e - 14; }
 bool tb_isnan(float x) { return (asuint(x) & 0x7fffffffu) > 0x7f800000u; }
 float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a < b ? a : b)); }
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
@@ -6270,6 +6272,49 @@ uint tb_fmac_half(uint a, uint b, uint c) {
             let x = r(&s[0])?;
             return self.wv(&d, &format!("((({x}) & 0x7fffu) > 0x7c00u ? 0u : (asuint((int)clamp({}, -32768.0, 32767.0)) & 0xffffu))", h16(&s[0])?));
         }
+        // These half forms don't yet model SDWA clamp or half inline constants. The SDWA
+        // path below would otherwise re-enter them as plain VOP1/VOP2 forms.
+        if ins.aux.sdwa.is_some()
+            && matches!(m.as_str(), "v_ldexp_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16" | "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16")
+        {
+            return Err(format!("unsupported SDWA form of {m}"));
+        }
+        if ins.aux.sdwa.is_none() && m == "v_ldexp_f16" {
+            // D.f16 = S0.f16 * 2^S1, with S1 a signed 16-bit exponent. Scaling in f32 is
+            // exact over the half range, so the single rounding to half matches.
+            let n = format!("(asint(({}) << 16) >> 16)", r(&s[1])?);
+            return self.wv(&d, &hres(format!("tb_ldexp({}, {n})", h16(&s[0])?)));
+        }
+        if ins.aux.sdwa.is_none()
+            && matches!(m.as_str(), "v_frexp_mant_f16" | "v_frexp_exp_i16_f16" | "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16")
+        {
+            if ins.enc == Enc::Vop3 && (ins.aux.imm != 0 || ins.aux.imm2 != 0) {
+                return Err("unsupported half conversion clamp or output modifier".into());
+            }
+            // The 16-bit source pattern with VOP3 abs/neg applied to its sign bit. An inline
+            // float constant denotes the half of that value.
+            let mut bits = match &s[0] {
+                Opnd::ConstF32(_) => format!("f32tof16({})", f(&s[0])?),
+                o => format!("(({}) & 0xffffu)", r(o)?),
+            };
+            if ins.enc == Enc::Vop3 {
+                if ins.aux.mask & 1 != 0 { bits = format!("({bits} & 0x7fffu)"); }
+                if ins.aux.mask & 8 != 0 { bits = format!("({bits} ^ 0x8000u)"); }
+            }
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = {bits};"));
+            let x = format!("f16tof32(t{t})");
+            let nan = format!("((t{t} & 0x7fffu) > 0x7c00u)");
+            let e = match m.as_str() {
+                "v_frexp_mant_f16" => format!("tb_frexp_mant16(t{t})"),
+                "v_frexp_exp_i16_f16" => format!("(asuint(tb_frexp_exp16(t{t})) & 0xffffu)"),
+                // Normalized integers as for D3D: clamp, scale, round to nearest even; NaN is 0.
+                "v_cvt_norm_i16_f16" => format!("({nan} ? 0u : (asuint((int)round(clamp({x}, -1.0, 1.0) * 32767.0)) & 0xffffu))"),
+                _ => format!("({nan} ? 0u : (uint)round(saturate({x}) * 65535.0))"),
+            };
+            return self.wv(&d, &e);
+        }
         if matches!(m.as_str(), "v_fmaak_f16" | "v_fmamk_f16") {
             // The trailing literal dword carries the half-float constant K in its low bits.
             let k = format!("f16tof32({:#x}u)", ins.raw.last().copied().unwrap_or(0) & 0xffff);
@@ -9637,6 +9682,42 @@ mod tests {
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+    }
+
+    #[test]
+    fn half_exponent_forms_and_normalized_conversions() {
+        use crate::hlsl::float64::tests::translate;
+        let line = |w: &[u32]| {
+            let hlsl = translate(Stage::Compute, w).unwrap();
+            hlsl.lines().rev().find(|l| l.contains("v8 =")).unwrap_or_default().to_string()
+        };
+        // LLVM gfx1030: v_ldexp_f16_e32 v8, v4, v5
+        let e = line(&[0x7610_0b04]);
+        assert!(e.contains("v8 = tb_f16_rne(tb_ldexp(f16tof32((v4) & 0xffffu), (asint((v5) << 16) >> 16)))"), "{e}");
+        // v_ldexp_f16_e64 v8, -|v4|, v5 clamp
+        let e = line(&[0xd53b_8108, 0x2002_0b04]);
+        assert!(e.contains("saturate(tb_ldexp((-abs(f16tof32((v4) & 0xffffu))), "), "{e}");
+        // v_ldexp_f16_e64 v8, v4, v5 mul:2
+        assert!(line(&[0xd53b_0008, 0x0802_0b04]).contains("* 2.0"));
+        // v_frexp_mant_f16_e32 v8, v4 and v_frexp_exp_i16_f16_e32 v8, v4
+        let hlsl = translate(Stage::Compute, &[0x7e10_b304]).unwrap();
+        assert!(hlsl.contains("= ((v4) & 0xffffu);") && hlsl.contains("v8 = tb_frexp_mant16(t"), "{hlsl}");
+        assert!(line(&[0x7e10_b504]).contains("v8 = (asuint(tb_frexp_exp16(t"));
+        // v_frexp_mant_f16_e64 v8, -|v4|: abs then neg on the sign bit.
+        let hlsl = translate(Stage::Compute, &[0xd5d9_0108, 0x2000_0104]).unwrap();
+        assert!(hlsl.contains("= ((((v4) & 0xffffu) & 0x7fffu) ^ 0x8000u);"), "{hlsl}");
+        // v_frexp_mant_f16_e32 v8, 0.5
+        assert!(translate(Stage::Compute, &[0x7e10_b2f0]).unwrap().contains("f32tof16("));
+        // v_cvt_norm_i16_f16_e32 v8, v4 and v_cvt_norm_u16_f16_e32 v8, v4
+        let e = line(&[0x7e10_c704]);
+        assert!(e.contains("0x7fffu) > 0x7c00u) ? 0u : (asuint((int)round(clamp(f16tof32(t"), "{e}");
+        assert!(e.contains("-1.0, 1.0) * 32767.0)) & 0xffffu))"), "{e}");
+        let e = line(&[0x7e10_c904]);
+        assert!(e.contains("? 0u : (uint)round(saturate(f16tof32(t") && e.contains(" * 65535.0))"), "{e}");
+        // Refused: clamp on a conversion, and the SDWA form.
+        for w in [&[0xd5d9_8008u32, 0x0000_0104][..], &[0xd5e4_8008, 0x0000_0104], &[0x7e10_b2f9, 0x0005_1504]] {
+            assert!(translate(Stage::Compute, w).is_err(), "{w:x?}");
+        }
     }
 
     #[test]
