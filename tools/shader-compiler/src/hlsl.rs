@@ -97,6 +97,7 @@ mod heap_origins;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
+mod dpp16;
 use packed_root::{PackedRoot, RootAbi};
 
 pub struct Translated {
@@ -550,6 +551,8 @@ struct Emitter<'a> {
     vote_uses: BTreeMap<usize, usize>,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
+    /// Instructions whose DPP16 source lane was read outside the guards.
+    dpp16_fetched: BTreeSet<usize>,
     indexed_lane: bool,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
@@ -668,6 +671,7 @@ const OP_ROW_MIRROR: u32 = 0x7fe2;
 fn is_quad_exchange(i: &Insn) -> bool {
     (i.enc == Enc::Vop2 && i.op == OP_QUAD_ADD_F32)
         || (i.enc == Enc::Vop1 && (i.op == OP_QUAD_MOVE || i.op == OP_ROW_MIRROR))
+        || dpp16::marked(i)
 }
 
 /// Whole-wave reductions (HLSL `WaveActiveMin` / `WaveActiveMax`; observed in
@@ -718,7 +722,7 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
             op.aux.imm = 0;
             continue;
         }
-        return Err(format!("unsupported DPP16 move at {:#x}", op.offset));
+        // Any other shape is an ordinary DPP16 move; see `dpp16::prepare`.
     }
     let mut width = None;
     let is_dpp = |i: &Insn| i.enc == Enc::Vop2 && matches!(i.src.first(), Some(Opnd::Raw(233 | 234 | 250)));
@@ -727,6 +731,19 @@ fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Option<u32>, String> {
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
+        if insns[first].src.first() == Some(&Opnd::Raw(250)) {
+            // Only two shapes start with a DPP16 operation: the quad add and the
+            // min/max reduction behind s_nand_saveexec_b64. The integer and
+            // masked reductions start with DPP8. Leave anything else to `dpp16`.
+            let ctrl = insns[first].raw.get(1).copied();
+            let nand_prologue = first.checked_sub(3).is_some_and(|p| insns[p].enc == Enc::Sop1 && insns[p].op == 0x29);
+            if !((red == "v_add_f32" && ctrl.is_some_and(|c| c & 0xffff0000 == 0xff0c0000))
+                || (matches!(red.as_str(), "v_min_f32" | "v_max_f32") && nand_prologue))
+            {
+                at = first + 1;
+                continue;
+            }
+        }
         if red == "v_add_f32" && insns[first].src.first() == Some(&Opnd::Raw(250)) {
             let ctrl = *insns[first].raw.get(1).ok_or_else(|| bad("missing DPP16 control word"))?;
             // DPP16 quad_perm, all rows and banks, BC=1, FI=1, no modifiers.
@@ -1397,7 +1414,11 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     let required_wave_size = if wave_cull {
         fspx_wave.filter(|&width| width == 32)
     } else if straight_exchange { None }
-      else { lower_wave_reductions(&mut insns)? };
+      else {
+        let width = lower_wave_reductions(&mut insns)?;
+        dpp16::prepare(&mut insns)?;
+        width
+    };
     let required_wave_size = if resolve_wave32 {
         if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
@@ -1507,7 +1528,7 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && em.insns.iter().all(|i| i.op != wave_sum::DPP_REDUCE || i.enc != Enc::Vop2
             || matches!(i.mnemonic.as_str(), "v_and_b32" | "v_or_b32" | "v_min_u32" | "v_max_u32" | "v_min_f32" | "v_max_f32" | "v_add_nc_u32" | "v_add_f32"));
     let required_wave_size = if em.pixel_wave { None } else { required_wave_size };
-    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1)) || uses_bpermute || uses_permlane || group_extrema).then_some(32));
+    let required_wave_size = required_wave_size.or(scan_width).or(register_wave_size).or((requires_ballot || !em.vote_uses.is_empty()).then_some(64)).or((uses_quad_add && !(em.pixel_wave && em.insns.iter().all(|i| (i.op != OP_ROW_MIRROR || i.enc != Enc::Vop1) && !dpp16::marked(i))) || uses_bpermute || uses_permlane || group_extrema).then_some(32));
     em.required_wave_size = required_wave_size;
     // DS bit-mask mode operates on the low five lane bits in wave32 and wave64.
     // Map guest lanes by workgroup index, independently of the Vulkan subgroup layout.
@@ -2076,6 +2097,7 @@ impl<'a> Emitter<'a> {
             vote_uses: BTreeMap::new(),
             reflected_lds_words: None,
             hoisted_swizzle: None,
+            dpp16_fetched: BTreeSet::new(),
             indexed_lane: false,
             single_wave32: false,
             resolve_wave32: false,
@@ -4412,7 +4434,12 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                     cur.clear();
                 }
                 let source = r(&ins.src[0])?;
-                if self.pixel_wave && ins.op != OP_ROW_MIRROR {
+                if dpp16::marked(ins) {
+                    let skipped = (!active.is_empty()).then(|| {
+                        format!("({})", active.iter().map(|t| format!("j{t}")).collect::<Vec<_>>().join(" || "))
+                    });
+                    dpp16::fetch(self, i, ins, skipped.as_deref())?;
+                } else if self.pixel_wave && ins.op != OP_ROW_MIRROR {
                     // Quad operations include helper lanes, as FI=1 does. Lane bits are x, y.
                     let perm = ins.aux.imm;
                     self.line(&format!("uint q{i}lane = WaveGetLaneIndex() & 3u, q{i}src = (({perm}u >> (2u * q{i}lane)) & 3u) ^ q{i}lane;"));
@@ -4681,7 +4708,11 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     }
 
     fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
-        self.emit_insn_body(idx, ins, is_ps, br)?;
+        if dpp16::marked(ins) {
+            dpp16::emit(self, idx, ins, is_ps, br)?;
+        } else {
+            self.emit_insn_body(idx, ins, is_ps, br)?;
+        }
         if self.vote_defs.contains(&idx) {
             let mask = r(&ins.dst[0])?;
             self.line(&format!("tb_votes{idx} = WaveActiveCountBits(({mask} & 1u) != 0u);"));
@@ -9691,11 +9722,14 @@ mod tests {
     }
 
     #[test]
-    fn dpp16_row_mirror_with_fi1_is_refused() {
-        // row_mirror with FI=1 reads the pre-existing value; not the accepted shape.
+    fn dpp16_row_mirror_with_fi1_is_left_to_the_ordinary_lowering() {
+        // row_mirror with FI=1 reads the pre-existing value; not a reduction move.
         let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x140, 1, 1, 0xf, 0xf))];
-        let err = lower_wave_reductions(&mut insns).expect_err("refused");
-        assert!(err.contains("unsupported DPP16 move"));
+        lower_wave_reductions(&mut insns).expect("not claimed");
+        assert_eq!((insns[0].op, &insns[0].src), (0, &vec![Opnd::Raw(250)]));
+        dpp16::prepare(&mut insns).expect("ordinary DPP16 move");
+        assert!(dpp16::marked(&insns[0]));
+        assert_eq!(insns[0].src, vec![Opnd::Vgpr(2)]);
     }
 
     #[test]
@@ -9743,18 +9777,22 @@ mod tests {
     }
 
     #[test]
-    fn dpp16_unimplemented_control_is_refused() {
-        // row_half_mirror, and quad_perm with a negation modifier.
+    fn dpp16_moves_outside_the_reduction_shapes() {
+        // row_half_mirror is an ordinary DPP16 move; quad_perm with a negation
+        // modifier on v_mov_b32 is refused by the ordinary lowering.
         let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x141, 0, 1, 0xf, 0xf))];
-        assert!(lower_wave_reductions(&mut insns).is_err());
+        lower_wave_reductions(&mut insns).expect("not claimed");
+        dpp16::prepare(&mut insns).expect("row_half_mirror");
         let mut insns = vec![dpp16_move_insn(dpp16_word(2, 0x0, 1, 1, 0xf, 0xf) | (1u32 << 20))];
-        assert!(lower_wave_reductions(&mut insns).is_err());
+        lower_wave_reductions(&mut insns).expect("not claimed");
+        assert!(dpp16::prepare(&mut insns).unwrap_err().contains("not f32"));
     }
 
     #[test]
     fn dpp16_mov_missing_control_word_is_refused() {
         let mut insns = vec![Insn { raw: vec![0x7e0802fa], ..dpp16_move_insn(0) }];
         assert!(lower_wave_reductions(&mut insns).is_err());
+        assert!(dpp16::prepare(&mut insns).unwrap_err().contains("missing DPP16 control word"));
     }
 
     #[test]
