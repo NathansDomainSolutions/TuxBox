@@ -41,7 +41,7 @@ fn quad_perm_reads_the_selected_lane_of_the_quad() {
         "uint q2 = WaveReadLaneAt(v1, q2src);",
         "uint tb_s0 = q2;",
         "if (q2ok) {",
-        "if (exec_lo & 1u) v5 = reversebits(tb_s0);",
+        "v5 = reversebits(tb_s0);",
     ]);
     // LLVM gfx1030: v_bfrev_b32_dpp v5, v1 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf bound_ctrl:1 fi:1
     let hlsl = compute(&[0x7e0a_70fa, 0xff0c_1b01]);
