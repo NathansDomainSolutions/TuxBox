@@ -403,6 +403,101 @@ pub fn private(shader: &[u8], stage: u32) -> Option<Vec<[u32; 13]>> {
     )
 }
 
+/// Static samplers a pixel shader declares in PSV and FSSM and carries as literal
+/// states, but that the title's root signature leaves out. The console compiles a
+/// static sampler into the program, so a title can drop it from the root it creates
+/// pipelines with; the host needs it back.
+///
+/// Each one takes a sampler register the shader declares and the root does not
+/// cover, so the returned descriptors can be appended to the root's own.
+pub fn omitted(shader: &[u8], root: &crate::rootsig::RootSig) -> Option<Vec<[u32; 13]>> {
+    let d = Dxbc::parse(shader).ok()?;
+    let chunk = |tag| {
+        let c = d.chunk(tag)?;
+        shader.get(c.offset..c.offset + c.size)
+    };
+    let dxil = chunk(b"DXIL")?;
+    // Samplers indexed from the sampler heap need the guest's actual heap.
+    if word(dxil, 0)? >> 16 != 0
+        || u64::from_le_bytes(chunk(b"SFI0")?.try_into().ok()?) & (3 << 25) != 0
+    {
+        return None;
+    }
+    let psv = chunk(b"PSV0")?;
+    let resources = psv.get(4usize.checked_add(word(psv, 0)? as usize)?..)?;
+    let count = word(resources, 0)? as usize;
+    let stride = word(resources, 4)? as usize;
+    if count > 128 || stride < 16 {
+        return None;
+    }
+    let mut declared = Vec::new();
+    for r in resources.get(8..)?.get(..count.checked_mul(stride)?)?.chunks_exact(stride) {
+        if word(r, 0)? == 1 {
+            if word(r, 8)? != word(r, 12)? {
+                return None;
+            }
+            declared.push((word(r, 8)?, word(r, 4)?));
+        }
+    }
+    let programs = xdat::programs(dxil.get(24..)?).ok()?;
+    let [program] = programs.as_slice() else {
+        return None;
+    };
+    let recorded: Vec<_> =
+        compute_table::records(program)?.filter(|r| r[0] == 0x401).map(|r| r[2]).collect();
+    omitted_states(&fssm::decode(program).ok()?.isa, &declared, &recorded, &root.static_samplers)
+}
+
+fn omitted_states(
+    isa: &[u8],
+    declared: &[(u32, u32)],
+    recorded: &[u32],
+    statics: &[[u32; 13]],
+) -> Option<Vec<[u32; 13]>> {
+    use std::collections::BTreeSet;
+    // A root with no static samplers is recovered whole by `pixel` and `private`.
+    if statics.is_empty() || statics.iter().any(|s| s[11] == 32765) {
+        return None;
+    }
+    // PSV and FSSM must name the same static samplers, each register once.
+    let names: BTreeSet<_> = declared.iter().map(|&(register, _)| register).collect();
+    if names.len() != declared.len()
+        || recorded.len() != declared.len()
+        || recorded.iter().copied().collect::<BTreeSet<_>>() != names
+        || declared.iter().any(|&(_, space)| space == 32765)
+    {
+        return None;
+    }
+    let pixel = |s: &&[u32; 13]| matches!(s[12], 0 | 5);
+    let mut free: Vec<_> = declared
+        .iter()
+        .filter(|&&(register, space)| !statics.iter().filter(pixel).any(|s| (s[10], s[11]) == (register, space)))
+        .map(|&(register, space)| (space, register))
+        .collect();
+    free.sort_unstable();
+    let states = literal_sites(isa, 5)?.descriptors;
+    let missing: Vec<_> = states
+        .into_iter()
+        .filter(|state| !statics.iter().filter(pixel).any(|s| s[..10] == state[..10]))
+        .collect();
+    // Every missing state needs a declared register of its own. Which of several
+    // takes which is only a name: the translation reads the same root.
+    if missing.is_empty() || missing.len() > free.len() {
+        return None;
+    }
+    Some(
+        missing
+            .into_iter()
+            .zip(free)
+            .map(|(mut state, (space, register))| {
+                state[10] = register;
+                state[11] = space;
+                state
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 #[path = "tests/inline_sampler.rs"]
 mod tests;

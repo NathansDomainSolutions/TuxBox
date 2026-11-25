@@ -6,7 +6,7 @@ Lanes is an original, turn-based homebrew game for Project TuxBox. Collect as ma
 
 Use an x86-64 PC with Python 3.10 or newer, Rust 1.95 or newer with Cargo, and the DirectX Shader Compiler (`dxc`) on your PATH. Add the Windows build target once with `rustup target add x86_64-pc-windows-msvc`. [DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
 
-- **Linux** needs `clang-cl`, `lld-link` and the Windows SDK and C runtime staged with xwin. To stage them in the cargo-xwin cache that `build.py` reads, run `cargo install cargo-xwin` and then `cargo xwin cache xwin --xwin-arch x86_64` once. If the SDK is outside the cargo-xwin cache, set `XWIN_SDK_ROOT` to the directory containing `sdk/` and `crt/`. The launcher builds a small Vulkan layer on first run, so also install the Vulkan headers (`vulkan-headers` on Arch). Use Microsoft's Linux DXC release: Arch's `directx-shader-compiler` 1.10.2605.37 aborts on every shader, and `build.py` reports this before building. Install UMU (`umu-run`, the `umu-launcher` package in the AUR on Arch) and Proton Experimental to play. From the project folder, run `python3 -m venv .venv` and `source .venv/bin/activate` before installing the Python dependencies.
+- **Linux** needs `clang-cl`, `lld-link` and the Windows SDK and C runtime staged with xwin. To stage them in the cargo-xwin cache that `build.py` reads, run `cargo install cargo-xwin` and then `cargo xwin cache xwin --xwin-arch x86_64` once. If the SDK is outside the cargo-xwin cache, set `XWIN_SDK_ROOT` to the directory containing `sdk/` and `crt/`. The launcher builds a small Vulkan layer on first run, so also install the Vulkan headers (`vulkan-headers` on Arch). Use Microsoft's Linux DXC release: Arch's `directx-shader-compiler` 1.10.2605.37 aborts on every shader, and `build.py` reports this before building. Install UMU (`umu-run`, the `umu-launcher` package in the AUR on Arch) and [GE-Proton11-14](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-14), extracted into Steam's `compatibilitytools.d`, to play. From the project folder, run `python3 -m venv .venv` and `source .venv/bin/activate` before installing the Python dependencies.
 - **Windows** needs Visual Studio Build Tools with the C++ tools and Windows SDK. Run the commands in an **x64 Native Tools Command Prompt**.
 
 ## Build and play
@@ -38,12 +38,15 @@ The game also imports Windows core API sets for services such as files, timing a
 | Scenario | What it checks |
 | --- | --- |
 | `labels` | `Write32BitValueBottomOfPipeX` and `Write64BitValueBottomOfPipeX`, with and without a flush |
-| `cross-queue` | A compute queue and a direct queue waiting on each other's labels with `Wait64BitValueX` |
+| `cross-queue` | The compute queue waits for a direct-queue label, writes a 64-bit payload and signals a reply. The direct queue waits for the reply and copies the payload for CPU readback. |
 | `compute-frame` | `ExecuteCommandListsX` on a compute queue |
 | `skipped-command` | A command that cannot be recorded leaves its list, and the list's fence write, intact |
 | `copy-memory` | `CopyMemoryToMemoryX` copies from the source to the destination |
+| `direct-copy-wait` | A direct queue waits before or after a buffer copy. The copy before the wait can finish while a second copy waits for the compute producer’s label and payload. |
 | `shared-texture` | A queue waiting on a label reads a guest texture that the queue setting the label writes |
 | `indirect-dispatch` | `ExecuteIndirect` on its Series X\|S slot matches a direct dispatch |
+| `gpu-indirect-dispatch` | A compute shader writes indirect dispatch arguments for 0, 1 and 2 groups. Check all 24 output words, including untouched guards. |
+| `dispatch-wait` | Copies a producer's word after a label wait, first at list start and then immediately after a course dispatch. Reports whether compute finished before producer submission and the word read by the CPU. |
 | `texture-readback` | `CopyMemoryToMemoryX` reads a guest texture into title memory |
 | `ray-tracing-builder` | `XboxBvhBuilder` builds a structure with a size report, copies it and builds it again in a batch (needs ray tracing) |
 | `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |

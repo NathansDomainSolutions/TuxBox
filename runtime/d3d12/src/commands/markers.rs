@@ -5,7 +5,7 @@ use super::*;
 // The flush argument selects console caches; the desktop driver manages its own.
 pub(super) unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, _flush: u32, flags: u32) {
     let mut state = recording(list);
-    if !state.ensure_open(&list.native) {
+    if !state.can_record() {
         // Keep what a failed list would have written, to explain a stall.
         state.labels.push(memory_wait::Label::write(address, u64::from(value)));
         return;
@@ -15,6 +15,7 @@ pub(super) unsafe extern "system" fn write_marker(list: &List, address: u64, val
     } else {
         write_dword(list, &mut state, address, value)
             .map(|()| {
+                state.record_write(address, 4);
                 state.labels.push(memory_wait::Label::write(address, u64::from(value)));
                 memory_wait::trace_write("Write32BitValueBottomOfPipeX", address, 4, u64::from(value));
             })
@@ -31,7 +32,7 @@ pub(super) unsafe extern "system" fn write_marker(list: &List, address: u64, val
 // labels other queues wait on with Wait64BitValueX.
 pub(super) unsafe extern "system" fn write_value64(list: &List, address: u64, value: u64, flush: u32, flags: u32) {
     let mut state = recording(list);
-    if !state.ensure_open(&list.native) {
+    if !state.can_record() {
         // Keep what a failed list would have written, to explain a stall.
         state.labels.push(memory_wait::Label::write(address, value));
         return;
@@ -48,6 +49,7 @@ pub(super) unsafe extern "system" fn write_value64(list: &List, address: u64, va
         write_dword(list, &mut state, address + 4, (value >> 32) as u32)
             .and_then(|()| write_dword(list, &mut state, address, value as u32))
             .map(|()| {
+                state.record_write(address, 8);
                 state.labels.push(memory_wait::Label::write(address, value));
                 memory_wait::trace_write("Write64BitValueBottomOfPipeX", address, 8, value);
             })
@@ -64,5 +66,12 @@ pub(super) fn write_dword(list: &List, state: &mut Recording, address: u64, valu
     let (resource, dest) = unsafe { device::command_buffer_address(parent(&list.parent), address, 4)? };
     if let Some(buffer) = &resource { raytracing::retain(state, &[buffer])?; }
     let write = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: dest, Value: value };
-    state.prefix.push(&list.native, memory_wait::Packet::Marker(write))
+    // Marker-out lands after preceding work, matching the bottom-of-pipe write contract.
+    unsafe {
+        state
+            .native()
+            .cast::<ID3D12GraphicsCommandList2>()?
+            .WriteBufferImmediate(1, &write, Some(&D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT));
+    }
+    Ok(())
 }

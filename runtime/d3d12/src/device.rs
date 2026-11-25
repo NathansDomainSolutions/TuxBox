@@ -30,7 +30,7 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface, InterfaceRef, Result};
 use crate::commands::{wrap_command_list, wrap_command_queue};
 use crate::proxy::{Proxy, Slot, Slots, allocate, check_output, child_slots, object_slots, unwrap};
 
-mod allocation;
+pub(crate) mod allocation;
 mod fallback;
 pub(crate) mod blas;
 pub(crate) mod compute;
@@ -117,6 +117,12 @@ impl ResourceState {
         } else {
             None
         }
+    }
+    pub(crate) fn guest_address(&self) -> Option<u64> {
+        if let Backing::Addressed(address, _) = &self.backing {
+            return Some(address.base as u64);
+        }
+        self.texture_address.get().map(|address| address.base as u64)
     }
 }
 impl From<Backing> for ResourceState {
@@ -323,8 +329,21 @@ unsafe extern "system" fn create_allocator(
     }
 }
 
+fn guest_increment_size(this: &Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> u32 {
+    let native = unsafe { this.native.GetDescriptorHandleIncrementSize(kind) };
+    if this.state.device11_queue
+        && kind == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        && (native as usize) >= descriptor_paging::INLINE_BYTES
+        && (native as usize).is_multiple_of(descriptor_paging::INLINE_BYTES)
+    {
+        descriptor_paging::INLINE_BYTES as u32
+    } else {
+        native
+    }
+}
+
 unsafe extern "system" fn increment_size(this: &Device, kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> u32 {
-    unsafe { this.native.GetDescriptorHandleIncrementSize(kind) }
+    guest_increment_size(this, kind)
 }
 
 pub(crate) const BUFFER_READ_BITS: i32 =

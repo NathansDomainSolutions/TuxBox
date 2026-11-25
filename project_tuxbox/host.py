@@ -16,6 +16,11 @@ from .pipeline_profile import pipeline_capture
 from .runtime_shaders import runtime_shader_compiler
 
 
+# The Proton distribution used when none is selected. Its dxil-spirv converts
+# large translated shaders in seconds, where older releases take minutes.
+PINNED_PROTON = "GE-Proton11-14"
+
+
 def _descendant_pids(pid):
     """All descendants of pid, depth-first, via /proc (Linux)."""
     children = {}
@@ -62,13 +67,15 @@ def proton_installation(selection):
     if vdf.is_file():
         libraries += [Path(p) for p in re.findall(r'"path"\s*"([^"]+)"', vdf.read_text(errors="replace"))]
     for library in libraries:
-        candidate = library / "steamapps/common/Proton - Experimental"
-        if (candidate / "proton").is_file():
-            return candidate.resolve()
-    local = steam / "compatibilitytools.d/Proton - Experimental"
-    if (local / "proton").is_file():
-        return local.resolve()
-    raise ValueError("Select an installed Proton distribution with --proton or PROTONPATH")
+        for parent in ("compatibilitytools.d", "steamapps/common"):
+            # The release archive adds the architecture; Proton managers may not.
+            for name in (f"{PINNED_PROTON}-x86_64", PINNED_PROTON):
+                candidate = library / parent / name
+                if (candidate / "proton").is_file():
+                    return candidate.resolve()
+    raise ValueError(f"Install {PINNED_PROTON} in {steam / 'compatibilitytools.d'} from "
+                     f"https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/{PINNED_PROTON}, "
+                     "or select another distribution with --proton or PROTONPATH")
 
 
 def warn_scarlett_dxc(executable, report):

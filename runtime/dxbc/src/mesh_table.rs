@@ -39,12 +39,36 @@ impl MeshLayout {
         Self::read(&program, &resources, root)
     }
 
+    /// The same physical layout for the pixel program of a mesh pipeline. It
+    /// receives its tables in the same scalar registers as the mesh program,
+    /// and can also hold unordered-access textures.
+    pub fn from_pixel_shader(bytes: &[u8], root: &RootSig) -> Option<Self> {
+        let container = Dxbc::parse(bytes).ok()?;
+        let chunk = |tag| {
+            let part = container.chunk(tag)?;
+            bytes.get(part.offset..part.offset + part.size)
+        };
+        let dxil = chunk(b"DXIL")?;
+        if word(dxil, 0)? >> 16 != 0 || dxil.get(8..12)? != b"DXIL" {
+            return None;
+        }
+        let [program] = xdat::programs(dxil.get(24..)?).ok()?.try_into().ok()?;
+        let resources = shader_resources(bytes)?;
+        Self::read_stage(&program, &resources, root, true)
+    }
+
     pub fn read(program: &[u8], resources: &[[u32; 4]], root: &RootSig) -> Option<Self> {
+        Self::read_stage(program, resources, root, false)
+    }
+
+    fn read_stage(program: &[u8], resources: &[[u32; 4]], root: &RootSig, pixel: bool) -> Option<Self> {
         let used = records(program)?;
         let user: BTreeSet<_> = user_data_records(program)?.collect();
         if used.len() > 128 || resources.len() > 128 {
             return None;
         }
+        // The visibility of a root parameter only this stage reads.
+        let own_visibility = if pixel { 5 } else { 7 };
         let mut expanded = BTreeSet::new();
         for &[ty, space, lower, upper] in resources {
             let count = upper.checked_sub(lower)?.checked_add(1)?;
@@ -78,7 +102,7 @@ impl MeshLayout {
             let root_param = root.params.get(index)?;
             let sgpr = ((location >> 8) as u8).checked_add(8)?;
             if sgpr >= 104
-                || !matches!(root_param.visibility, 0 | 7)
+                || (root_param.visibility != 0 && root_param.visibility != own_visibility)
                 || parameter_sgprs
                     .insert(index, sgpr)
                     .is_some_and(|old| old != sgpr)
@@ -92,6 +116,7 @@ impl MeshLayout {
                 (0x300, 4, 4) if named(3) == 1 && named(5) == 0 => (3, 1),
                 // An eight-word descriptor is a texture.
                 (0x300, 8, _) => (3, 1),
+                (0x303, 8, _) if pixel => (6, 1),
                 (0x300, 4, n) if (4..=2048).contains(&n) && n % 4 == 0 => (5, 1),
                 (0x302, 4, 0) => (2, 1),
                 (0x100, 4, 1) => (4, 2),
@@ -108,7 +133,11 @@ impl MeshLayout {
             };
             let mut matching = expanded.iter().filter(|&&(t, _, reg)| t == ty && reg == register);
             let space = matching.next()?.1;
-            let binding_class = if ty == 2 { 2 } else { 0 };
+            let binding_class = match ty {
+                2 => 2,
+                6 => 1,
+                _ => 0,
+            };
             if matching.next().is_some()
                 || !used_resources.insert((binding_class, space, register))
                 || u32::from(sgpr) + width > 104
@@ -122,11 +151,11 @@ impl MeshLayout {
             }
             match &root_param.kind {
                 RootParamKind::Table(_)
-                    if matches!(class, 0x300 | 0x302)
+                    if matches!(class, 0x300 | 0x302 | 0x303)
                         && offset % 8 == 0
                         && user.contains(&[3, offset, 1, register, location >> 8]) =>
                 {
-                    let kind = if class == 0x302 { 2 } else { 0 };
+                    let kind = binding_class;
                     let binding = MeshTableBinding {
                         parameter: index,
                         kind,

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from build import find_dxc
 from frosty_gpu_guest import run_gpu_guest
+from project_tuxbox.dxil_store import COMPUTE_FLAGS
 from project_tuxbox.inspect import digest
 
 
@@ -125,7 +126,8 @@ def main():
             source.write_text(instrument(emitted, args.width, mode, args.variant))
             blob = trial / f"{mode}.cso"
             profile = "cs_6_6" if args.width == 32 else "cs_6_0"
-            subprocess.run([dxc, "-T", profile, "-E", "main", "-Fo", blob, source], check=True, timeout=30)
+            subprocess.run([dxc, "-T", profile, "-E", "main", *(COMPUTE_FLAGS if profile == "cs_6_6" else ()),
+                            "-Fo", blob, source], check=True, timeout=30)
             subprocess.run([dxc.with_name("dxv"), blob], check=True, timeout=30)
             shaders[mode] = dict(hlsl_sha256=digest(source), dxil_sha256=digest(blob), profile=profile)
             for case, mask, values in cases(args.width):

@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from check_packed_integer_gpu import assemble  # noqa: E402
 from check_wave_guard import cases  # noqa: E402
 from frosty_gpu_guest import run_gpu_guest  # noqa: E402
+from project_tuxbox.dxil_store import COMPUTE_FLAGS  # noqa: E402
 from project_tuxbox.inspect import digest  # noqa: E402
 
 WIDTH = 32
@@ -212,7 +213,7 @@ def main(argv=None):
             source = trial / f"{name}.hlsl"
             source.write_text(instrument(emitted, resolve))
             blob = trial / f"{name}.cso"
-            subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", "-Fo", blob, source], check=True, timeout=30,
+            subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", *COMPUTE_FLAGS, "-Fo", blob, source], check=True, timeout=30,
                            capture_output=True)
             subprocess.run([args.dxv, blob], check=True, timeout=30, capture_output=True)
             shaders[name] = dict(hlsl_sha256=digest(source), dxil_sha256=digest(blob),

@@ -7,10 +7,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 pub(super) unsafe extern "system" fn pipeline(list: &List, object: *mut c_void) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = state.raytracing().cloned() else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -30,10 +30,10 @@ const _: () = assert!(size_of::<D3D12_DISPATCH_RAYS_DESC>() == 104);
 
 pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DISPATCH_RAYS_DESC) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    let Some(host) = state.raytracing().cloned() else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -66,6 +66,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, desc: *const D3D12_DI
         return;
     }
     state.sample_heap();
+    state.record_unknown_write();
     unsafe {
         host.DispatchRays(desc);
     }

@@ -16,6 +16,9 @@ pub(crate) struct ComputeTable {
     /// LOCAL: appended host parameters that bind the same guest table
     /// (host index, guest slot), e.g. a pixel-only copy of a mesh-rewritten table.
     pub(crate) mirrors: Vec<(u32, u32)>,
+    /// The root a mesh pipeline's pixel program is translated against when
+    /// that program reads a table at other slots than the title declares.
+    pub(crate) pixel_root: Option<RootSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +93,9 @@ pub(super) fn reflected(
                 return Ok(TableLayout::Unsupported);
             };
             corroborated_raster = true;
+            // A static sampler the title compiled into the pixel shader and left out
+            // of this root. The translation reads the root built here, so it finds it.
+            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature).unwrap_or_default();
             Some(bindings)
         }
         (Program::Raster { vertex, pixel }, [table, rest @ ..])
@@ -299,6 +305,16 @@ pub(super) fn reflected(
             MinLOD: f32::from_bits(s[8]), MaxLOD: f32::from_bits(s[9]), ShaderRegister: s[10], RegisterSpace: s[11],
             ShaderVisibility: D3D12_SHADER_VISIBILITY(s[12] as i32),
         }).collect();
+        // Recovered samplers join the root's own: `omitted` gives them registers the
+        // root does not use, and the other recoveries apply only to a root with none.
+        let samplers: Vec<_> = if samplers.is_empty() || source.NumStaticSamplers == 0 {
+            samplers
+        } else {
+            if source.pStaticSamplers.is_null() { return Err(E_INVALIDARG.into()); }
+            let mut all = std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize).to_vec();
+            all.extend(samplers);
+            all
+        };
         if !samplers.is_empty() {
             desc.Anonymous.Desc_1_1.pStaticSamplers = samplers.as_ptr();
             desc.Anonymous.Desc_1_1.NumStaticSamplers = samplers.len() as u32;
@@ -318,6 +334,7 @@ pub(super) fn reflected(
             accessed_views,
             index_map,
             mirrors: Vec::new(),
+            pixel_root: None,
         })))
     }
 }
@@ -419,6 +436,7 @@ fn append_corroborated_ranges(
             accessed_views,
             index_map: None,
             mirrors: Vec::new(),
+            pixel_root: None,
         })))
     }
 }

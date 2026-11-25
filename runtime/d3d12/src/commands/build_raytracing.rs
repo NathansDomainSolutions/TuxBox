@@ -329,10 +329,11 @@ unsafe fn record_builds(
     outputs: &[D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC],
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) || count == 0 {
+    if !state.prepare_state() || count == 0 {
         return;
     }
-    let Some(host) = &list.state.raytracing else {
+    state.active.has_commands = true;
+    let Some(host) = state.raytracing().cloned() else {
         state.error = E_NOTIMPL;
         return;
     };
@@ -374,7 +375,7 @@ unsafe fn record_builds(
         // the list still runs.
         let translated = match refusal(entry) {
             Some((reason, code)) => Err((reason, code)),
-            None => translate(&mut state, owner, host, entry.build)
+            None => translate(&mut state, owner, &host, entry.build)
                 .map_err(|e| ("translation", e.code())),
         };
         let (build, instances, bytes) = match translated {
@@ -404,6 +405,7 @@ unsafe fn record_builds(
                 native: build.SourceAccelerationStructureData,
             });
         }
+        state.record_unknown_write();
         unsafe {
             host.BuildRaytracingAccelerationStructure(&build, (!outputs.is_empty()).then_some(outputs.as_slice()));
             let guest_va = entry.build.DestAccelerationStructureData;

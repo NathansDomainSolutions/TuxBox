@@ -56,7 +56,7 @@ fn resolve_flagged_groups(
 
 pub(super) unsafe extern "system" fn bind_root(list: &List, signature: *mut c_void) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     // SAFETY: the guest holds its signature during this call. Only a native
@@ -65,7 +65,7 @@ pub(super) unsafe extern "system" fn bind_root(list: &List, signature: *mut c_vo
         Ok(root) => {
             let native = root.map(|r| &r.native);
             state.bindings.compute_root(native, root.map(|r| &r.state));
-            unsafe { list.native.SetComputeRootSignature(native) };
+            unsafe { state.native().SetComputeRootSignature(native) };
         }
         Err(error) => state.error = error,
     }
@@ -83,7 +83,7 @@ pub(super) unsafe extern "system" fn constants<const COMPUTE: bool>(
     offset: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) || count == 0 {
+    if !state.prepare_state() || count == 0 {
         return;
     }
     if data.is_null() || offset.checked_add(count).is_none_or(|end| end > 64) {
@@ -94,10 +94,10 @@ pub(super) unsafe extern "system" fn constants<const COMPUTE: bool>(
     let words = unsafe { core::slice::from_raw_parts(data.cast(), count as usize) };
     if COMPUTE {
         state.bindings.constants(index, offset, words);
-        unsafe { list.native.SetComputeRoot32BitConstants(index, count, data, offset); }
+        unsafe { state.native().SetComputeRoot32BitConstants(index, count, data, offset); }
     } else {
         state.bindings.graphics_constants(index, offset, words);
-        unsafe { list.native.SetGraphicsRoot32BitConstants(index, count, data, offset); }
+        unsafe { state.native().SetGraphicsRoot32BitConstants(index, count, data, offset); }
     }
 }
 
@@ -105,7 +105,7 @@ use super::compute_bindings::BufferView;
 
 fn root_buffer<const COMPUTE: bool>(list: &List, index: u32, guest: u64, view: fn(u64) -> BufferView) {
     let mut state = recording(list);
-    if state.can_record(&list.native) {
+    if state.prepare_state() {
         // A desktop root CBV has no size: vkd3d binds min(host buffer end -
         // address, 64 KiB). A one-byte import can leave a short, odd range,
         // which NVIDIA rejects (Xid 13, SKEDCHECK23_CONSTANT_BUFFER_SIZE).
@@ -135,7 +135,7 @@ fn root_buffer<const COMPUTE: bool>(list: &List, index: u32, guest: u64, view: f
             }
         };
         let view = view(address);
-        unsafe { view.apply::<COMPUTE>(&list.native, index) };
+        unsafe { view.apply::<COMPUTE>(state.native(), index) };
         state.bindings.buffer::<COMPUTE>(index, view);
     }
 }
@@ -154,7 +154,7 @@ pub(super) unsafe extern "system" fn unordered_access<const COMPUTE: bool>(list:
 
 pub(super) unsafe extern "system" fn async_compute_budget(list: &List, budget: *const [u8; 24]) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.prepare_state() {
         return;
     }
     // SAFETY: the Xbox caller supplies a readable 24-byte record for this call.
@@ -179,7 +179,7 @@ pub(super) unsafe extern "system" fn async_compute_budget(list: &List, budget: *
 
 pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u32) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     record_dispatch(list, &mut state, x, y, z);
@@ -187,7 +187,7 @@ pub(super) unsafe extern "system" fn dispatch(list: &List, x: u32, y: u32, z: u3
 
 pub(super) unsafe extern "system" fn dispatch_flagged(list: &List, x: u32, y: u32, z: u32, flags: u32) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if flags & !(DISPATCH_USE_THREAD_DIMENSIONS | DISPATCH_CS_W32_EN) != 0 {
@@ -233,9 +233,9 @@ fn record_dispatch(list: &List, state: &mut super::Recording, x: u32, y: u32, z:
         return;
     }
     let null_usage = state.bindings.null_usage.clone();
-    // SAFETY: the native list remains open under its recording lock.
-    state.compute_dispatch(list, || unsafe {
-        list.native.Dispatch(x, y, z);
+    // SAFETY: the active native list remains open under its recording lock.
+    state.compute_dispatch(list, |native| unsafe {
+        native.Dispatch(x, y, z);
         if let Some(tag) = &null_usage {
             crate::diagnostics::display::sample_null_dispatch(tag, [x, y, z]);
         }
@@ -272,7 +272,7 @@ pub(super) unsafe extern "system" fn copy_buffer(
     bytes: u64,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     let owner = parent(&list.parent);
@@ -283,13 +283,20 @@ pub(super) unsafe extern "system" fn copy_buffer(
         state.error = E_INVALIDARG;
         return;
     };
+    let guest_dst_offset = dst_offset;
     let (Some(dst_offset), Some(src_offset)) = (buffer_offset(dst, dst_offset, bytes), buffer_offset(src, src_offset, bytes)) else {
         state.error = E_INVALIDARG;
         return;
     };
+    if let Some(base) = dst.state.guest_address() {
+        state.record_write(base.saturating_add(guest_dst_offset), bytes);
+    } else {
+        state.record_unknown_write();
+    }
     // SAFETY: both native buffers belong to the list and contain the requested range.
     unsafe {
-        list.native
+        state
+            .native()
             .CopyBufferRegion(&dst.native, dst_offset, &src.native, src_offset, bytes)
     };
 }

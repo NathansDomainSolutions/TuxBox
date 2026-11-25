@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from tools.frosty_gpu_guest import run_gpu_guest
+from project_tuxbox.dxil_store import COMPUTE_FLAGS
 
 OPS=("umin","umax","fmin","fmax")
 WORDS=384
@@ -82,7 +83,7 @@ def main(argv=None):
             emitted=subprocess.check_output([a.emitter,str(a.width),op],text=True,timeout=15)
             source=trial/(op+".hlsl");source.write_text(instrument(emitted,a.width))
             blob=trial/(op+".cso")
-            subprocess.run([a.dxc,"-T","cs_6_6" if a.width==32 else "cs_6_0","-E","main","-Fo",blob,source],check=True,timeout=30)
+            subprocess.run([a.dxc,"-T","cs_6_6" if a.width==32 else "cs_6_0","-E","main",*(COMPUTE_FLAGS if a.width==32 else ()),"-Fo",blob,source],check=True,timeout=30)
             subprocess.run([a.dxv,blob],check=True,timeout=30)
             shaders[op]=digest(blob)
             for i,mask,values in inputs(a.width,op):

@@ -18,6 +18,14 @@ impl<'a> Emitter<'a> {
             Some(Opnd::Sgpr(n)) => Some(*n as usize + 7),
             _ => None,
         });
+        // A vertex shader's own records outrank the chained-entry rule: with a
+        // fetch call the tables stay in the registers FSSM names (s8, s9, ...).
+        if let Some(parameter) = sampler_heap::vertex_table_parameter(self.ex, sgpr) {
+            return match &self.ex.root_sig.as_ref()?.params.get(parameter)?.kind {
+                crate::meta::RootParamKind::Table(r) => Some(r),
+                _ => None,
+            };
+        }
         // Geometry shaders: SRV table in s22, CBV table in s23 (6a6bdf123db8b5b0).
         let base = match self.ex.stage {
             Stage::Vertex if sgpr == 8 && sampler_heap::vertex_s8_table(self.ex) => 8,

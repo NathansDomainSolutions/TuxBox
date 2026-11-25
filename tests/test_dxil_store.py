@@ -59,6 +59,12 @@ class DxilReuse(unittest.TestCase):
             self.assertTrue(compile_request(source, key, self.tools, cache, None))
         return (cache / (key + ".cso")).read_bytes()
 
+    def test_output_built_with_other_compute_flags_is_not_reused(self):
+        plain = hashlib.sha256(b"cs_6_6\nshader").hexdigest()
+        self.assertNotEqual(DxilStore.key(b"shader", "cs_6_6"), plain)
+        # Other targets keep their key, so their cached output stays usable.
+        self.assertEqual(DxilStore.key(b"shader", "ps_6_0"), hashlib.sha256(b"ps_6_0\nshader").hexdigest())
+
     def test_new_translator_with_same_hlsl_skips_dxc(self):
         first = self.compile(self.cache("a"))
         second = self.compile(self.cache("b"))

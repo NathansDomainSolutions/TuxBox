@@ -19,7 +19,7 @@ fn slot_of(arena: &Arena, handle: D3D12_GPU_DESCRIPTOR_HANDLE) -> u32 {
 }
 
 fn addr_of(arena: &Arena, logical: u32) -> u64 {
-    arena.base() as u64 + u64::from(logical) * arena.stride as u64
+    arena.base() as u64 + u64::from(logical) * arena.guest_stride() as u64
 }
 
 #[test]
@@ -342,4 +342,56 @@ fn index_map_activation_and_publish_reclaim_unpinned_and_protect_direct_pinned()
     assert!(!tables.ranges.contains_key(&(10, 2)));
     assert!(tables.direct.contiguous(6, 1).is_some());
     assert!(tables.ranges.get(&(0, 2)).unwrap().direct_pinned);
+}
+
+#[test]
+fn inline_arena_uses_32_byte_guest_stride_on_64_byte_native_heap() {
+    let mut backing = vec![0u8; 64 * INLINE_BYTES];
+    let base = backing.as_mut_ptr() as usize;
+    let registry = Arc::new(Registry::default());
+    {
+        let arena = Arc::new(Arena {
+            base_address: base,
+            native: None,
+            registry: registry.clone(),
+            stride: 64,
+            count: 64,
+            limit: 16,
+            inline: true,
+            authored: Mutex::default(),
+            tables: Mutex::new(Tables::default()),
+        });
+        {
+            let mut entries = registry.arenas.lock().unwrap();
+            entries.insert(base, Arc::downgrade(&arena));
+            registry.count.store(entries.len(), Ordering::Release);
+        }
+        assert_eq!(arena.guest_stride(), INLINE_BYTES);
+        assert!(arena.contains((base + 63 * INLINE_BYTES) as u64));
+        assert!(!arena.contains((base + 64 * INLINE_BYTES) as u64));
+        assert_eq!(arena.cpu(base + INLINE_BYTES).ptr - arena.cpu(base).ptr, 64);
+
+        arena.author(base + INLINE_BYTES, 2);
+        let first = arena.resolve_inline(arena.inline_record(base + INLINE_BYTES)).unwrap();
+        let second = arena.resolve_inline(arena.inline_record(base + 2 * INLINE_BYTES)).unwrap();
+        assert_eq!(first.ptr, 0x3000_0000 + 64);
+        assert_eq!(second.ptr, 0x3000_0000 + 128);
+
+        let mut leases = DescriptorLeases::default();
+        let gpu = arena.gpu_table((base + INLINE_BYTES) as u64, 3, &[], &mut leases).unwrap();
+        assert_eq!((gpu.ptr - 0x2000_0000) % 64, 0);
+        {
+            let mut tables = arena.tables.lock().unwrap();
+            let rec = InlineDescriptor { source: 1, version: 1, reserved: [0; 2] };
+            for slot in 0..3 {
+                tables.resident_records.insert(slot, rec);
+            }
+        }
+        arena.publish(base + 2 * INLINE_BYTES, 1);
+        let tables = arena.tables.lock().unwrap();
+        assert!(tables.resident_records.contains_key(&0));
+        assert!(!tables.resident_records.contains_key(&1));
+        assert!(tables.resident_records.contains_key(&2));
+    }
+    drop(backing);
 }

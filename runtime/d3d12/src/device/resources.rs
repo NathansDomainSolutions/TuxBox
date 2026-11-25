@@ -336,14 +336,46 @@ pub(super) unsafe extern "system" fn create_resource<const EXTENDED: bool>(
         return E_NOTIMPL;
     }
     let host_clear = format::host_clear(clear);
+    let clear_ptr = host_clear.as_ref().map_or(clear, core::ptr::from_ref);
+    let desc_for_host = primary.as_ref().unwrap_or(&host_desc);
+    let host_initial = host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+    let packed = allocation::packed_uav_formats(desc_for_host.Format, desc_for_host.Flags);
     let mut native = None;
-    if let Err(error) = unsafe {
+    if !packed.is_empty() && !dxgi::supports_native_packed_uav(this, desc_for_host.Format) {
+        let Ok(api) = this.native.cast::<ID3D12Device10>() else {
+            return E_NOTIMPL;
+        };
+        if !allocation::valid_initial_texture_state(host_initial, desc_for_host.Flags) {
+            return E_INVALIDARG;
+        }
+        let desc1 = allocation::resource_desc1(desc_for_host);
+        if let Err(error) = unsafe {
+            api.CreateCommittedResource3::<_, ID3D12Resource>(
+                &host_heap,
+                flags,
+                &desc1,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                clear_ptr.as_ref().map(core::ptr::from_ref),
+                None,
+                Some(packed),
+                &mut native,
+            )
+        } {
+            return error.code();
+        }
+        if let Some(res) = native.as_ref()
+            && let Err(hr) =
+                allocation::transition_initial_state(this, res, host_initial, desc_for_host.Flags)
+        {
+            return hr;
+        }
+    } else if let Err(error) = unsafe {
         this.native.CreateCommittedResource::<ID3D12Resource>(
             &host_heap,
             flags,
-            primary.as_ref().unwrap_or(&host_desc),
-            host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER),
-            Some(host_clear.as_ref().map_or(clear, core::ptr::from_ref)),
+            desc_for_host,
+            host_initial,
+            Some(clear_ptr),
             &mut native,
         )
     } {

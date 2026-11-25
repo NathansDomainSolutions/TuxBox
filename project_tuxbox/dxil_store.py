@@ -24,6 +24,15 @@ IDENTITY_FILE = "dxil-identity"
 LIBRARIES = ("libdxcompiler*", "libdxil*", "dxcompiler.dll", "dxil.dll")
 reused = Counter()
 
+# Compute programs that fix their wave size. Unoptimised, their DXIL has about
+# four times the code blocks, and vkd3d-proton's control-flow pass takes minutes
+# on the largest: 364 s against 30 s for one ProjectScarlett program. At default
+# settings DXC spends nearly all its time in Jump Threading instead, which turning
+# lifetime markers off avoids.
+COMPUTE_FLAGS = ("-O1", "-disable-lifetime-markers")
+# Targets whose cached DXIL depends on the flags above.
+VARIANTS = {"cs_6_6": " ".join(COMPUTE_FLAGS)}
+
 
 def write_identity(cache, version, dxc, dxv):
     """Record which DXC toolchain fills this runtime cache. This turns reuse on."""
@@ -67,7 +76,8 @@ class DxilStore:
 
     @staticmethod
     def key(hlsl, target):
-        return hashlib.sha256(f"{target}\n".encode("ascii") + hlsl).hexdigest()
+        tag = f"{target} {VARIANTS[target]}" if target in VARIANTS else target
+        return hashlib.sha256(f"{tag}\n".encode("ascii") + hlsl).hexdigest()
 
     def fetch(self, key, output):
         """Copy the stored DXIL to `output` if its bytes still match their stamp."""

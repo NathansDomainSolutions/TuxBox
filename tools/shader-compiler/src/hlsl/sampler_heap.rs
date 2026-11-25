@@ -199,6 +199,22 @@ pub(super) fn vertex_s8_table(ex: &ShaderExtract) -> bool {
         })
 }
 
+/// The root parameter of the descriptor table a vertex shader receives in
+/// `sgpr`, when its own used-resource records place descriptors there. A
+/// generated fetch call (`s_swappc_b64`) leaves those registers where the
+/// records say, unlike the chained entry of a shader built to feed a geometry
+/// shader. Every record for the register must name the same parameter.
+pub(super) fn vertex_table_parameter(ex: &ShaderExtract, sgpr: u8) -> Option<usize> {
+    if ex.stage != Stage::Vertex {
+        return None;
+    }
+    let mut parameters = tuxbox_dxbc::compute_table::records(&ex.fssm)?
+        .filter(|[class, _, _, _, loc]| matches!(class, 0x300 | 0x302 | 0x303) && (loc >> 8) & 0xff == u32::from(sgpr))
+        .map(|[.., loc]| (loc >> 16) as usize);
+    let parameter = parameters.next()?;
+    parameters.all(|other| other == parameter).then_some(parameter)
+}
+
 /// Confirm that the pixel-stage resource uses the table slot in the shared raster root.
 pub(super) fn matches_table(
     ex: &ShaderExtract,

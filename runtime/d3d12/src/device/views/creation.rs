@@ -205,12 +205,100 @@ pub(in super::super) unsafe extern "system" fn uav(
         };
         return;
     }
+    let packed_view = packed_uav_desc(device, buffer, unsafe { desc.as_ref() });
+    let final_desc = packed_view.as_ref().map_or(desc, core::ptr::from_ref);
     if let Some((mode, offset, stride)) = byte_view {
-        mode.create_uav(device, buffer.expect("placed buffer"), counter, unsafe { *desc }, offset, stride, handle)
+        mode.create_uav(device, buffer.expect("placed buffer"), counter, unsafe { *final_desc }, offset, stride, handle)
             .unwrap_or_else(|e| fail_call(format_args!("placed UAV offset={offset} stride={stride}: {:?}", e.code())));
     } else {
-        unsafe { device.native.CreateUnorderedAccessView(buffer, counter, Some(desc), handle) };
+        unsafe { device.native.CreateUnorderedAccessView(buffer, counter, Some(final_desc), handle) };
     }
+}
+
+/// On adapters without native typed UAV support for packed formats
+/// (`B5G5R5A1_UNORM` -> `R16_UINT`, `R9G9B9E5_SHAREDEXP` -> `R32_UINT`),
+/// default/UNKNOWN/packed UAV views either crash the driver (null desc) or
+/// trigger device removal / debug-layer errors. Redirect them to the matching
+/// raw integer castable format while leaving explicit `R32_UINT`/`R16_UINT`
+/// views and natively capable adapters untouched.
+fn packed_uav_desc(
+    device: &Device,
+    resource: Option<&ID3D12Resource>,
+    view: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    if let Some(native) = resource {
+        let rdesc = unsafe { native.GetDesc() };
+        if rdesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            let view = view?;
+            let raw = super::super::allocation::packed_uav_raw_format(view.Format)?;
+            if super::super::dxgi::supports_native_packed_uav(device, view.Format) {
+                return None;
+            }
+            return Some(D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: raw, ..*view });
+        }
+        let raw = super::super::allocation::packed_uav_raw_format(rdesc.Format)?;
+        if super::super::dxgi::supports_native_packed_uav(device, rdesc.Format) {
+            return None;
+        }
+        return match view {
+            Some(v) if v.Format == DXGI_FORMAT_UNKNOWN || v.Format == rdesc.Format => {
+                Some(D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: raw, ..*v })
+            }
+            Some(_) => None,
+            None => default_texture_uav_desc(&rdesc, raw),
+        };
+    }
+    let view = view?;
+    let raw = super::super::allocation::packed_uav_raw_format(view.Format)?;
+    if super::super::dxgi::supports_native_packed_uav(device, view.Format) {
+        return None;
+    }
+    Some(D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: raw, ..*view })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn default_texture_uav_desc(
+    desc: &D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    let layers = u32::from(desc.DepthOrArraySize);
+    let mut view = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ..Default::default() };
+    match desc.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if layers <= 1 => {
+            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            view.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: layers,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if layers <= 1 => {
+            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            view.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: layers,
+                PlaneSlice: 0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            view.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                MipSlice: 0,
+                FirstWSlice: 0,
+                WSize: layers,
+            };
+        }
+        _ => return None,
+    }
+    Some(view)
 }
 
 pub(in super::super) unsafe extern "system" fn rtv(

@@ -7,9 +7,10 @@ pub(super) unsafe extern "system" fn transition(
     barriers: *const D3D12_RESOURCE_BARRIER,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) || count == 0 {
+    if !state.prepare_state() || count == 0 {
         return;
     }
+    state.active.has_commands = true;
     if barriers.is_null() {
         state.error = E_INVALIDARG;
         return;
@@ -17,6 +18,7 @@ pub(super) unsafe extern "system" fn transition(
     // The guest supplies count readable barriers. Read a transition payload
     // only after checking the union tag.
     let guest = unsafe { slice::from_raw_parts(barriers, count as usize) };
+    let cmd = state.native().clone();
     let result = translate_batch(
         guest,
         Vec::new(),
@@ -156,8 +158,8 @@ pub(super) unsafe extern "system" fn transition(
             let mut first = 0;
             let submit = |run: &[RecordedBarrier]| {
                 if !run.is_empty() {
-                    (list.native.vtable().ResourceBarrier)(
-                        list.native.as_raw(),
+                    (cmd.vtable().ResourceBarrier)(
+                        cmd.as_raw(),
                         run.len() as u32,
                         run.as_ptr().cast(),
                     );
@@ -169,7 +171,7 @@ pub(super) unsafe extern "system" fn transition(
                 {
                     submit(&host[first..index]);
                     if let Some((_, resource, pair)) = handoffs.next_if(|(at, _, _)| *at == index) {
-                        depth::handoff(&list.native, resource, pair, &barrier.transition);
+                        depth::handoff(&cmd, resource, pair, &barrier.transition);
                     }
                     first = index + 1;
                 }
@@ -210,7 +212,7 @@ pub(super) fn enhanced_barriers(native: &ID3D12GraphicsCommandList) -> Option<ID
 
 pub(super) unsafe extern "system" fn flush_texture_cache(list: &List, mask: u32, address: u64, bytes: u64) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     // The mask selects the caches to flush. Both can use the same host
@@ -235,7 +237,7 @@ pub(super) unsafe extern "system" fn flush_texture_cache(list: &List, mask: u32,
             format!("texture cache range flush mask {mask:#x} address {address:#x} bytes {bytes:#x}")
         });
     }
-    global_cache_barrier(list, &mut state);
+    global_cache_barrier(&mut state);
 }
 
 // The extended list accepts separate cache/engine masks before the VA range.
@@ -244,22 +246,18 @@ pub(super) unsafe extern "system" fn extended_cache_barrier(
     list: &List, _cache: u32, _engines: u32, address: u64, bytes: u64,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if address.checked_add(bytes).is_none() {
         state.error = E_INVALIDARG;
         return;
     }
-    global_cache_barrier(list, &mut state);
+    global_cache_barrier(&mut state);
 }
 
-pub(super) fn global_cache_barrier(list: &List, state: &mut Recording) {
-    let Some(native) = list
-        .state
-        .enhanced_barriers
-        .get_or_init(|| enhanced_barriers(&list.native))
-    else {
+pub(super) fn global_cache_barrier(state: &mut Recording) {
+    let Some(native) = state.enhanced_barriers() else {
         crate::diagnostics::recording_error(format_args!("enhanced global barriers unavailable"));
         state.error = E_NOTIMPL;
         return;

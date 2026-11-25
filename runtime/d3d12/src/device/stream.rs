@@ -262,10 +262,15 @@ unsafe fn create(
     // A mesh pipeline's pixel stage runs under the guest root too (its
     // parameters are unchanged by the mesh table). Translate it against that
     // root, as a vertex/pixel pair is, so its constant buffers and views use the
-    // root's registers rather than the root-less private space.
+    // root's registers rather than the root-less private space. Where the pixel
+    // program reads a table at other slots than the root declares, the mesh
+    // table carries a root that follows the program instead.
     if let (Some(root), Some((pixel, _)), Some(_)) = (guest_root, original[1], original[7])
         && original[0].is_none()
-        && let Some(variant) = shader_cache::raster_with_root(pixel, root.payload())
+        && let Some(variant) = shader_cache::raster_with_root(
+            pixel,
+            pipeline.raster_table.as_ref().and_then(|table| table.pixel_root.as_ref()).unwrap_or(root).payload(),
+        )
         && shader_cache::prepared(&variant).is_some()
     {
         rooted[1] = Some(variant);

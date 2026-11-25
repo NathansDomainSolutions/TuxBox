@@ -22,6 +22,7 @@ struct Track {
     kind: i32,
     progress: ID3D12Fence,
     mark: u64,
+    armed: Option<u64>,
     ops: VecDeque<Op>,
 }
 
@@ -30,20 +31,38 @@ unsafe impl Send for Track {}
 
 static TRACKS: Mutex<Vec<Track>> = Mutex::new(Vec::new());
 
+/// Arm a shared wake event on every queue that has uncompleted operations.
+pub(super) fn arm_progress_wake(event: windows::Win32::Foundation::HANDLE) {
+    let mut tracks = TRACKS.lock().unwrap_or_else(|e| e.into_inner());
+    for track in tracks.iter_mut() {
+        // SAFETY: each private progress fence stays alive in TRACKS.
+        let done = unsafe { track.progress.GetCompletedValue() };
+        if done < track.mark && done != u64::MAX {
+            let target = done.saturating_add(1);
+            if track.armed != Some(target)
+                && unsafe { track.progress.SetEventOnCompletion(target, event) }.is_ok()
+            {
+                track.armed = Some(target);
+            }
+        }
+    }
+}
+
 /// Note a wait TuxBox itself just put on `queue`.
 pub(crate) fn waited(queue: &ID3D12CommandQueue, what: &str, fence: &ID3D12Fence, value: u64) {
     // SAFETY: the queue is live for this call.
     let kind = unsafe { queue.GetDesc() }.Type.0;
-    note(queue, kind, what.into(), Some((fence.clone(), value)));
+    let _ = note(queue, kind, what.into(), Some((fence.clone(), value)));
 }
 
-/// Note an operation just given to `queue`.
+/// Note an operation just given to `queue`, returning the signaled progress
+/// fence and value when recorded.
 pub(crate) fn note(
     queue: &ID3D12CommandQueue,
     kind: i32,
     text: String,
     fence: Option<(ID3D12Fence, u64)>,
-) {
+) -> Option<(ID3D12Fence, u64)> {
     use windows::core::Interface;
     let key = queue.as_raw().addr();
     let mut tracks = TRACKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -53,16 +72,16 @@ pub(crate) fn note(
             let mut device: Option<ID3D12Device> = None;
             // SAFETY: the queue is live for this call.
             if unsafe { queue.GetDevice(&mut device) }.is_err() {
-                return;
+                return None;
             }
-            let Some(device) = device else { return };
+            let device = device?;
             // SAFETY: a plain fence on the queue's device.
             let Ok(progress) =
                 (unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) })
             else {
-                return;
+                return None;
             };
-            tracks.push(Track { queue: key, kind, progress, mark: 0, ops: VecDeque::new() });
+            tracks.push(Track { queue: key, kind, progress, mark: 0, armed: None, ops: VecDeque::new() });
             tracks.len() - 1
         }
     };
@@ -70,12 +89,16 @@ pub(crate) fn note(
     track.mark += 1;
     // SAFETY: the queue and its private fence are live.
     if unsafe { queue.Signal(&track.progress, track.mark) }.is_err() {
-        return;
+        return None;
     }
+    let marker = (track.progress.clone(), track.mark);
     if track.ops.len() >= KEEP {
         track.ops.pop_front();
     }
     track.ops.push_back(Op { mark: track.mark, text, fence });
+    drop(tracks);
+    super::memory_wait::notify_waiters();
+    Some(marker)
 }
 
 /// Log, for each queue that is behind, the operations it has not passed.

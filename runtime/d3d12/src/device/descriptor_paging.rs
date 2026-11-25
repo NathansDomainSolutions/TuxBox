@@ -37,7 +37,7 @@ impl Registry {
         }
         let entries = self.arenas.lock().unwrap_or_else(|e| e.into_inner());
         let arena = entries.range(..=address).next_back()?.1.upgrade()?;
-        (address - arena.base() < arena.count as usize * arena.stride).then_some(arena)
+        (address - arena.base() < arena.count as usize * arena.guest_stride()).then_some(arena)
     }
     pub(super) fn copy_source(
         &self,
@@ -46,7 +46,7 @@ impl Registry {
         let Some(arena) = self.find(handle.ptr) else {
             return handle;
         };
-        if arena.inline && (handle.ptr - arena.base()).is_multiple_of(arena.stride)
+        if arena.inline && (handle.ptr - arena.base()).is_multiple_of(arena.guest_stride())
             && let Some(source) = arena.resolve_inline(arena.inline_record(handle.ptr))
         {
             return source;
@@ -64,7 +64,7 @@ struct InlineDescriptor {
     version: u64,
     reserved: [u64; 2],
 }
-const INLINE_BYTES: usize = size_of::<InlineDescriptor>();
+pub(super) const INLINE_BYTES: usize = size_of::<InlineDescriptor>();
 
 /// Fence completion oracle used for non-blocking retirement of in-flight batches.
 #[derive(Clone)]
@@ -326,7 +326,11 @@ impl Arena {
             staging.clone()
         };
         let stride = unsafe { device.GetDescriptorHandleIncrementSize(desc.Type) } as usize;
-        let bytes = stride
+        let inline = owner.state.device11_queue
+            && stride >= INLINE_BYTES
+            && stride.is_multiple_of(INLINE_BYTES);
+        let guest_stride = if inline { INLINE_BYTES } else { stride };
+        let bytes = guest_stride
             .checked_mul(desc.NumDescriptors as usize)
             .ok_or(E_OUTOFMEMORY)?;
         let memory = GuestMemory::allocate(bytes, 0x0480_0004)?;
@@ -373,9 +377,7 @@ impl Arena {
             stride,
             count: desc.NumDescriptors,
             limit,
-            inline: owner.state.device11_queue
-                && stride >= INLINE_BYTES
-                && stride.is_multiple_of(INLINE_BYTES),
+            inline,
             authored: Mutex::default(),
             tables: Mutex::new(Tables::default()),
         });
@@ -389,6 +391,10 @@ impl Arena {
         self.inline
     }
 
+    pub(crate) fn guest_stride(&self) -> usize {
+        if self.inline { INLINE_BYTES } else { self.stride }
+    }
+
     pub(crate) fn base(&self) -> usize {
         self.base_address
     }
@@ -396,7 +402,7 @@ impl Arena {
     pub(crate) fn contains(&self, address: u64) -> bool {
         address
             .checked_sub(self.base() as u64)
-            .is_some_and(|offset| offset < self.count as u64 * self.stride as u64)
+            .is_some_and(|offset| offset < self.count as u64 * self.guest_stride() as u64)
     }
 
     pub(crate) fn visible(&self) -> &ID3D12DescriptorHeap {
@@ -408,8 +414,9 @@ impl Arena {
             .native
             .as_ref()
             .map_or(0x3000_0000, |n| n.staging_cpu_start);
+        let slot = (address - self.base()) / self.guest_stride();
         D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: start + (address - self.base()),
+            ptr: start + slot * self.stride,
         }
     }
 
@@ -420,16 +427,17 @@ impl Arena {
     }
 
     pub(super) fn author(&self, address: usize, count: u32) {
+        let guest_stride = self.guest_stride();
         if !self.inline
             || !self.contains(address as u64)
-            || !(address - self.base()).is_multiple_of(self.stride)
-            || count as usize > self.count as usize - (address - self.base()) / self.stride
+            || !(address - self.base()).is_multiple_of(guest_stride)
+            || count as usize > self.count as usize - (address - self.base()) / guest_stride
         {
             return;
         }
         let mut versions = self.authored.lock().unwrap_or_else(|e| e.into_inner());
         for slot in 0..count as usize {
-            let source = address + slot * self.stride;
+            let source = address + slot * guest_stride;
             let version = self.registry.next_version.fetch_add(1, Ordering::Relaxed) + 1;
             versions.insert(source, version);
             let record = InlineDescriptor {
@@ -482,7 +490,9 @@ impl Arena {
         let Some(native) = &self.native else {
             return;
         };
-        let from = self.cpu(self.base() + src as usize * self.stride);
+        let from = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: native.staging_cpu_start + src as usize * self.stride,
+        };
         let to = D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: native.visible_cpu_start + dst as usize * self.stride,
         };
@@ -563,7 +573,7 @@ impl Arena {
     }
 
     pub(crate) fn publish(&self, address: usize, count: u32) {
-        let first = ((address - self.base()) / self.stride) as u32;
+        let first = ((address - self.base()) / self.guest_stride()) as u32;
         let end = first.saturating_add(count);
         if end > self.count || count == 0 {
             return;
@@ -595,24 +605,6 @@ impl Arena {
             } = tables;
             for (&(start, length), entry) in ranges.iter() {
                 let resident = entry.slot;
-                if self.inline && self.stride != INLINE_BYTES {
-                    let offset =
-                        (first as usize).saturating_sub(start as usize) * self.stride / INLINE_BYTES;
-                    if first >= start && offset < length as usize {
-                        let count = u32::try_from(
-                            (length as usize - offset).div_ceil(self.stride / INLINE_BYTES),
-                        )
-                        .unwrap_or(0)
-                        .min(count);
-                        for step in 0..count as usize {
-                            let slot =
-                                resident as usize + offset + step * (self.stride / INLINE_BYTES);
-                            self.copy(first + step as u32, slot as u32, 1, &mut retired);
-                            resident_records.remove(&slot);
-                        }
-                    }
-                    continue;
-                }
                 let lo = start.max(first);
                 let hi = (start + length).min(end);
                 if lo < hi {

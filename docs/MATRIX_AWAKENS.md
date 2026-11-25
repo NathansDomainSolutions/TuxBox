@@ -48,7 +48,7 @@ The title reports an invalid local user when saving the city unlock. Closing the
 
 ## Run with TuxBox on Linux
 
-Start with the original `Mount` and matching `EmbeddedXvd` directories. Install Valve’s Proton Experimental from Steam, then install umu-run, Vulkan headers, liblz4 and the project’s Rust, xwin, clang-cl and lld-link build tools. Shader preparation uses the Linux DXC tools `dxc` and `dxv`. The guest also uses the Windows x64 DXC release. The example accepts its zip file directly. Choose a working directory on the game’s filesystem to take advantage of copy-on-write. [Build prerequisites](../examples/lanes/README.md#build-requirements) · [Microsoft DXC v1.8.2505.1](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2505.1)
+Start with the original `Mount` and matching `EmbeddedXvd` directories. Install Valve’s Proton Experimental from Steam, then install umu-run, Vulkan headers, liblz4 and the project’s Rust, xwin, clang-cl and lld-link build tools. Set `PROTONPATH` to that Proton installation, because TuxBox otherwise selects GE-Proton11-14. Shader preparation uses the Linux DXC tools `dxc` and `dxv`. The guest also uses the Windows x64 DXC release. The example accepts its zip file directly. Choose a working directory on the game’s filesystem to take advantage of copy-on-write. [Build prerequisites](../examples/lanes/README.md#build-requirements) · [Microsoft DXC v1.8.2505.1](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.8.2505.1)
 
 ```sh
 python tools/prepare_frosty.py /path/to/Mount \

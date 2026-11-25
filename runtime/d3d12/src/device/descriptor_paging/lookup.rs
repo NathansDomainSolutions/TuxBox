@@ -13,7 +13,7 @@ impl Arena {
 
     pub(crate) fn resident_gpu(&self, address: u64, length: u32) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
         let offset = (address as usize).checked_sub(self.base())?;
-        let first = u32::try_from(offset / self.stride).ok()?;
+        let first = u32::try_from(offset / self.guest_stride()).ok()?;
         let tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         let slot = tables
             .ranges
@@ -47,10 +47,10 @@ impl Arena {
         let offset = (address as usize)
             .checked_sub(self.base())
             .ok_or(E_INVALIDARG)?;
-        if length == 0 || !offset.is_multiple_of(self.stride) {
+        if length == 0 || !offset.is_multiple_of(self.guest_stride()) {
             return Err(E_INVALIDARG.into());
         }
-        let first = u32::try_from(offset / self.stride).map_err(|_| E_INVALIDARG)?;
+        let first = u32::try_from(offset / self.guest_stride()).map_err(|_| E_INVALIDARG)?;
         if first.checked_add(length).is_none_or(|end| end > self.count) {
             return Err(E_INVALIDARG.into());
         }

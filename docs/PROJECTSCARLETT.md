@@ -1,13 +1,13 @@
 # Set up ProjectScarlett (GTA VI) on Linux
 
-This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on Valve's stock Proton Experimental. The furthest recorded run got into the story intro, where GPU queues stalled. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
+This guide stages GTA VI 1.0.2.1 (`ProjectScarlett`) with TuxBox's providers and starts it on GE-Proton. The furthest recorded run got into the story intro, where GPU queues stalled. The game isn't playable. [What to expect](#what-to-expect) · [Title progress](PROGRESS.md) · [Run record](../evidence/projectscarlett-gameplay.json)
 
 You supply the game package. TuxBox doesn't include any game files. The recorded runs use package `RockstarGamesInc.28872443D20A7` 1.0.2.1, whose `game_scarlett_master.exe` has SHA-256 `e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993`. Other builds may need different providers or shader requests.
 
 ## Requirements
 
 - The project's Linux build tools: Python 3.10 or newer, Rust with the `x86_64-pc-windows-msvc` target, `clang-cl`, `lld-link` and the xwin Windows SDK. [Build requirements](../examples/lanes/README.md#build-requirements)
-- Proton Experimental from Steam and `umu-run`.
+- [GE-Proton11-14](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-14), extracted into Steam's `compatibilitytools.d`, and `umu-run`. TuxBox selects this release unless `--proton` or `PROTONPATH` names another. Its shader converter handles large translated shaders far faster than the one in the Proton Experimental build used for earlier runs.
 - Microsoft's Linux DXC release with `dxc` and `dxv`, for shader preparation and runtime translation. Arch's `directx-shader-compiler` 1.10.2605.37 fails on a minimal compute shader. Use Microsoft's release instead. [DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
 - The Windows x64 DXC release (same-release `dxcompiler.dll` and `dxil.dll`) for generating rectangle geometry shaders inside the game process. The Linux `dxc` executable alone does not supply these DLLs. Use [Microsoft's official DXC releases](https://github.com/microsoft/DirectXShaderCompiler/releases).
 - A C compiler and Vulkan headers. The launcher builds TuxBox's constant-buffer Vulkan layer on first use.
@@ -76,7 +76,7 @@ UMU_RUNTIME_UPDATE=0 unshare --user --map-current-user --net -- \
 
 Inside the namespace the only network device is a loopback interface that is down. `UMU_RUNTIME_UPDATE=0` stops umu-run from trying to update the Steam Runtime. Offline launches need unprivileged user namespaces.
 
-Add `--mangohud` before the package path to record frame times. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/Proton - Experimental`. Pass `--prefix` to use another one.
+Add `--mangohud` before the package path to record frame times. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
 
 ## Shader preparation
 

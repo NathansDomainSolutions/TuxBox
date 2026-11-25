@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
 
-from .dxil_store import DxilStore, write_identity
+from .dxil_store import COMPUTE_FLAGS, VARIANTS, DxilStore, write_identity
 from .inspect import digest
 from .persistent_dxc import PersistentDxc
 from .shader_diagnostics import refusal_line
@@ -211,6 +211,9 @@ def archive_request(archive, source, inputs):
 # compute program (CS_Emit_Dynamic_Model_Edge, 7,813 instructions) needs
 # about 18 s at -O0, so a 15 s cap refused it on every boot.
 O0_TIMEOUT = 90
+# The longest optimised cs_6_6 compile in a ProjectScarlett sample took 40 s
+# with twelve compiles sharing the processor.
+COMPUTE_TIMEOUT = 60
 
 
 def validated_dxil(dxv, output, stage):
@@ -238,12 +241,25 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             return validated_dxil(dxv, output, stage)
         except (subprocess.TimeoutExpired, ValueError):
             output.unlink(missing_ok=True)
-    # cs_6_6 programs from this boot either finish default optimisation in
-    # under a second or sit in it until the cap. The ones that sit there
-    # compile at -O0 in a few seconds, and the driver optimises that DXIL
-    # again when it builds the pipeline. A request that timed out before goes
-    # straight to -O0 rather than spending the cap again.
-    if target == "cs_6_6" or (store and store.is_slow(request, target)):
+    # A request that timed out before goes straight to -O0 rather than spending
+    # the cap again.
+    if store and store.is_slow(request, target):
+        run_tool(unoptimised, timeout=O0_TIMEOUT)
+        return validated_dxil(dxv, output, stage)
+    # See `COMPUTE_FLAGS`. -O0 remains the fallback: the largest programs still
+    # compile that way when the optimiser fails or runs out of time.
+    if target == "cs_6_6":
+        try:
+            run_tool([dxc, "-T", target, *entry, *COMPUTE_FLAGS, "-Fo", output, hlsl], timeout=COMPUTE_TIMEOUT)
+            if not output.exists():
+                raise ValueError("compiler returned no DXIL output")
+            return validated_dxil(dxv, output, stage)
+        except subprocess.TimeoutExpired:
+            if store:
+                store.mark_slow(request, target)
+        except ValueError:
+            pass
+        output.unlink(missing_ok=True)
         run_tool(unoptimised, timeout=O0_TIMEOUT)
         return validated_dxil(dxv, output, stage)
     try:
@@ -445,7 +461,8 @@ def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     version = subprocess.check_output([dxc, "--version"], timeout=10)
     if dxc_helper is not None:
         version += b"\npersistent-dxc:" + digest(dxc_helper).encode("ascii")
-    fingerprint = hashlib.sha256(version)
+    # Outputs built with other compiler flags must not be reused.
+    fingerprint = hashlib.sha256(version + repr(sorted(VARIANTS.items())).encode("ascii"))
     for tool in tools:
         fingerprint.update(bytes.fromhex(digest(Path(tool))))
     cache = cache_root / "runtime" / fingerprint.hexdigest()

@@ -218,10 +218,8 @@ pub(super) unsafe extern "system" fn place(
     }
     let mut host = primary.unwrap_or(*desc);
     host.Flags.0 &= super::format::HOST_FLAGS;
-    let allocation = |host: &D3D12_RESOURCE_DESC| unsafe {
-        device
-            .native
-            .GetResourceAllocationInfo(0, core::slice::from_ref(host))
+    let allocation = |host: &D3D12_RESOURCE_DESC| {
+        super::allocation::allocation_info_for(&device.native, 0, host)
     };
     let fits = |info: &D3D12_RESOURCE_ALLOCATION_INFO| {
         info.SizeInBytes != u64::MAX
@@ -276,14 +274,44 @@ pub(super) unsafe extern "system" fn place(
         return report("range", E_INVALIDARG);
     }
     let host_clear = super::format::host_clear(clear);
+    let clear_ptr = host_clear.as_ref().map_or(clear, core::ptr::from_ref);
+    let host_initial = super::host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+    let packed = super::allocation::packed_uav_formats(host.Format, host.Flags);
     let mut native = None;
-    if let Err(error) = unsafe {
+    if !packed.is_empty() && !super::dxgi::supports_native_packed_uav(device, host.Format) {
+        let Ok(api) = device.native.cast::<ID3D12Device10>() else {
+            return report("host", E_NOTIMPL);
+        };
+        if !super::allocation::valid_initial_texture_state(host_initial, host.Flags) {
+            return report("host", E_INVALIDARG);
+        }
+        let host1 = super::allocation::resource_desc1(&host);
+        if let Err(error) = unsafe {
+            api.CreatePlacedResource2::<_, ID3D12Resource>(
+                &heap.native,
+                offset,
+                &host1,
+                D3D12_BARRIER_LAYOUT_COMMON,
+                clear_ptr.as_ref().map(core::ptr::from_ref),
+                Some(packed),
+                &mut native,
+            )
+        } {
+            return report("host", error.code());
+        }
+        if let Some(res) = native.as_ref()
+            && let Err(hr) =
+                super::allocation::transition_initial_state(device, res, host_initial, host.Flags)
+        {
+            return report("host", hr);
+        }
+    } else if let Err(error) = unsafe {
         device.native.CreatePlacedResource::<_, ID3D12Resource>(
             &heap.native,
             offset,
             &host,
-            super::host_state(initial, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER),
-            Some(host_clear.as_ref().map_or(clear, core::ptr::from_ref)),
+            host_initial,
+            Some(clear_ptr),
             &mut native,
         )
     } {
@@ -415,9 +443,15 @@ unsafe fn place_gpu_target(
     let mut render_heap = None;
     let result = (|| -> windows::core::Result<ID3D12Resource> {
         let api: ID3D12Device13 = device.native.cast()?;
-        let formats = super::allocation::packed_uav_formats(host.Format, host.Flags);
+        let formats = if super::dxgi::supports_native_packed_uav(device, host.Format) {
+            &[][..]
+        } else {
+            super::allocation::packed_uav_formats(host.Format, host.Flags)
+        };
         let requirements = |desc: &D3D12_RESOURCE_DESC1| {
-            super::allocation::packed_requirements(&device.native, 0, desc)
+            (!formats.is_empty())
+                .then(|| super::allocation::packed_requirements(&device.native, 0, desc))
+                .flatten()
                 .unwrap_or_else(|| unsafe { api.GetResourceAllocationInfo2(0, 1, desc, None) })
         };
         let mut allocation = requirements(&host);
@@ -518,8 +552,24 @@ pub(super) unsafe extern "system" fn committed_layout(
     if !protected.is_null() { return E_NOTIMPL; }
     if count > 0 && formats.is_null() { return E_INVALIDARG; }
     let packed = super::allocation::packed_uav_formats(desc.Format, desc.Flags);
-    let castable = if count == 0 { (!packed.is_empty()).then_some(packed) }
-        else { Some(unsafe { std::slice::from_raw_parts(formats, count as usize) }) };
+    let needs_cast = !packed.is_empty() && !super::dxgi::supports_native_packed_uav(device, desc.Format);
+    let mut merged_castable = Vec::new();
+    let castable = if count == 0 {
+        needs_cast.then_some(packed)
+    } else {
+        let caller = unsafe { std::slice::from_raw_parts(formats, count as usize) };
+        if needs_cast && packed.iter().any(|fmt| !caller.contains(fmt)) {
+            merged_castable.extend_from_slice(caller);
+            for &fmt in packed {
+                if !merged_castable.contains(&fmt) {
+                    merged_castable.push(fmt);
+                }
+            }
+            Some(merged_castable.as_slice())
+        } else {
+            Some(caller)
+        }
+    };
     // A float depth plane with a writable companion is not created through this entry point.
     let paired = super::depth::paired(desc);
     let translated = super::depth::primary(desc).filter(|_| !paired || desc.Format == super::format::D16_UNORM_S8_UINT);

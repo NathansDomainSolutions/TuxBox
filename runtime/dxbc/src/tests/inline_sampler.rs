@@ -166,3 +166,48 @@ fn sampler_words_must_agree_on_every_reachable_loop_path() {
     words[6] = 0xbf84_0002; // s_cbranch_scc0 also allows the point filter.
     assert!(classify(&words).is_none());
 }
+
+#[test]
+fn a_static_sampler_the_root_leaves_out_takes_its_declared_register() {
+    // image_sample_c with the comparison state, then image_sample with a
+    // linear clamped state the root does carry.
+    let words = [
+        0xb008_30b6u32, // s_movk_i32 s8
+        0xbe89_03ff, 0x00c0_0000,
+        0xbe8a_03ff, 0x1850_0000,
+        0xbe8b_03ff, 0x8000_0000,
+        0xf0a0_0f08, 0x0040_0a0a, // image_sample_c
+        0xb008_0092, // s_movk_i32 s8, clamp
+        0xbe8b_0380, // s_mov_b32 s11, 0
+        0xf080_0f08, 0x0040_0a0a, // image_sample
+        0xbf81_0000,
+    ];
+    let isa: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let carried = super::descriptor([0x92, 0xc00000, 0x18500000, 0], 1, 1, 0, false).unwrap();
+    let shadow = [0x95, 4, 4, 3, 0, 1, 4, 2, 0, 12.0_f32.to_bits(), 17, 1, 5];
+    let omitted = |declared: &[(u32, u32)], recorded: &[u32], statics: &[[u32; 13]]| {
+        super::omitted_states(&isa, declared, recorded, statics)
+    };
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[17, 1], &[carried]), Some(vec![shadow]));
+    // The root already has that state, or covers every declared register.
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[17, 1], &[carried, shadow]), None);
+    let mut other = carried;
+    other[10] = 17;
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[17, 1], &[carried, other]), None);
+    // A sampler visible only to another stage does not cover the register.
+    other[12] = 1;
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[17, 1], &[carried, other]), Some(vec![shadow]));
+    // PSV and FSSM disagree, or the root has no static samplers of its own.
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[1], &[carried]), None);
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[1, 18], &[carried]), None);
+    assert_eq!(omitted(&[(1, 1), (17, 1)], &[17, 1], &[]), None);
+    // With neither state in the root both are missing. They take the free
+    // registers in order, and need one each.
+    let mut elsewhere = carried;
+    (elsewhere[0], elsewhere[10]) = (0, 9);
+    let both = omitted(&[(17, 1), (1, 1)], &[17, 1], &[elsewhere]).unwrap();
+    assert_eq!(both.iter().map(|s| (s[10], s[11], s[12])).collect::<Vec<_>>(), [(1, 1, 5), (17, 1, 5)]);
+    assert!(both.iter().any(|s| s[..10] == shadow[..10]) && both.iter().any(|s| s[..10] == carried[..10]));
+    elsewhere[10] = 1;
+    assert_eq!(omitted(&[(17, 1), (1, 1)], &[17, 1], &[elsewhere]), None);
+}

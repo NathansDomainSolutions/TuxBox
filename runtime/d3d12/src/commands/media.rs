@@ -82,13 +82,15 @@ fn copy_state(state: D3D12_RESOURCE_STATES) -> std::result::Result<D3D12_RESOURC
 
 unsafe extern "system" fn barriers(list: &List, count: u32, input: *const D3D12_RESOURCE_BARRIER) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) || count == 0 {
+    if !state.prepare_state() || count == 0 {
         return;
     }
+    state.active.has_commands = true;
     if input.is_null() {
         state.error = E_POINTER;
         return;
     }
+    let cmd = state.native().clone();
     let Some(media) = state.media.as_mut() else {
         state.error = E_INVALIDARG;
         return;
@@ -118,8 +120,8 @@ unsafe extern "system" fn barriers(list: &List, count: u32, input: *const D3D12_
                 // SAFETY: TransitionBarrier has the desktop layout and the
                 // recording allocator owns the resource throughout execution.
                 unsafe {
-                    (list.native.vtable().ResourceBarrier)(
-                        list.native.as_raw(),
+                    (cmd.vtable().ResourceBarrier)(
+                        cmd.as_raw(),
                         1,
                         ptr::from_ref(t).cast(),
                     )
@@ -143,24 +145,26 @@ unsafe extern "system" fn copy(
     region: *const D3D12_BOX,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     let (Some(dst), Some(src)) = (unsafe { dst.as_ref() }, unsafe { src.as_ref() }) else {
         state.error = E_POINTER;
         return;
     };
+    let cmd = state.native().clone();
     let Some(media) = state.media.as_mut() else {
         state.error = E_INVALIDARG;
         return;
     };
-    if let Err(error) = unsafe { record_copy(list, media, dst, [x, y, z], src, region.as_ref()) } {
+    if let Err(error) = unsafe { record_copy(list, &cmd, media, dst, [x, y, z], src, region.as_ref()) } {
         state.error = error.code();
     }
 }
 
 unsafe fn record_copy(
     list: &List,
+    cmd: &ID3D12GraphicsCommandList,
     media: &mut Recording,
     dst: &CopyLocation,
     at: [u32; 3],
@@ -233,8 +237,8 @@ unsafe fn record_copy(
         ..*dst
     };
     unsafe {
-        (list.native.vtable().CopyTextureRegion)(
-            list.native.as_raw(),
+        (cmd.vtable().CopyTextureRegion)(
+            cmd.as_raw(),
             ptr::from_ref(&to).cast(),
             at[0],
             at[1],

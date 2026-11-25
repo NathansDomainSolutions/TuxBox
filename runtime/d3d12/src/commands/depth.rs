@@ -17,7 +17,7 @@ pub(super) unsafe extern "system" fn clear(
     rects: *const RECT,
 ) {
     let mut recording = recording(list);
-    if !recording.can_record(&list.native) {
+    if !recording.can_record() {
         return;
     }
     if handle.ptr == 0
@@ -28,9 +28,10 @@ pub(super) unsafe extern "system" fn clear(
         recording.error = E_INVALIDARG;
         return;
     }
+    let cmd = recording.native();
     unsafe {
-        (list.native.vtable().ClearDepthStencilView)(
-            list.native.as_raw(),
+        (cmd.vtable().ClearDepthStencilView)(
+            cmd.as_raw(),
             handle,
             flags,
             depth,
@@ -51,7 +52,7 @@ pub(super) unsafe extern "system" fn clear_uav<const FLOAT: bool>(
     rects: *const RECT,
 ) {
     let mut recording = recording(list);
-    if !recording.can_record(&list.native) {
+    if !recording.can_record() {
         return;
     }
     let Some(resource) = (unsafe { resource_proxy(resource, parent(&list.parent)) }) else {
@@ -106,7 +107,8 @@ pub(super) unsafe extern "system" fn clear_uav<const FLOAT: bool>(
     }
     let target = alias.as_ref().unwrap_or_else(|| resource.state.depth()
         .map_or(&resource.native, |pair| &pair.image)).as_raw();
-    let native = &list.native;
+    recording.record_unknown_write();
+    let native = recording.native();
     unsafe {
         if FLOAT {
             (native.vtable().ClearUnorderedAccessViewFloat)(

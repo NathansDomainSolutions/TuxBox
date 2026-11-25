@@ -63,14 +63,17 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
         plane.options[4] = 0;
     }
     // Frosty's main thread owns the game window while a render thread presents.
-    auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });
-    while (render.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) pump();
-    HRESULT hr = render.get();
-    if (hr != S_OK) {
-        char message[96];
-        std::snprintf(message, sizeof(message), "queue slot 30 PresentX returned %#lx", static_cast<unsigned long>(hr));
-        throw std::runtime_error(message);
-    }
+    const auto submit = [&] {
+        auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });
+        while (render.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) pump();
+        const HRESULT hr = render.get();
+        if (hr != S_OK) {
+            char message[96];
+            std::snprintf(message, sizeof(message), "queue slot 30 PresentX returned %#lx", static_cast<unsigned long>(hr));
+            throw std::runtime_error(message);
+        }
+    };
+    submit();
     if (!window_) {
         EnumWindows([](HWND w, LPARAM data) -> BOOL {
             DWORD pid{};
@@ -100,6 +103,10 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
             throw std::runtime_error("distorted presentation" + sizing_);
     }
     const auto deadline = GetTickCount64() + 4000;
+    // GE-Proton11-14 can leave a presented image off the screen until a later
+    // present, which a title supplies every frame. Repeat this one a few times.
+    auto resubmit_at = GetTickCount64() + 250;
+    int resubmits = 3;
     const std::array<POINT, 5> samples{{{5, 5}, {95, 5}, {5, 95}, {95, 95}, {50, 50}}};
     std::array<COLORREF, samples.size()> pixels{};
     do {
@@ -114,6 +121,11 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
         }
         ReleaseDC(nullptr, screen);
         if (matched) return;
+        if (resubmits && GetTickCount64() >= resubmit_at) {
+            submit();
+            --resubmits;
+            resubmit_at += 250;
+        }
         Sleep(16);
     } while (GetTickCount64() < deadline);
     char message[180];

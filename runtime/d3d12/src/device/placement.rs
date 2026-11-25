@@ -45,15 +45,36 @@ fn committed(
     };
     let mut native = None;
     // SAFETY: D3D12 only borrows the input structures during creation.
-    unsafe {
-        device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            desc,
-            initial,
-            clear.map(core::ptr::from_ref),
-            &mut native,
-        )?;
+    if super::allocation::needs_packed_uav_cast(device, desc.Format, desc.Flags) {
+        use windows::core::Interface;
+        let api: ID3D12Device10 = device.cast().map_err(|_| windows::core::Error::from(E_NOTIMPL))?;
+        let layout = super::allocation::initial_barrier_layout(initial)
+            .ok_or_else(|| windows::core::Error::from(E_NOTIMPL))?;
+        let desc1 = super::allocation::resource_desc1(desc);
+        let formats = super::allocation::packed_uav_formats(desc.Format, desc.Flags);
+        unsafe {
+            api.CreateCommittedResource3::<_, ID3D12Resource>(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc1,
+                layout,
+                clear.map(core::ptr::from_ref),
+                None,
+                Some(formats),
+                &mut native,
+            )?;
+        }
+    } else {
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                desc,
+                initial,
+                clear.map(core::ptr::from_ref),
+                &mut native,
+            )?;
+        }
     }
     native.ok_or_else(|| E_POINTER.into())
 }
@@ -247,11 +268,15 @@ impl Texture {
             } else {
                 (0, 0, 2, luma_bytes..size)
             };
+            let footprint_host = super::allocation::needs_packed_uav_cast(device, host.Format, host.Flags)
+                .then(|| super::allocation::copy_footprint_desc(&host))
+                .flatten();
+            let footprint_desc = footprint_host.as_ref().unwrap_or(&host);
             let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let (mut rows, mut row_bytes, mut bytes) = (0, 0, 0);
             unsafe {
                 device.GetCopyableFootprints(
-                    &host,
+                    footprint_desc,
                     index,
                     1,
                     0,

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from project_tuxbox.runtime_shaders import O0_TIMEOUT, ShaderRefused, archive_request, compile_dxil, compile_request, serve, snapshot_compiler_cache
+from project_tuxbox.runtime_shaders import COMPUTE_TIMEOUT, O0_TIMEOUT, ShaderRefused, archive_request, compile_dxil, compile_request, serve, snapshot_compiler_cache
 from project_tuxbox.scarlett_prep import scarlett_requests
 from project_tuxbox.shader_prep import SOURCE_CACHE, ToolFailure, prepare_for_launch
 
@@ -454,7 +454,7 @@ class RuntimeShaderLinks(unittest.TestCase):
         self.assertEqual(compiler.call_count, 1)
 
     def test_large_pixel_policy_leaves_other_profiles_and_small_sources_unchanged(self):
-        """Only ps_6_6 sources at least 256 KiB use the candidate invocation."""
+        """Of these, only compute programs with a wave size turn lifetime markers off."""
         hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
         for target, stage, size in (("ps_6_6", 0, (256 << 10) - 1), ("ps_6_0", 0, 256 << 10),
                                     ("cs_6_6", 5, 256 << 10), ("gs_6_6", 2, 256 << 10)):
@@ -462,15 +462,15 @@ class RuntimeShaderLinks(unittest.TestCase):
                 hlsl.write_bytes(b"x" * size)
                 dxil = portable_program(stage, b"baseline")
                 def run(args, *, timeout):
-                    self.assertNotIn("-disable-lifetime-markers", args)
                     if args[0] == "dxc":
-                        self.assertEqual("-O0" in args, target == "cs_6_6")
+                        self.assertEqual("-disable-lifetime-markers" in args, target == "cs_6_6")
+                        self.assertNotIn("-O0", args)
                         output.write_bytes(dxil)
                 with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
                     self.assertEqual(compile_dxil("dxc", "dxv", target, hlsl, output, None, "request", stage), dxil)
                 self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["dxc", "dxv"])
 
-    def test_cs_6_6_skips_the_optimiser(self):
+    def test_cs_6_6_optimises_without_lifetime_markers(self):
         program = b"Xbox compute shader"
         key = hashlib.sha256(program).hexdigest()
         source = self.requests / (key + ".dxbc")
@@ -482,8 +482,9 @@ class RuntimeShaderLinks(unittest.TestCase):
                 args[args.index("--hlsl-out") + 1].write_text("compute shader")
                 args[args.index("--profile-out") + 1].write_text("cs_6_6")
             elif args[0] == "dxc":
-                self.assertIn("-O0", args)
-                self.assertEqual(timeout, O0_TIMEOUT)
+                self.assertIn("-O1", args)
+                self.assertIn("-disable-lifetime-markers", args)
+                self.assertEqual(timeout, COMPUTE_TIMEOUT)
                 args[args.index("-Fo") + 1].write_bytes(dxil)
             else:
                 self.assertEqual(args[0], "dxv")
@@ -491,6 +492,41 @@ class RuntimeShaderLinks(unittest.TestCase):
         with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
         self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxv"])
+
+    def test_cs_6_6_falls_back_to_no_optimisation(self):
+        hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
+        hlsl.write_bytes(b"compute shader")
+        dxil = portable_program(5, b"fallback")
+        for failure in ("timeout", "dxc", "dxv", "missing", "slow"):
+            with self.subTest(failure=failure):
+                output.unlink(missing_ok=True)
+                store = Mock()
+                store.is_slow.return_value = failure == "slow"
+                optimised = False
+
+                def run(args, *, timeout):
+                    nonlocal optimised
+                    if args[0] == "dxc":
+                        optimised = "-O0" not in args
+                        self.assertEqual(timeout, COMPUTE_TIMEOUT if optimised else O0_TIMEOUT)
+                        if not optimised:
+                            self.assertFalse(output.exists())
+                            output.write_bytes(dxil)
+                            return
+                        if failure != "missing":
+                            output.write_bytes(b"partial")
+                        if failure == "timeout":
+                            raise subprocess.TimeoutExpired("dxc", timeout)
+                        if failure == "dxc":
+                            raise ToolFailure("dxc", 1, "internal error")
+                    elif optimised and failure == "dxv":
+                        raise ToolFailure("dxv", 1, "invalid DXIL")
+
+                with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
+                    self.assertEqual(compile_dxil("dxc", "dxv", "cs_6_6", hlsl, output, store, "request", 5), dxil)
+                compiles = [call for call in compiler.call_args_list if call.args[0][0] == "dxc"]
+                self.assertEqual(len(compiles), 1 if failure == "slow" else 2)
+                self.assertEqual(store.mark_slow.called, failure == "timeout")
 
     def test_scarlett_replays_exact_recorded_requests_before_launch(self):
         directory = self.session.parent

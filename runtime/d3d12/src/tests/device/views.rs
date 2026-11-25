@@ -1,4 +1,6 @@
-use super::{desktop_cbv_bytes, earlier_page};
+use super::{default_texture_uav_desc, desktop_cbv_bytes, earlier_page};
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT};
 
 #[test]
 fn an_earlier_page_puts_a_view_on_a_whole_element() {
@@ -22,4 +24,66 @@ fn desktop_cbv_size_is_a_256_byte_multiple_up_to_the_limit() {
     assert_eq!(desktop_cbv_bytes(257), 512);
     assert_eq!(desktop_cbv_bytes(65536), 65536);
     assert_eq!(desktop_cbv_bytes(65537), 65537);
+}
+
+#[test]
+fn default_texture_uav_desc_synthesizes_raw_views_for_all_texture_dimensions() {
+    let base = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 16,
+        Height: 16,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        ..Default::default()
+    };
+    let v2d = default_texture_uav_desc(&base, DXGI_FORMAT_R32_UINT).expect("2D UAV");
+    assert_eq!(v2d.Format, DXGI_FORMAT_R32_UINT);
+    assert_eq!(v2d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2D);
+
+    let v2da = default_texture_uav_desc(
+        &D3D12_RESOURCE_DESC { DepthOrArraySize: 6, ..base },
+        DXGI_FORMAT_R32_UINT,
+    )
+    .expect("2D array UAV");
+    assert_eq!(v2da.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+    assert_eq!(unsafe { v2da.Anonymous.Texture2DArray.ArraySize }, 6);
+
+    let v1d = default_texture_uav_desc(
+        &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D, Height: 1, ..base },
+        DXGI_FORMAT_R16_UINT,
+    )
+    .expect("1D UAV");
+    assert_eq!(v1d.Format, DXGI_FORMAT_R16_UINT);
+    assert_eq!(v1d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE1D);
+
+    let v1da = default_texture_uav_desc(
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            Height: 1,
+            DepthOrArraySize: 4,
+            ..base
+        },
+        DXGI_FORMAT_R16_UINT,
+    )
+    .expect("1D array UAV");
+    assert_eq!(v1da.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE1DARRAY);
+    assert_eq!(unsafe { v1da.Anonymous.Texture1DArray.ArraySize }, 4);
+
+    let v3d = default_texture_uav_desc(
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            DepthOrArraySize: 8,
+            ..base
+        },
+        DXGI_FORMAT_R32_UINT,
+    )
+    .expect("3D UAV");
+    assert_eq!(v3d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+    assert_eq!(unsafe { v3d.Anonymous.Texture3D.WSize }, 8);
+
+    assert!(default_texture_uav_desc(
+        &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, ..base },
+        DXGI_FORMAT_R32_UINT,
+    )
+    .is_none());
 }

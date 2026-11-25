@@ -3,7 +3,7 @@ use super::{compute::RootSource, compute_table::ComputeTable};
 use std::{ops::Range, sync::Arc};
 use tuxbox_dxbc::{
     mesh_table::{MeshLayout, shader_resources},
-    rootsig::{RootParamKind, RootSig, parse_rts0},
+    rootsig::{RootParamKind, RootRange, RootSig, parse_rts0},
 };
 use windows::Win32::{
     Foundation::{E_INVALIDARG, E_NOTIMPL, E_POINTER},
@@ -24,9 +24,23 @@ pub(super) fn reflected(
     let Some(layout) = MeshLayout::from_shader(mesh, &root) else {
         return Ok(None);
     };
-    if layout.replacements.is_empty() {
+    // The pixel program carries its own table layout too. Where it differs
+    // from what the title's root declares, the declaration is wrong for that
+    // program: the console never reads it, the desktop does. Only tables
+    // visible to every stage are taken: ProjectScarlett shows no other case.
+    let pixel_tables: Vec<(usize, Vec<RootRange>)> = pixel
+        .and_then(|pixel| MeshLayout::from_pixel_shader(pixel, &root))
+        .into_iter()
+        .flat_map(|layout| layout.replacements)
+        .filter_map(|(index, change)| match change {
+            RootParamKind::Table(ranges) if root.params[index].visibility == 0 => Some((index, ranges)),
+            _ => None,
+        })
+        .collect();
+    if layout.replacements.is_empty() && pixel_tables.is_empty() {
         return Ok(None);
     }
+    let mesh_rewritten: Vec<usize> = layout.replacements.keys().copied().collect();
     let mut lengths = vec![0; root.params.len()];
     let mut accessed_views = Vec::new();
     for ((_, offset), binding) in &layout.tables {
@@ -69,6 +83,24 @@ pub(super) fn reflected(
                 if matches!(range.range_type, 0 | 1) {
                     accessed_views.push((target, start..end));
                 }
+            }
+        }
+    }
+    // Such a table gets a pixel-only copy laid out as the pixel program reads it.
+    for (guest, ranges) in &pixel_tables {
+        if !mirrored.contains(guest) {
+            mirrored.push(*guest);
+        }
+        let position = mirrored.iter().position(|index| index == guest).unwrap_or_default();
+        let target = root.params.len() + position;
+        if lengths.len() <= target {
+            lengths.resize(target + 1, 0);
+        }
+        for range in ranges {
+            let end = range.offset_in_table + 1;
+            lengths[target] = lengths[target].max(end);
+            if range.range_type != 2 {
+                accessed_views.push((target, range.offset_in_table..end));
             }
         }
     }
@@ -144,6 +176,74 @@ pub(super) fn reflected(
                 }
             }
         }
+        // The pixel program's layout of each such table. Filled before any
+        // pointer into it is taken.
+        let mut pixel_storage: Vec<(usize, Vec<D3D12_DESCRIPTOR_RANGE1>)> = Vec::new();
+        for (guest, ranges) in &pixel_tables {
+            let source = originals[*guest];
+            if source.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE {
+                return Err(E_INVALIDARG.into());
+            }
+            let table = source.Anonymous.DescriptorTable;
+            let old = if table.NumDescriptorRanges == 0 || table.pDescriptorRanges.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(table.pDescriptorRanges, table.NumDescriptorRanges as usize)
+            };
+            let storage = ranges
+                .iter()
+                .map(|range| {
+                    let kind = D3D12_DESCRIPTOR_RANGE_TYPE(range.range_type as i32);
+                    D3D12_DESCRIPTOR_RANGE1 {
+                        RangeType: kind,
+                        NumDescriptors: 1,
+                        BaseShaderRegister: range.base_register,
+                        RegisterSpace: range.space,
+                        Flags: old.iter().find(|r| r.RangeType == kind).map(|r| r.Flags).unwrap_or(
+                            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                        ),
+                        OffsetInDescriptorsFromTableStart: range.offset_in_table,
+                    }
+                })
+                .collect();
+            pixel_storage.push((*guest, storage));
+        }
+        let pixel_table = |guest: usize| {
+            pixel_storage.iter().find(|(index, _)| *index == guest).map(|(_, ranges)| D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: ranges.len() as u32,
+                pDescriptorRanges: ranges.as_ptr(),
+            })
+        };
+        // The root the pixel program is translated against: the title's, with
+        // those tables as the program reads them.
+        let pixel_root = if pixel_storage.is_empty() {
+            None
+        } else {
+            let mut for_pixel = originals.clone();
+            for (guest, _) in &pixel_storage {
+                if let Some(table) = pixel_table(*guest) {
+                    for_pixel[*guest].Anonymous.DescriptorTable = table;
+                }
+            }
+            let mut pixel_desc = desc;
+            pixel_desc.Anonymous.Desc_1_1.NumParameters = for_pixel.len() as u32;
+            pixel_desc.Anonymous.Desc_1_1.pParameters = for_pixel.as_ptr();
+            let mut blob = None;
+            D3D12SerializeVersionedRootSignature(&pixel_desc, &mut blob, None)?;
+            let blob = blob.ok_or(E_POINTER)?;
+            Some(RootSource::new(std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast(),
+                blob.GetBufferSize(),
+            )))
+        };
+        // A table only the pixel program reads differently stays as the title
+        // declares it, for the mesh stage: the pixel stage has its own copy.
+        for (guest, _) in &pixel_storage {
+            if !mesh_rewritten.contains(guest) {
+                params[*guest].ShaderVisibility = D3D12_SHADER_VISIBILITY_MESH;
+            }
+        }
         let mut mirrors = Vec::new();
         for &guest in &mirrored {
             let mut copy = originals[guest];
@@ -151,6 +251,9 @@ pub(super) fn reflected(
                 return Err(E_NOTIMPL.into());
             }
             copy.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            if let Some(table) = pixel_table(guest) {
+                copy.Anonymous.DescriptorTable = table;
+            }
             mirrors.push((params.len() as u32, guest as u32));
             params.push(copy);
         }
@@ -172,6 +275,7 @@ pub(super) fn reflected(
             accessed_views,
             index_map: None,
             mirrors,
+            pixel_root,
         })))
     }
 }

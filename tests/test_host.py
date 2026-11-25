@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import Host, claim_package_drive, configure_nvidia_shader_cache, proton_installation, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, Host, claim_package_drive, configure_nvidia_shader_cache, proton_installation, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -65,17 +65,33 @@ class SelectProton(unittest.TestCase):
             runner.symlink_to("proton-launcher")
             self.assertEqual(proton_installation(str(runner)), install)
 
-    def test_registered_steam_library(self):
+    def test_default_is_the_pinned_release(self):
+        for relative in (f"compatibilitytools.d/{PINNED_PROTON}-x86_64",
+                         f"Steam Library/compatibilitytools.d/{PINNED_PROTON}",
+                         f"Steam Library/steamapps/common/{PINNED_PROTON}"):
+            with self.subTest(relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                (root / "steamapps").mkdir()
+                library = root / "Steam Library"
+                (root / "steamapps/libraryfolders.vdf").write_text(
+                    f'"libraryfolders" {{ "0" {{ "path" "{library}" }} }}')
+                install = root / relative
+                install.mkdir(parents=True)
+                (install / "proton").touch()
+                with patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root)}), \
+                        patch.object(Path, "home", return_value=root):
+                    self.assertEqual(proton_installation(None), install)
+
+    def test_another_installed_proton_is_not_a_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
-            (root / "steamapps").mkdir()
-            library = root / "Steam Library"
-            install = library / "steamapps/common/Proton - Experimental"
-            install.mkdir(parents=True)
-            (install / "proton").touch()
-            (root / "steamapps/libraryfolders.vdf").write_text(f'"libraryfolders" {{ "0" {{ "path" "{library}" }} }}')
-            with patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root)}), patch.object(Path, "home", return_value=root):
-                self.assertEqual(proton_installation(None), install)
+            other = root / "steamapps/common/Proton - Experimental"
+            other.mkdir(parents=True)
+            (other / "proton").touch()
+            with patch.dict(os.environ, {"STEAM_COMPAT_CLIENT_INSTALL_PATH": str(root)}), \
+                    patch.object(Path, "home", return_value=root):
+                with self.assertRaisesRegex(ValueError, PINNED_PROTON):
+                    proton_installation(None)
 
     @unittest.skipUnless(sys.platform == "linux", "Wine prefix drive links and POSIX modes require Linux")
     def test_linux_title_drive_uses_prefix_and_preserves_existing_assignment(self):

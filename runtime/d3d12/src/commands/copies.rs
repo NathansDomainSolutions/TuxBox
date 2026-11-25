@@ -50,7 +50,7 @@ pub(super) unsafe extern "system" fn copy_texture(
     flags: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if flags != 0 {
@@ -71,10 +71,14 @@ pub(super) unsafe extern "system" fn copy_texture(
         state.error = error;
         return;
     }
+    if dst.kind == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+        state.record_unknown_write();
+    }
     crate::diagnostics::display::copy(dst.resource);
+    let native = state.native();
     unsafe {
-        (list.native.vtable().CopyTextureRegion)(
-            list.native.as_raw(),
+        (native.vtable().CopyTextureRegion)(
+            native.as_raw(),
             ptr::from_ref(&dst).cast(),
             x,
             y,
@@ -94,7 +98,7 @@ pub(super) unsafe extern "system" fn copy_resource(
     options: u32,
 ) {
     let mut state = recording(list);
-    if !state.can_record(&list.native) {
+    if !state.can_record() {
         return;
     }
     if options != 0 {
@@ -123,7 +127,12 @@ pub(super) unsafe extern "system" fn copy_resource(
             state.error = E_INVALIDARG;
             return;
         }
-        unsafe { list.native.CopyBufferRegion(&dst.native, to, &src.native, from, size) };
+        if let Some(base) = dst.state.guest_address() {
+            state.record_write(base, size);
+        } else {
+            state.record_unknown_write();
+        }
+        unsafe { state.native().CopyBufferRegion(&dst.native, to, &src.native, from, size) };
         return;
     }
     if dst.native == src.native
@@ -142,9 +151,16 @@ pub(super) unsafe extern "system" fn copy_resource(
         state.error = error;
         return;
     }
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        if let Some(base) = dst.state.guest_address() {
+            state.record_write(base, d.Width);
+        } else {
+            state.record_unknown_write();
+        }
+    }
     // SAFETY: both native resources belong to this open command list's device.
     // The guest supplies their copy states via barriers and owns their lifetimes.
-    unsafe { list.native.CopyResource(&dst.native, &src.native) };
+    unsafe { state.native().CopyResource(&dst.native, &src.native) };
     static FIRST_COPY: std::sync::Once = std::sync::Once::new();
     crate::diagnostics::log_once(&FIRST_COPY, || {
         format!(

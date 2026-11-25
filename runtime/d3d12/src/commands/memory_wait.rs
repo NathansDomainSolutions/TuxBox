@@ -1,75 +1,227 @@
-//! Translate waits on host-visible Series fence words at a native list boundary.
-//! The game can write markers and sample timestamps before waiting. Keep these
-//! prefix operations ordered without disturbing bindings on the main command list.
+//! Translate waits on host-visible 64-bit fence words across command list segments.
+//! Supports all eight D3D12 comparison functions, mid-list segment splitting with
+//! bound state replay, one persistent monotonic fence per queue, safe pre-satisfied
+//! wait elision, and cross-queue completion wakeups.
 use super::*;
-use std::sync::atomic::{AtomicI32, AtomicU64};
-use std::sync::mpsc;
-use std::time::Duration;
-use windows::Win32::Foundation::HANDLE;
+use std::ops::Range;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize};
+use std::sync::{Condvar, LazyLock, Once, mpsc};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{HANDLE, WAIT_FAILED};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Result;
 
-pub(super) enum Packet {
-    Marker(D3D12_WRITEBUFFERIMMEDIATE_PARAMETER),
-    Timestamp(ID3D12QueryHeap, u32, ID3D12Resource, u64),
+/// Exact D3D12 comparison predicate for `Wait64BitValueX`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Comparison {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
 }
 
-impl Packet {
-    fn emit(&self, list: &ID3D12GraphicsCommandList) -> Result<()> {
-        unsafe {
-            match self {
-                Self::Marker(write) => {
-                    // Marker-out lands after the preceding work, as the
-                    // bottom-of-pipe write it stands for does.
-                    list.cast::<ID3D12GraphicsCommandList2>()?.WriteBufferImmediate(
-                        1,
-                        write,
-                        Some(&D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT),
-                    );
-                }
-                Self::Timestamp(heap, index, dest, offset) => {
-                    list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *index);
-                    list.ResolveQueryData(
-                        heap,
-                        D3D12_QUERY_TYPE_TIMESTAMP,
-                        *index,
-                        1,
-                        dest,
-                        *offset,
-                    );
-                }
-            }
+impl Comparison {
+    pub(super) fn from_raw(raw: u32) -> Result<Self> {
+        match D3D12_COMPARISON_FUNC(raw as i32) {
+            D3D12_COMPARISON_FUNC_NEVER => Ok(Self::Never),
+            D3D12_COMPARISON_FUNC_LESS => Ok(Self::Less),
+            D3D12_COMPARISON_FUNC_EQUAL => Ok(Self::Equal),
+            D3D12_COMPARISON_FUNC_LESS_EQUAL => Ok(Self::LessEqual),
+            D3D12_COMPARISON_FUNC_GREATER => Ok(Self::Greater),
+            D3D12_COMPARISON_FUNC_NOT_EQUAL => Ok(Self::NotEqual),
+            D3D12_COMPARISON_FUNC_GREATER_EQUAL => Ok(Self::GreaterEqual),
+            D3D12_COMPARISON_FUNC_ALWAYS => Ok(Self::Always),
+            _ => Err(E_INVALIDARG.into()),
         }
-        Ok(())
+    }
+
+    pub(super) fn matches(self, current: u64, target: u64) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Less => current < target,
+            Self::Equal => current == target,
+            Self::LessEqual => current <= target,
+            Self::Greater => current > target,
+            Self::NotEqual => current != target,
+            Self::GreaterEqual => current >= target,
+            Self::Always => true,
+        }
+    }
+
+    /// True when every possible `u64` value already satisfies the predicate.
+    pub(super) fn is_always_satisfied(self, target: u64) -> bool {
+        matches!(self, Self::Always)
+            || (matches!(self, Self::GreaterEqual) && target == 0)
+            || (matches!(self, Self::LessEqual) && target == u64::MAX)
+    }
+
+    /// Monotone upward predicates remain satisfied once reached by a counter.
+    /// Non-monotone predicates (`EQUAL`, `LESS`, `LESS_EQUAL`, `NOT_EQUAL`,
+    /// `NEVER`) are never elided at submission time.
+    pub(super) fn is_monotone(self) -> bool {
+        matches!(self, Self::Greater | Self::GreaterEqual)
+    }
+
+    pub(super) fn symbol(self) -> &'static str {
+        match self {
+            Self::Never => "NEVER",
+            Self::Less => "<",
+            Self::Equal => "==",
+            Self::LessEqual => "<=",
+            Self::Greater => ">",
+            Self::NotEqual => "!=",
+            Self::GreaterEqual => ">=",
+            Self::Always => "ALWAYS",
+        }
     }
 }
 
+/// Guest address ranges written by recorded commands, used to prevent unsafe
+/// submission-time elision when an earlier list or segment modifies a waited word.
 #[derive(Default)]
-pub(super) struct Prefix {
-    pending: Vec<Packet>,
-    in_body: bool,
-    pub(super) segments: Vec<Arc<Segment>>,
+pub(super) struct WrittenRanges {
+    ranges: Vec<Range<u64>>,
+    all: bool,
 }
 
-impl Prefix {
-    pub(super) fn push(&mut self, list: &ID3D12GraphicsCommandList, packet: Packet) -> Result<()> {
-        if self.in_body {
-            return packet.emit(list);
+impl WrittenRanges {
+    const MAX_RANGES: usize = 256;
+
+    pub(super) fn record(&mut self, address: u64, bytes: u64) {
+        if self.all || bytes == 0 {
+            return;
         }
-        self.pending.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
-        self.pending.push(packet);
-        Ok(())
+        let end = address.saturating_add(bytes);
+        let range = address..end;
+        if let Some(existing) = self
+            .ranges
+            .iter_mut()
+            .find(|r| r.start <= range.end && range.start <= r.end)
+        {
+            existing.start = existing.start.min(range.start);
+            existing.end = existing.end.max(range.end);
+            return;
+        }
+        if self.ranges.len() >= Self::MAX_RANGES {
+            self.all = true;
+            self.ranges.clear();
+            return;
+        }
+        self.ranges.push(range);
     }
 
-    pub(super) fn finish(&mut self, list: &ID3D12GraphicsCommandList) -> Result<()> {
-        if self.in_body {
-            return Ok(());
+    pub(super) fn extend_from(&mut self, other: &Self) {
+        if self.all {
+            return;
         }
-        self.in_body = true;
-        for packet in self.pending.drain(..) {
-            packet.emit(list)?;
+        if other.all {
+            self.all = true;
+            self.ranges.clear();
+            return;
         }
-        Ok(())
+        for r in &other.ranges {
+            self.record(r.start, r.end - r.start);
+        }
     }
+
+    pub(super) fn overlaps_word(&self, address: u64) -> bool {
+        if self.all {
+            return true;
+        }
+        let end = address.saturating_add(8);
+        self.ranges
+            .iter()
+            .any(|r| r.start < end && address < r.end)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        !self.all && self.ranges.is_empty()
+    }
+
+    pub(super) fn record_unknown(&mut self) {
+        self.all = true;
+        self.ranges.clear();
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.ranges.clear();
+        self.all = false;
+    }
+}
+
+struct InFlightWrite {
+    device: usize,
+    fence_key: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    writes: WrittenRanges,
+}
+
+// SAFETY: D3D12 fences are free-threaded.
+unsafe impl Send for InFlightWrite {}
+
+const MAX_IN_FLIGHT_WRITES: usize = 256;
+
+static IN_FLIGHT_WRITES: Mutex<Vec<InFlightWrite>> = Mutex::new(Vec::new());
+static IN_FLIGHT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn prune_in_flight(entries: &mut Vec<InFlightWrite>) {
+    entries.retain(|entry| {
+        let done = unsafe { entry.fence.GetCompletedValue() };
+        done < entry.value && done != u64::MAX
+    });
+    IN_FLIGHT_COUNT.store(entries.len(), Ordering::Release);
+}
+
+/// Track writes belonging to a submitted batch until its progress fence retires.
+/// Prevents a later submission from eliding a monotone wait while an earlier
+/// GPU write to the same address is still in flight.
+pub(super) fn record_in_flight_writes(
+    device: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    writes: WrittenRanges,
+) {
+    if writes.is_empty() {
+        return;
+    }
+    let fence_key = fence.as_raw().addr();
+    let mut entries = IN_FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    prune_in_flight(&mut entries);
+    if entries.len() >= MAX_IN_FLIGHT_WRITES
+        && let Some(existing) = entries
+            .iter_mut()
+            .find(|e| e.device == device && e.fence_key == fence_key)
+    {
+        existing.value = existing.value.max(value);
+        existing.writes.extend_from(&writes);
+        IN_FLIGHT_COUNT.store(entries.len(), Ordering::Release);
+        return;
+    }
+    entries.push(InFlightWrite {
+        device,
+        fence_key,
+        fence,
+        value,
+        writes,
+    });
+    IN_FLIGHT_COUNT.store(entries.len(), Ordering::Release);
+}
+
+fn has_in_flight_write(device: usize, address: u64) -> bool {
+    if IN_FLIGHT_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut entries = IN_FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    prune_in_flight(&mut entries);
+    entries
+        .iter()
+        .any(|entry| entry.device == device && entry.writes.overlaps_word(address))
 }
 
 struct Word {
@@ -116,8 +268,8 @@ impl Word {
         unsafe { AtomicU64::from_ptr(self.mapped as *mut u64).load(Ordering::Acquire) }
     }
 
-    fn reached(&self, value: u64) -> bool {
-        self.value() >= value
+    fn matches(&self, comparison: Comparison, target: u64) -> bool {
+        comparison.matches(self.value(), target)
     }
 }
 
@@ -128,22 +280,64 @@ pub(super) struct Segment {
     prefix: Option<(ID3D12CommandList, ID3D12CommandAllocator)>,
     word: Word,
     address: u64,
+    comparison: Comparison,
     target: u64,
+    prior_write_in_list: bool,
+}
+
+impl Segment {
+    pub(super) fn reached(&self) -> bool {
+        self.word.matches(self.comparison, self.target)
+    }
+
+    /// Safe submission-time fast-path check: only elide when no prefix list runs
+    /// before the wait, the predicate is monotone upward, no earlier list,
+    /// segment, or still-in-flight GPU submission wrote to `[address..address+8)`,
+    /// and the memory word already satisfies the predicate right now.
+    pub(super) fn can_elide(&self, device: usize, batch_writes: &WrittenRanges) -> bool {
+        if self.prefix.is_some() || !self.comparison.is_monotone() {
+            return false;
+        }
+        let prior_write = self.prior_write_in_list
+            || batch_writes.overlaps_word(self.address)
+            || has_in_flight_write(device, self.address);
+        can_elide_wait(false, self.comparison, prior_write, self.reached())
+    }
+}
+
+fn can_elide_wait(
+    has_prefix: bool,
+    comparison: Comparison,
+    prior_write_overlaps: bool,
+    already_reached: bool,
+) -> bool {
+    !has_prefix && comparison.is_monotone() && !prior_write_overlaps && already_reached
 }
 
 /// One fence label operation a list recorded.
 #[derive(Clone, Copy)]
 pub(super) struct Label {
-    /// `None` for a write. For a wait, whether it holds the queue (`false` when
-    /// it came after rendering commands and became a barrier).
-    wait: Option<bool>,
+    /// `None` for a write. For a wait, `(holds_queue, comparison)`.
+    wait: Option<(bool, Comparison)>,
     address: u64,
     value: u64,
 }
 
 impl Label {
     pub(super) fn write(address: u64, value: u64) -> Self {
-        Self { wait: None, address, value }
+        Self {
+            wait: None,
+            address,
+            value,
+        }
+    }
+
+    fn wait(holds: bool, comparison: Comparison, address: u64, value: u64) -> Self {
+        Self {
+            wait: Some((holds, comparison)),
+            address,
+            value,
+        }
     }
 }
 
@@ -193,15 +387,15 @@ fn fate(seen: &Seen) -> String {
 
 /// Say which lists should have satisfied a stalled wait, and which waits stand
 /// before it: the one waiting and the one writing.
-fn explain(address: u64, target: u64) {
+fn explain(address: u64, comparison: Comparison, target: u64) {
     let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
     let mut found = 0;
     for seen in history.iter() {
         for (at, label) in seen.labels.iter().enumerate() {
             let matches = label.address == address
                 && match label.wait {
-                    None => label.value >= target,
-                    Some(_) => label.value == target,
+                    None => comparison.matches(label.value, target),
+                    Some((_, cmp)) => cmp == comparison && label.value == target,
                 };
             if !matches || found >= 6 {
                 continue;
@@ -209,21 +403,30 @@ fn explain(address: u64, target: u64) {
             found += 1;
             let earlier: Vec<_> = seen.labels[..at]
                 .iter()
-                .filter(|l| l.wait == Some(true))
-                .map(|l| format!("{:#x}>={:#x}", l.address, l.value))
+                .filter_map(|l| match l.wait {
+                    Some((true, cmp)) => Some(format!("{:#x}{}{:#x}", l.address, cmp.symbol(), l.value)),
+                    _ => None,
+                })
                 .collect();
             crate::diagnostics::log(&format!(
-                "stalled label {address:#x} target {target:#x}: {} by list {:#x} (order {}), {}, after waits [{}]",
+                "stalled label {address:#x} {} {target:#x}: {} by list {:#x} (order {}), {}, after waits [{}]",
+                comparison.symbol(),
                 if label.wait.is_some() { "waited" } else { "written" },
-                seen.list, seen.order, fate(seen), earlier.join(" "),
+                seen.list,
+                seen.order,
+                fate(seen),
+                earlier.join(" "),
             ));
         }
     }
-    if !history.iter().any(|seen| seen.labels.iter().any(|l| {
-        l.wait.is_none() && l.address == address && l.value >= target
-    })) {
+    if !history.iter().any(|seen| {
+        seen.labels
+            .iter()
+            .any(|l| l.wait.is_none() && l.address == address && comparison.matches(l.value, target))
+    }) {
         crate::diagnostics::log(&format!(
-            "stalled label {address:#x} target {target:#x}: no submitted or rejected list writes it"
+            "stalled label {address:#x} {} {target:#x}: no submitted or rejected list writes it",
+            comparison.symbol(),
         ));
     }
 }
@@ -232,7 +435,14 @@ fn explain(address: u64, target: u64) {
 static WAITED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// Log the first waits on each address, then each power of two.
-fn trace_wait(address: u64, target: u64, value: u64, list_type: i32, mid_list: bool) {
+fn trace_wait(
+    address: u64,
+    comparison: Comparison,
+    target: u64,
+    value: u64,
+    list_type: i32,
+    mid_list: bool,
+) {
     let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
     let count = if let Some((_, count)) = waited.iter_mut().find(|(known, _)| *known == address) {
         *count += 1;
@@ -246,7 +456,8 @@ fn trace_wait(address: u64, target: u64, value: u64, list_type: i32, mid_list: b
     drop(waited);
     if count <= 4 || count.is_power_of_two() {
         crate::diagnostics::log(&format!(
-            "memory wait trace #{count} address={address:#x} target={target:#x} value={value:#x} list_type={list_type} mid_list={mid_list}"
+            "memory wait trace #{count} address={address:#x} op={} target={target:#x} value={value:#x} list_type={list_type} mid_list={mid_list}",
+            comparison.symbol()
         ));
     }
 }
@@ -257,7 +468,9 @@ pub(super) fn trace_write(source: &str, address: u64, bytes: u64, value: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .any(|(waited, _)| address < waited.saturating_add(8) && *waited < address.saturating_add(bytes));
+        .any(|(waited, _)| {
+            address < waited.saturating_add(8) && *waited < address.saturating_add(bytes)
+        });
     if hit {
         static COUNT: AtomicU64 = AtomicU64::new(0);
         let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -269,36 +482,61 @@ pub(super) fn trace_write(source: &str, address: u64, bytes: u64, value: u64) {
     }
 }
 
+static FENCES_CREATED: AtomicU64 = AtomicU64::new(0);
+static WAITS_SUBMITTED: AtomicU64 = AtomicU64::new(0);
+static WAITS_ELIDED: AtomicU64 = AtomicU64::new(0);
+static MID_LIST_SPLITS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn note_elided() {
+    WAITS_ELIDED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(super) unsafe extern "system" fn wait_value64(
     list: &List,
     address: u64,
-    comparison: u32,
+    comparison_raw: u32,
     target: u64,
     flags: u32,
 ) {
     let mut state = recording(list);
-    if !state.ensure_open(&list.native) {
+    if !state.ensure_open() {
         return;
     }
     let result = (|| -> Result<()> {
-        if comparison != 7 || flags > 1 {
+        if flags > 1 {
             return Err(E_NOTIMPL.into());
         }
+        let comparison = Comparison::from_raw(comparison_raw)?;
         let word = Word::map(list, address)?;
-        if target == 0 {
+        if comparison.is_always_satisfied(target) {
             return Ok(());
         }
-        let list_type = unsafe { list.native.GetType() }.0;
-        trace_wait(address, target, word.value(), list_type, state.prefix.in_body);
-        let split = !state.prefix.in_body;
-        state.labels.push(Label { wait: Some(split), address, value: target });
-        if state.prefix.in_body {
-            // Honoring this would split the list and replay its bound state.
-            // Order the work already in this list with a global UAV barrier and
-            // continue: a value produced by another queue or the CPU is not
-            // waited for, so later commands can read data before it is ready.
-            // Failing the list would poison the queue and fail Present.
-            if unsafe { list.native.GetType() } != D3D12_COMMAND_LIST_TYPE_COPY {
+        let list_type = state.list_type.0;
+        let mid_list = state.active.has_commands;
+        trace_wait(address, comparison, target, word.value(), list_type, mid_list);
+        if mid_list {
+            if state.can_split_mid_list() {
+                state.segments.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+                let prior_write_in_list = state.written_ranges.overlaps_word(address);
+                let closed = state.split_active()?;
+                MID_LIST_SPLITS.fetch_add(1, Ordering::Relaxed);
+                state
+                    .labels
+                    .push(Label::wait(true, comparison, address, target));
+                state.segments.push(Arc::new(Segment {
+                    prefix: Some(closed),
+                    word,
+                    address,
+                    comparison,
+                    target,
+                    prior_write_in_list,
+                }));
+                return Ok(());
+            }
+            state
+                .labels
+                .push(Label::wait(false, comparison, address, target));
+            if state.list_type != D3D12_COMMAND_LIST_TYPE_COPY {
                 let barrier = D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -308,116 +546,344 @@ pub(super) unsafe extern "system" fn wait_value64(
                         }),
                     },
                 };
-                // SAFETY: the list is open, and a null resource names every UAV.
-                unsafe { list.native.ResourceBarrier(&[barrier]) };
+                // SAFETY: the active list is open, and a null resource names every UAV.
+                unsafe { state.native().ResourceBarrier(&[barrier]) };
             }
-            static FIRST: std::sync::Once = std::sync::Once::new();
-            crate::diagnostics::log_once(&FIRST, || format!(
-                "GPU memory wait {address:#x} >= {target:#x} after rendering commands replaced by a barrier"
-            ));
+            let reason = state.split_fallback_reason();
+            static FIRST: Once = Once::new();
+            crate::diagnostics::log_once(&FIRST, || {
+                format!(
+                    "GPU memory wait {address:#x} {} {target:#x} replaced by a barrier ({reason})",
+                    comparison.symbol()
+                )
+            });
             return Ok(());
         }
+        state.segments.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+        let prior_write_in_list = state.written_ranges.overlaps_word(address);
         state
-            .prefix
-            .segments
-            .try_reserve(1)
-            .map_err(|_| E_OUTOFMEMORY)?;
-        let prefix = if state.prefix.pending.is_empty() {
-            None
-        } else {
-            let mut device: Option<ID3D12Device> = None;
-            unsafe {
-                list.native.GetDevice(&mut device)?;
-            }
-            let device = device.ok_or(E_FAIL)?;
-            let kind = unsafe { list.native.GetType() };
-            let allocator: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(kind)? };
-            let native: ID3D12GraphicsCommandList =
-                unsafe { device.CreateCommandList(0, kind, &allocator, None)? };
-            for packet in state.prefix.pending.drain(..) {
-                packet.emit(&native)?;
-            }
-            unsafe {
-                native.Close()?;
-            }
-            Some((native.into(), allocator))
-        };
-        state.prefix.segments.push(Arc::new(Segment {
-            prefix,
+            .labels
+            .push(Label::wait(true, comparison, address, target));
+        state.segments.push(Arc::new(Segment {
+            prefix: None,
             word,
             address,
+            comparison,
             target,
+            prior_write_in_list,
         }));
         Ok(())
     })();
     if let Err(error) = result {
+        let op = Comparison::from_raw(comparison_raw)
+            .map(Comparison::symbol)
+            .unwrap_or("INVALID");
         crate::diagnostics::recording_error(format_args!(
-            "64-bit GPU memory wait {address:#x} >= {target:#x} ({:?})",
+            "64-bit GPU memory wait {address:#x} {op} {target:#x} ({:?})",
             error.code()
         ));
         state.error = error.code();
     }
 }
 
-/// Waits the queue workers are polling right now: queue type, label, target.
-static ACTIVE: std::sync::Mutex<Vec<(i32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+/// Shared wakeup notifier for cross-queue memory waits.
+struct Notifier {
+    epoch: Mutex<u64>,
+    ready: Condvar,
+}
 
-fn active() -> std::sync::MutexGuard<'static, Vec<(i32, u64, u64)>> {
+impl Notifier {
+    const fn new() -> Self {
+        Self {
+            epoch: Mutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        *self.epoch.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn notify_all(&self) {
+        let mut epoch = self.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        *epoch = epoch.wrapping_add(1);
+        self.ready.notify_all();
+    }
+
+    fn wait_timeout(&self, seen: u64, timeout: Duration) {
+        let guard = self.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard != seen {
+            return;
+        }
+        let _ = self.ready.wait_timeout(guard, timeout);
+    }
+}
+
+static NOTIFIER: Notifier = Notifier::new();
+static ACTIVE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+// D3D12 can retain SetEventOnCompletion registrations across queue lifetimes.
+// Keep one process-lifetime event handle valid forever and bridge it into NOTIFIER.
+static WAKE_EVENT: LazyLock<Result<OwnedHandle>> = LazyLock::new(|| {
+    let handle = unsafe { CreateEventW(None, false, false, None)? };
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+});
+
+fn wake_event() -> Option<HANDLE> {
+    static BRIDGE: Once = Once::new();
+    let handle = WAKE_EVENT.as_ref().ok().map(|e| HANDLE(e.as_raw_handle()))?;
+    BRIDGE.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("TuxBox wait wakeup".into())
+            .spawn(move || {
+                let Some(event) = WAKE_EVENT.as_ref().ok().map(|e| HANDLE(e.as_raw_handle())) else {
+                    return;
+                };
+                loop {
+                    if unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_FAILED {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    notify_waiters();
+                }
+            });
+    });
+    Some(handle)
+}
+
+/// Wake any memory-wait worker sleeping for cross-queue or fence progress.
+/// Zero-lock fast path when no queue is actively waiting.
+pub(crate) fn notify_waiters() {
+    if ACTIVE_WAITERS.load(Ordering::SeqCst) != 0 {
+        NOTIFIER.notify_all();
+    }
+}
+
+/// Waits the queue workers are polling right now: queue type, label, comparison, target.
+static ACTIVE: std::sync::Mutex<Vec<(i32, u64, Comparison, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn active() -> std::sync::MutexGuard<'static, Vec<(i32, u64, Comparison, u64)>> {
     ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct ActiveWaitGuard {
+    held: (i32, u64, Comparison, u64),
+}
+
+impl ActiveWaitGuard {
+    fn enter(held: (i32, u64, Comparison, u64)) -> Self {
+        ACTIVE_WAITERS.fetch_add(1, Ordering::SeqCst);
+        active().push(held);
+        Self { held }
+    }
+}
+
+impl Drop for ActiveWaitGuard {
+    fn drop(&mut self) {
+        let mut waiting = active();
+        if let Some(at) = waiting.iter().position(|&w| w == self.held) {
+            waiting.swap_remove(at);
+        }
+        drop(waiting);
+        ACTIVE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct WorkerEvent(Option<OwnedHandle>);
+
+impl WorkerEvent {
+    fn new() -> Result<Self> {
+        let handle = unsafe { CreateEventW(None, false, false, None)? };
+        Ok(Self(Some(unsafe { OwnedHandle::from_raw_handle(handle.0) })))
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.0
+            .as_ref()
+            .map_or(HANDLE::default(), |h| HANDLE(h.as_raw_handle()))
+    }
+
+    fn wait_for_fence(
+        &mut self,
+        fence: &ID3D12Fence,
+        value: u64,
+        device: &ID3D12Device,
+    ) -> Result<()> {
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            return Err(unsafe { device.GetDeviceRemovedReason() }
+                .err()
+                .unwrap_or_else(|| E_FAIL.into()));
+        }
+        if completed >= value {
+            return Ok(());
+        }
+        let event = self.handle();
+        if event.is_invalid() {
+            unsafe { fence.SetEventOnCompletion(value, HANDLE::default())? };
+        } else {
+            unsafe { fence.SetEventOnCompletion(value, event)? };
+            if unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_FAILED {
+                // Keep the handle alive if D3D12 still retains a pending registration.
+                if unsafe { fence.GetCompletedValue() } < value {
+                    std::mem::forget(self.0.take());
+                }
+                return Err(E_FAIL.into());
+            }
+        }
+        if unsafe { fence.GetCompletedValue() } == u64::MAX {
+            return Err(unsafe { device.GetDeviceRemovedReason() }
+                .err()
+                .unwrap_or_else(|| E_FAIL.into()));
+        }
+        Ok(())
+    }
 }
 
 struct Job {
     kind: i32,
     fence: ID3D12Fence,
+    signal_val: u64,
+    release_val: u64,
     segment: Arc<Segment>,
     device: ID3D12Device,
     /// Unreleased label waits of the batch this one belongs to.
     waits: Option<crate::device::placement::held::Waits>,
 }
 
-pub(super) struct Worker(mpsc::Sender<Job>);
+impl Job {
+    fn release_wait(&mut self) {
+        if let Some(waits) = self.waits.take() {
+            waits.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.release_wait();
+    }
+}
+
+/// RAII guard for batch waits not yet handed off to a queued worker `Job`.
+pub(super) struct PendingWaits {
+    waits: Option<crate::device::placement::held::Waits>,
+    remaining: usize,
+}
+
+impl PendingWaits {
+    pub(super) fn new(
+        waits: Option<crate::device::placement::held::Waits>,
+        remaining: usize,
+    ) -> Self {
+        Self { waits, remaining }
+    }
+
+    fn take_one(&mut self) -> Option<crate::device::placement::held::Waits> {
+        debug_assert!(self.remaining > 0);
+        self.remaining = self.remaining.saturating_sub(1);
+        self.waits.clone()
+    }
+}
+
+impl Drop for PendingWaits {
+    fn drop(&mut self) {
+        if self.remaining != 0
+            && let Some(waits) = &self.waits
+        {
+            waits.fetch_sub(self.remaining, Ordering::AcqRel);
+        }
+    }
+}
+
+pub(super) struct Worker {
+    sender: mpsc::Sender<Job>,
+    fence: ID3D12Fence,
+    next_pair: AtomicU64,
+}
+
+fn next_monotonic_pair(counter: &AtomicU64) -> Result<(u64, u64)> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current >= u64::MAX - 2 {
+            return Err(E_FAIL.into());
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 2,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok((current + 1, current + 2)),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 impl Worker {
-    fn new(error: Arc<AtomicI32>) -> Result<Self> {
+    fn new(device: &ID3D12Device, error: Arc<AtomicI32>) -> Result<Self> {
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? };
+        FENCES_CREATED.fetch_add(1, Ordering::Relaxed);
+        let mut fence_event = WorkerEvent::new()?;
         let (sender, jobs) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("TuxBox GPU memory waits".into())
             .spawn(move || {
-                for job in jobs {
+                for mut job in jobs {
                     let result = (|| -> Result<()> {
-                        unsafe { job.fence.SetEventOnCompletion(1, HANDLE::default())? };
-                        let started = std::time::Instant::now();
-                        let held = (job.kind, job.segment.address, job.segment.target);
-                        active().push(held);
-                        while !job.segment.word.reached(job.segment.target) {
-                            unsafe {
-                                job.device.GetDeviceRemovedReason()?;
+                        fence_event.wait_for_fence(&job.fence, job.signal_val, &job.device)?;
+                        if !job.segment.reached() {
+                            let started = Instant::now();
+                            let held = (
+                                job.kind,
+                                job.segment.address,
+                                job.segment.comparison,
+                                job.segment.target,
+                            );
+                            let _guard = ActiveWaitGuard::enter(held);
+                            while !job.segment.reached() {
+                                unsafe {
+                                    job.device.GetDeviceRemovedReason()?;
+                                }
+                                let elapsed = started.elapsed();
+                                if elapsed >= STALL {
+                                    // Nothing wrote the value, for example because
+                                    // the work that should have was dropped. A queue
+                                    // held forever trips the title's GPU watchdog.
+                                    report_stall(
+                                        job.segment.address,
+                                        job.segment.comparison,
+                                        job.segment.target,
+                                        job.segment.word.value(),
+                                    );
+                                    break;
+                                }
+                                wait_for_progress(
+                                    &job.segment,
+                                    elapsed,
+                                    STALL.saturating_sub(elapsed),
+                                );
                             }
-                            if started.elapsed() >= STALL {
-                                // Nothing wrote the value, for example because
-                                // the work that should have was dropped. A queue
-                                // held forever trips the title's GPU watchdog.
-                                report_stall(job.segment.address, job.segment.target, job.segment.word.value());
-                                break;
-                            }
-                            pause(started.elapsed());
                         }
-                        let mut waiting = active();
-                        if let Some(at) = waiting.iter().position(|&w| w == held) {
-                            waiting.swap_remove(at);
+                        unsafe {
+                            job.fence.Signal(job.release_val)?;
                         }
-                        drop(waiting);
-                        unsafe { job.fence.Signal(2)?; }
-                        if let Some(waits) = &job.waits {
-                            waits.fetch_sub(1, Ordering::AcqRel);
-                        }
-                        static FIRST: std::sync::Once = std::sync::Once::new();
-                        crate::diagnostics::log_once(&FIRST, || format!(
-                            "GPU memory wait completed target={:#x}", job.segment.target
-                        ));
+                        notify_waiters();
+                        job.release_wait();
+                        static FIRST: Once = Once::new();
+                        crate::diagnostics::log_once(&FIRST, || {
+                            format!(
+                                "GPU memory wait completed {} {:#x}",
+                                job.segment.comparison.symbol(),
+                                job.segment.target
+                            )
+                        });
                         Ok(())
                     })();
                     if let Err(cause) = result {
+                        // Drop of `job` and any remaining queued `Job`s in `jobs`
+                        // releases every outstanding `placement::held::Waits` count.
                         let _ = error.compare_exchange(
                             S_OK.0,
                             cause.code().0,
@@ -433,32 +899,56 @@ impl Worker {
                 }
             })
             .map_err(|_| E_OUTOFMEMORY)?;
-        Ok(Self(sender))
+        Ok(Self {
+            sender,
+            fence,
+            next_pair: AtomicU64::new(0),
+        })
+    }
+
+    fn next_gate(&self) -> Result<(u64, u64)> {
+        next_monotonic_pair(&self.next_pair)
     }
 }
 
-/// How long a wait is polled before the worker starts sleeping. Most labels
-/// are written within this time, and a one-millisecond sleep would then be the
-/// largest part of handing work from one queue to another.
-const SPIN: Duration = Duration::from_millis(2);
+/// Brief active poll window for sub-millisecond cross-queue handoffs before
+/// parking on the completion notifier.
+const SPIN: Duration = Duration::from_micros(750);
 
-/// Wait a moment before reading a label again.
-fn pause(elapsed: Duration) {
+/// Maximum bounded sleep per iteration when no D3D12 completion event fires
+/// (for example, a direct CPU write or an unsatisfied wait approaching timeout).
+const WAIT_STEP: Duration = Duration::from_millis(1);
+
+fn wait_for_progress(segment: &Segment, elapsed: Duration, remaining: Duration) {
     if elapsed < SPIN {
+        for _ in 0..16 {
+            std::hint::spin_loop();
+            if segment.reached() {
+                return;
+            }
+        }
         std::thread::yield_now();
-    } else {
-        std::thread::sleep(Duration::from_millis(1));
+        return;
     }
+    let epoch = NOTIFIER.epoch();
+    if let Some(event) = wake_event() {
+        super::queue_trace::arm_progress_wake(event);
+    }
+    if segment.reached() {
+        return;
+    }
+    NOTIFIER.wait_timeout(epoch, remaining.min(WAIT_STEP));
 }
 
 /// Report a released wait: the first eight, then each power of two.
-fn report_stall(address: u64, target: u64, value: u64) {
-    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn report_stall(address: u64, comparison: Comparison, target: u64, value: u64) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
     let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 8 || count.is_power_of_two() {
         crate::diagnostics::log(&format!(
-            "GPU memory wait released after {}s without reaching its target (#{count}): address={address:#x} target={target:#x} value={value:#x}",
-            STALL.as_secs()
+            "GPU memory wait released after {}s without reaching its target (#{count}): address={address:#x} op={} target={target:#x} value={value:#x}",
+            STALL.as_secs(),
+            comparison.symbol(),
         ));
     }
     if count == 1 {
@@ -466,14 +956,15 @@ fn report_stall(address: u64, target: u64, value: u64) {
         // each, the lists that should release it.
         super::queue_trace::report();
         let held = active().clone();
-        for (kind, address, target) in held {
+        for (kind, address, cmp, target) in held {
             crate::diagnostics::log(&format!(
-                "held queue of type {kind}: waiting for {address:#x} >= {target:#x}"
+                "held queue of type {kind}: waiting for {address:#x} {} {target:#x}",
+                cmp.symbol()
             ));
-            explain(address, target);
+            explain(address, cmp, target);
         }
     } else if count <= 8 {
-        explain(address, target);
+        explain(address, comparison, target);
     }
 }
 
@@ -483,7 +974,7 @@ pub(super) unsafe fn submit(
     queue: &Queue,
     host: &[*mut c_void],
     splits: Splits,
-    waits: Option<crate::device::placement::held::Waits>,
+    mut pending: PendingWaits,
 ) -> Result<()> {
     let run = |lists: &[*mut c_void]| {
         if !lists.is_empty() {
@@ -496,46 +987,60 @@ pub(super) unsafe fn submit(
             };
         }
     };
+    if splits.is_empty() {
+        run(host);
+        return Ok(());
+    }
+    let mut device: Option<ID3D12Device> = None;
+    unsafe {
+        queue.native.GetDevice(&mut device)?;
+    }
+    let device = device.ok_or(E_FAIL)?;
+    let worker = match queue.state.wait_worker.get() {
+        Some(worker) => worker,
+        None => {
+            let new = Worker::new(&device, queue.state.placement.error.clone())?;
+            queue.state.wait_worker.get_or_init(|| new)
+        }
+    };
     let mut start = 0;
     for (index, segment) in splits {
         run(&host[start..index]);
         start = index;
-        let mut device: Option<ID3D12Device> = None;
-        unsafe {
-            queue.native.GetDevice(&mut device)?;
-        }
-        let device = device.ok_or(E_FAIL)?;
-        let fence = unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)? };
-        let worker = match queue.state.wait_worker.get() {
-            Some(worker) => worker,
-            None => {
-                let new = Worker::new(queue.state.placement.error.clone())?;
-                queue.state.wait_worker.get_or_init(|| new)
-            }
-        };
-        if let Some((prefix, _)) = &segment.prefix {
+        if let Some((prefix, _allocator)) = &segment.prefix {
             run(&[prefix.as_raw()]);
         }
-        // Fence 1 retires the entire prefix before the CPU reads the guest word.
-        // Fence 2 holds the suffix on the GPU without blocking the guest submission thread.
+        let (signal_val, release_val) = worker.next_gate()?;
+        WAITS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+        // `signal_val` retires the prefix before the CPU reads the guest word.
+        // `release_val` holds the suffix on the GPU without blocking the submission thread.
         unsafe {
-            queue.native.Signal(&fence, 1)?;
+            queue.native.Signal(&worker.fence, signal_val)?;
         }
-        worker
-            .0
-            .send(Job {
-                kind: queue.state.kind.0,
-                fence: fence.clone(),
-                segment,
-                device,
-                waits: waits.clone(),
-            })
-            .map_err(|_| E_FAIL)?;
+        let job = Job {
+            kind: queue.state.kind.0,
+            fence: worker.fence.clone(),
+            signal_val,
+            release_val,
+            segment,
+            device: device.clone(),
+            waits: pending.take_one(),
+        };
+        worker.sender.send(job).map_err(|_| E_FAIL)?;
         unsafe {
-            queue.native.Wait(&fence, 2)?;
-            super::queue_trace::waited(&queue.native, "hold for a title fence label", &fence, 2);
+            queue.native.Wait(&worker.fence, release_val)?;
+            super::queue_trace::waited(
+                &queue.native,
+                "hold for a title fence label",
+                &worker.fence,
+                release_val,
+            );
         }
     }
     run(&host[start..]);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/commands/memory_wait.rs"]
+mod tests;

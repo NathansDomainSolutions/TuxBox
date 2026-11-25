@@ -78,7 +78,7 @@ pub(super) unsafe extern "system" fn ranges(
                 Ranges::read(src_count, src, src_sizes)
             })
     {
-        let stride = unsafe { device.native.GetDescriptorHandleIncrementSize(kind) } as usize;
+        let stride = super::guest_increment_size(device, kind) as usize;
         if stride != 0
             && let Some(count) = to.count(stride)
             && Some(count) == from.count(stride)
@@ -131,8 +131,8 @@ unsafe fn copy_host_range(device: &Device, count: u32, dst: D3D12_CPU_DESCRIPTOR
     let registry = &device.state.descriptor_arenas;
     let arena = registry.find(dst.ptr);
     let translated = arena.as_ref().map_or(dst, |a| a.cpu(dst.ptr));
-    if count > 1 && kind == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && registry.find(src.ptr).is_some() {
-        let stride = unsafe { device.native.GetDescriptorHandleIncrementSize(kind) } as usize;
+    if count > 1 && kind == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && (arena.is_some() || registry.find(src.ptr).is_some()) {
+        let stride = super::guest_increment_size(device, kind) as usize;
         for i in 0..count as usize {
             let offset = i * stride;
             unsafe { copy_host_range(device, 1, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: dst.ptr + offset },

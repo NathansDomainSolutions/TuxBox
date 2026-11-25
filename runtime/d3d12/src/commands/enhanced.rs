@@ -150,23 +150,20 @@ pub(super) unsafe extern "system" fn barrier(
     groups: *const D3D12_BARRIER_GROUP,
 ) {
     let mut state = recording(list);
-    if count == 0 || !state.can_record(&list.native) {
+    if count == 0 || !state.prepare_state() {
         return;
     }
+    state.active.has_commands = true;
     if groups.is_null() {
         state.error = E_INVALIDARG;
         return;
     }
-    let Some(native) = list
-        .state
-        .enhanced_barriers
-        .get_or_init(|| enhanced_barriers(&list.native))
-    else {
+    let Some(native) = state.enhanced_barriers().cloned() else {
         state.error = E_NOTIMPL;
         return;
     };
     if let Err(error) =
-        unsafe { record(list, native, slice::from_raw_parts(groups, count as usize)) }
+        unsafe { record(list, &native, slice::from_raw_parts(groups, count as usize)) }
     {
         crate::diagnostics::recording_error(format_args!(
             "enhanced resource barrier group ({error:?})"

@@ -312,3 +312,27 @@ fn compute_group_ids_follow_the_last_launch_argument() {
     assert_eq!(end(&[table, [9, 0, 1, 0, 0x0c]]), None); // unknown argument
     assert_eq!(end(&[]), None);
 }
+
+#[test]
+fn vertex_table_parameter_follows_the_shaders_own_records() {
+    let mut ex = super::super::mesh::heap_extract(&[], 0, &[]);
+    ex.stage = Stage::Vertex;
+    // A fetch-call vertex shader: an SRV in table 0 (s8), a CBV and an SRV in table 1 (s9).
+    ex.fssm = fssm(&[], &[[0x300, 0, 3, 0, 0x808], [0x302, 8, 22, 0, 0x10904], [0x300, 16, 92, 0, 0x10908]]);
+    assert_eq!(vertex_table_parameter(&ex, 8), Some(0));
+    assert_eq!(vertex_table_parameter(&ex, 9), Some(1));
+    // No record for the register: the chained-entry rule still decides.
+    assert_eq!(vertex_table_parameter(&ex, 19), None);
+    // Root constants and root descriptors in a register do not make it a table.
+    ex.fssm = fssm(&[], &[[2, 0, 500, 0, 0x20a04], [0x100, 0, 9, 0, 0x30b04]]);
+    assert_eq!(vertex_table_parameter(&ex, 10), None);
+    assert_eq!(vertex_table_parameter(&ex, 11), None);
+    // Records that disagree about the parameter are not trusted.
+    ex.fssm = fssm(&[], &[[0x300, 0, 3, 0, 0x10908], [0x302, 8, 5, 0, 0x20904]]);
+    assert_eq!(vertex_table_parameter(&ex, 9), None);
+    // Other stages keep their own register conventions.
+    ex.fssm = fssm(&[], &[[0x300, 0, 3, 0, 0x10908]]);
+    assert_eq!(vertex_table_parameter(&ex, 9), Some(1));
+    ex.stage = Stage::Pixel;
+    assert_eq!(vertex_table_parameter(&ex, 9), None);
+}

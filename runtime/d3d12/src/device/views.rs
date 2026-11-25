@@ -18,6 +18,8 @@ use addressed::placed_view;
 pub(super) use addressed::address_srv;
 pub(super) use addressed::AddressUav;
 pub(super) use addressed::address_uav;
+#[cfg(test)]
+use creation::default_texture_uav_desc;
 pub(super) use creation::srv;
 pub(super) use creation::uav;
 pub(super) use creation::rtv;
@@ -90,7 +92,7 @@ impl TextureAddress {
 
     pub(super) fn register(device: &Device, native: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> std::sync::Arc<Self> {
         use windows::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_NOACCESS};
-        let size = unsafe { device.native.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) }.SizeInBytes;
+        let size = super::allocation::allocation_info_for(&device.native, 0, desc).SizeInBytes;
         let base = unsafe { VirtualAlloc(None, size as usize, MEM_RESERVE, PAGE_NOACCESS) }.addr();
         Self::at(device, native, base, true, None)
     }

@@ -79,6 +79,10 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
     // Mirrors exist only when a constant-buffer or address-SRV import failed.
     // The count is zero for every boot that has not hit that path.
     crate::device::snapshot_cbv_mirrors();
+    let device_key = parent(&queue.parent).addr();
+    // A guest Reset can replace the tail of a split recording. Hold every
+    // such tail through ExecuteCommandLists just as each wait owns its prefix.
+    let mut tails = Vec::new();
     let mut list_index = 0;
     let trace_samples = std::cell::RefCell::new(Vec::new());
     // The lists in this batch that write or wait on fence labels.
@@ -91,14 +95,15 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
             Vec::new(),
             Vec::new(),
             memory_wait::Splits::new(),
+            memory_wait::WrittenRanges::default(),
             device::descriptor_paging::PendingSubmissions::new(),
         ),
-        |&item, (textures, writes, shader_views, scene_lists, splits, pending)| {
+        |&item, (textures, writes, shader_views, scene_lists, splits, batch_writes, pending)| {
             let list = unsafe { guest_list(item, parent(&queue.parent)) }.ok_or(E_INVALIDARG)?;
             let state = recording(list);
             if !matches!(state.phase, ListState::Closed)
                 || state.error.is_err()
-                || unsafe { list.native.GetType() } != queue.state.kind
+                || state.list_type != queue.state.kind
             {
                 return Err(E_INVALIDARG);
             }
@@ -128,8 +133,15 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                 use std::fmt::Write;
                 let _ = write!(batch.borrow_mut(), " {:#x}", ptr::from_ref(list).addr());
             }
-            splits.try_reserve(state.prefix.segments.len()).map_err(|_| E_OUTOFMEMORY)?;
-            splits.extend(state.prefix.segments.iter().map(|s| (list_index, s.clone())));
+            splits.try_reserve(state.segments.len()).map_err(|_| E_OUTOFMEMORY)?;
+            for segment in &state.segments {
+                if segment.can_elide(device_key, batch_writes) {
+                    memory_wait::note_elided();
+                } else {
+                    splits.push((list_index, segment.clone()));
+                }
+            }
+            batch_writes.extend_from(&state.written_ranges);
             list_index += 1;
             if !state.scene_commands.is_empty() {
                 scene_lists.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
@@ -145,9 +157,13 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
             writes.extend(state.placed_writes.iter().cloned());
             shader_views.extend(state.sampled_heaps.iter().cloned());
             trace_samples.borrow_mut().extend(state.trace_samples.iter().cloned());
-            Ok(list.native.as_raw())
+            if state.native() != &list.native {
+                tails.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+                tails.push(state.native().clone());
+            }
+            Ok(state.native().as_raw())
         },
-        |host, (mut textures, mut writes, shader_views, scene_lists, splits, mut pending)| {
+        |host, (mut textures, mut writes, shader_views, scene_lists, splits, batch_writes, mut pending)| {
             let holds = (!splits.is_empty())
                 .then(|| placement::held::Waits::new(splits.len().into()));
             let waits = holds.clone();
@@ -161,6 +177,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                     &shader_views,
                     holds,
                     || {
+                        let pending_waits = memory_wait::PendingWaits::new(waits, splits.len());
                         // Placement dependencies are settled. Publish scene writes and
                         // snapshot each instance table in recorded order across lists.
                         let submission = if scene_lists.is_empty() {
@@ -180,7 +197,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                         } else {
                             None
                         };
-                        memory_wait::submit(queue, host, splits, waits)?;
+                        memory_wait::submit(queue, host, splits, pending_waits)?;
                         if let Some(rf) = retire {
                             let val = rf.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             let val = if val == u64::MAX { 1 } else { val };
@@ -195,12 +212,33 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                                 val,
                             );
                         }
-                        queue_trace::note(
+                        let progress = queue_trace::note(
                             &queue.native,
                             queue.state.kind.0,
                             format!("batch of {count} lists, with labels:{}", batch.borrow()),
                             None,
                         );
+                        if !batch_writes.is_empty() {
+                            if let Some((fence, value)) = progress {
+                                memory_wait::record_in_flight_writes(
+                                    device_key,
+                                    fence,
+                                    value,
+                                    batch_writes,
+                                );
+                            } else {
+                                let rf = queue.state.retire_fence(&queue.native)?;
+                                let val = rf.next.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                                let val = if val == u64::MAX { 1 } else { val };
+                                queue.native.Signal(&rf.fence, val)?;
+                                memory_wait::record_in_flight_writes(
+                                    device_key,
+                                    rf.fence.clone(),
+                                    val,
+                                    batch_writes,
+                                );
+                            }
+                        }
                         if !trace_samples.borrow().is_empty() {
                             let mut device: Option<ID3D12Device> = None;
                             queue.native.GetDevice(&mut device)?;
@@ -268,7 +306,7 @@ pub(super) unsafe extern "system" fn queue_fence<const WAIT: bool>(
     };
     let status = unsafe { method(queue.native.as_raw(), fence.as_raw(), value) };
     if status.is_ok() {
-        queue_trace::note(
+        let _ = queue_trace::note(
             &queue.native,
             queue.state.kind.0,
             if WAIT { "title wait".into() } else { "title signal".into() },

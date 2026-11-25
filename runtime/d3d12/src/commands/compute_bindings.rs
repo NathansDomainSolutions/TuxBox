@@ -260,7 +260,7 @@ impl Bindings {
     }
 
     pub(super) fn with_reflected_table<const COMPUTE: bool>(
-        &self, table: &ComputeTable, guest: &super::List,
+        &self, table: &ComputeTable, guest: &super::List, list: &ID3D12GraphicsCommandList,
         arena: Option<&Arc<crate::device::descriptor_paging::Arena>>,
         leases: &mut crate::device::descriptor_paging::DescriptorLeases,
         heap: Option<&super::descriptors::ResourceHeap>, reads: &mut Vec<std::ops::Range<usize>>,
@@ -299,7 +299,6 @@ impl Bindings {
             }
             None
         };
-        let list = &guest.native;
         unsafe {
             if COMPUTE {
                 list.SetComputeRootSignature(&table.native);
@@ -515,6 +514,43 @@ impl Bindings {
             host.SetComputeRootSignature(self.compute.as_ref());
             self.apply_compute_args(host, &[]);
         }
+    }
+
+    pub(super) unsafe fn replay(
+        &self,
+        active: &super::recording::ActiveList,
+        include_graphics: bool,
+    ) -> Result<()> {
+        let host = &active.native;
+        unsafe {
+            if !self.heaps.is_empty() {
+                host.SetDescriptorHeaps(&self.heaps);
+            }
+            if let Some(compute) = &self.compute {
+                host.SetComputeRootSignature(compute);
+                self.apply_compute_args(host, &[]);
+            }
+            if include_graphics
+                && let Some(graphics) = &self.graphics
+            {
+                host.SetGraphicsRootSignature(graphics);
+                self.apply_graphics_arguments(host);
+                for (&slot, &base) in &self.graphics_tables {
+                    host.SetGraphicsRootDescriptorTable(slot, base.native);
+                }
+            }
+            match self.pipeline.as_ref() {
+                Some(Pipeline::Regular(pso, _, _, _, _)) => host.SetPipelineState(pso),
+                Some(Pipeline::Ray(pso)) => {
+                    let rt = active
+                        .raytracing()
+                        .ok_or(windows::Win32::Foundation::E_NOINTERFACE)?;
+                    rt.SetPipelineState1(pso);
+                }
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     pub(super) unsafe fn restore(&self, host: &ID3D12GraphicsCommandList4) {

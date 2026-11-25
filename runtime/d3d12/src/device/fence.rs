@@ -45,25 +45,28 @@ fn event() -> Result<HANDLE> {
         .map_err(Clone::clone)
 }
 
-fn refresh(word: &Word) -> u64 {
+fn refresh(word: &Word) -> (u64, bool) {
     let value = unsafe { word.native.GetCompletedValue() };
     // MONITORX waiters can wake on a write of the existing value as well.
-    if word.value.load(Ordering::Relaxed) != value {
+    let changed = word.value.load(Ordering::Relaxed) != value;
+    if changed {
         word.value.store(value, Ordering::Release);
     }
-    value
+    (value, changed)
 }
 
 fn monitor() {
     let event = event().expect("completion event created before worker");
     loop {
+        let mut any_changed = false;
         {
             let mut state = MONITOR.lock().unwrap_or_else(|e| e.into_inner());
             state.watches.retain_mut(|watch| {
                 let Some(word) = watch.word.upgrade() else {
                     return false;
                 };
-                let value = refresh(&word);
+                let (value, changed) = refresh(&word);
+                any_changed |= changed;
                 if let Some(next) = value.checked_add(1)
                     && watch.target != Some(next)
                 {
@@ -76,8 +79,15 @@ fn monitor() {
             });
             if state.watches.is_empty() {
                 state.running = false;
+                if any_changed {
+                    drop(state);
+                    crate::commands::memory_wait::notify_waiters();
+                }
                 return;
             }
+        }
+        if any_changed {
+            crate::commands::memory_wait::notify_waiters();
         }
         // D3D12 also permits rewinding a fence. Such a write cannot satisfy
         // an upward event threshold, so periodically reconcile it as well.
@@ -91,7 +101,7 @@ fn address(this: &Fence) -> Result<*const u64> {
     let event = event()?;
     let mut state = MONITOR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(word) = this.state.get() {
-        refresh(word);
+        let _ = refresh(word);
         return Ok(word.value.as_ptr());
     }
     let word = Arc::new(Word {
@@ -172,14 +182,15 @@ mod stalls {
 unsafe extern "system" fn signal(this: &Fence, value: u64) -> HRESULT {
     let host = &this.native;
     let hr = unsafe { (host.vtable().Signal)(host.as_raw(), value) };
-    if hr.is_ok()
-        && let Some(word) = this.state.get()
-    {
-        let _guard = MONITOR.lock().unwrap_or_else(|e| e.into_inner());
-        refresh(word);
-        if let Ok(event) = event() {
-            let _ = unsafe { SetEvent(event) };
+    if hr.is_ok() {
+        if let Some(word) = this.state.get() {
+            let _guard = MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = refresh(word);
+            if let Ok(event) = event() {
+                let _ = unsafe { SetEvent(event) };
+            }
         }
+        crate::commands::memory_wait::notify_waiters();
     }
     hr
 }

@@ -33,6 +33,8 @@ pub(super) struct DxgiDevice {
     pub(super) media: super::media::Sources,
     pub(super) placements: super::placement::Placements,
     pub(super) emulate_stencil: OnceLock<bool>,
+    packed_uav_native: OnceLock<(bool, bool)>,
+    pub(super) init_transition: std::sync::Mutex<Option<super::allocation::InitTransition>>,
     wave_range: OnceLock<Option<(u32, u32)>>,
     pub(super) depth_views: std::sync::Arc<super::placement::Views<super::stencil::Surface>>,
     pub(super) disposal: std::sync::Mutex<Option<(super::DisposeCallback, usize)>>,
@@ -66,6 +68,8 @@ impl DxgiDevice {
             texture_addresses: Default::default(),
             byte_offset_views: Default::default(),
             emulate_stencil: Default::default(),
+            packed_uav_native: Default::default(),
+            init_transition: std::sync::Mutex::new(None),
             wave_range: Default::default(),
             depth_views: Default::default(),
             frames: Default::default(),
@@ -127,6 +131,28 @@ fn adapter(device: &Device) -> Result<&IDXGIAdapter> {
         factory.EnumAdapterByLuid(device.native.GetAdapterLuid())?
     };
     Ok(device.state.adapter.get_or_init(|| native))
+}
+
+/// Cached native typed-UAV support for packed formats whose fallback casts to
+/// a raw integer format (`B5G5R5A1_UNORM` -> `R16_UINT`, `R9G9B9E5_SHAREDEXP` -> `R32_UINT`).
+pub(super) fn supports_native_packed_uav(
+    device: &Device,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+    };
+    let &(bgra5551, rgb9e5) = device.state.packed_uav_native.get_or_init(|| {
+        (
+            super::allocation::supports_typed_uav(&device.native, DXGI_FORMAT_B5G5R5A1_UNORM),
+            super::allocation::supports_typed_uav(&device.native, DXGI_FORMAT_R9G9B9E5_SHAREDEXP),
+        )
+    });
+    match format {
+        DXGI_FORMAT_B5G5R5A1_UNORM => bgra5551,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP => rgb9e5,
+        _ => true,
+    }
 }
 
 /// Supported hardware wave lane range `[WaveLaneCountMin, WaveLaneCountMax]`,
