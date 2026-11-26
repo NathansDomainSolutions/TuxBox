@@ -66,6 +66,9 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
     const auto submit = [&] {
         auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });
         while (render.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) pump();
+        // The present may resize the title window asynchronously just before it returns; apply
+        // that move before the client area is measured.
+        pump();
         const HRESULT hr = render.get();
         if (hr != S_OK) {
             char message[96];

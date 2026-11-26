@@ -23,9 +23,32 @@ pub(super) fn trace_import_failure(source: &'static str, api: &'static str, size
 
 // This holder is also the key for the weak single-page import cache. Its
 // last native resource releases both the heap reference and the VA pin.
+// Field order is load-bearing: `native` must drop before `_shadow` unmaps
+// and before `_backing` lets XMem unmap the imported memory.
 pub(in super::super) struct ImportedHeap {
     pub(super) native: ID3D12Heap,
     pub(super) _pin: ImportPin,
+    _shadow: Option<Arc<super::shadow::ShadowPages>>,
+    _backing: Option<super::backing::Hold>,
+    // The host memory the heap was imported from (or mirrors).
+    memory: u64,
+}
+
+impl ImportedHeap {
+    pub(super) fn direct(native: ID3D12Heap, pin: ImportPin, backing: super::backing::Backing) -> Self {
+        Self { native, _pin: pin, _shadow: None, _backing: backing.hold, memory: backing.address }
+    }
+
+    pub(super) fn shadowed(native: ID3D12Heap, pin: ImportPin, shadow: Arc<super::shadow::ShadowPages>,
+        backing: super::backing::Backing) -> Self {
+        Self { native, _pin: pin, _shadow: Some(shadow), _backing: backing.hold, memory: backing.address }
+    }
+
+    /// Whether a later import of the same guest pages, now backed by
+    /// `memory`, can reuse this heap.
+    pub(super) fn reusable_for(&self, memory: u64) -> bool {
+        self.is_live() && self.memory == memory
+    }
 }
 
 // Slot 44 places a tiled resource at a title-selected virtual address. An
@@ -59,23 +82,36 @@ pub(in super::super) fn import_buffer_with_heap(
     crate::diagnostics::watch("imported buffer", address, info.SizeInBytes, || format!(
         "width={:#x} flags={:#x} state={:#x}", desc.Width, desc.Flags.0, state.0));
     let pin = GPU_APERTURE.pin(base, size)?;
-    validate_shared_range(base, base.checked_add(size).ok_or(E_INVALIDARG)?)?;
+    // Import the memory behind these pages: the address may be one of several
+    // GPU aliases of it (see `backing`). Without XMem's backing exports this
+    // is the address itself.
+    let backing = super::backing::acquire(base, size)?;
+    let memory = backing.address;
+    validate_shared_range(memory, memory.checked_add(size).ok_or(E_INVALIDARG)?)?;
+    super::super::host_profile::report(device);
+    // A host whose GPU cannot read the guest's section views gets a mirrored copy.
+    let mirror = super::super::host_profile::needs_mirror(super::super::host_profile::section_import(device))
+        && super::shadow::contains_mapped_pages(memory, size);
     // A guest can place thousands of tiny resources in one multi-GiB XMem
     // reservation. Pin only the pages needed by this resource on the adapter.
     let heap = if let Ok(sized) = device.native.cast::<ID3D12Device13>() {
-        device.state.page_pools.import(&sized, base, size, pin, source)?
+        device.state.page_pools.import(&sized, base, backing, size, pin, source, mirror)?
     } else {
         let mut region = MEMORY_BASIC_INFORMATION::default();
-        if unsafe { VirtualQuery(Some(base as _), &mut region, size_of_val(&region)) } == 0
-            || region.AllocationBase as u64 != base || region.RegionSize as u64 != size {
+        if unsafe { VirtualQuery(Some(memory as _), &mut region, size_of_val(&region)) } == 0
+            || region.AllocationBase as u64 != memory || region.RegionSize as u64 != size {
             return Err(E_NOTIMPL.into());
         }
         let host: ID3D12Device3 = device.native.cast()?;
-        let native = unsafe { host.OpenExistingHeapFromAddress(region.AllocationBase) }.map_err(|error| {
-            trace_import_failure(source, "legacy", size, error.code());
-            error
-        })?;
-        Arc::new(ImportedHeap { native, _pin: pin })
+        if mirror {
+            super::shadow::open_shadow_legacy(&host, backing, size, pin, source)?
+        } else {
+            let native = unsafe { host.OpenExistingHeapFromAddress(region.AllocationBase) }.map_err(|error| {
+                trace_import_failure(source, "legacy", size, error.code());
+                error
+            })?;
+            Arc::new(ImportedHeap::direct(native, pin, backing))
+        }
     };
     let mut resource = None;
     unsafe { device.native.CreatePlacedResource(&heap.native, offset, &host_desc, state, None, &mut resource)? };

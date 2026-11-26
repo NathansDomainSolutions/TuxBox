@@ -187,3 +187,49 @@ fn pixel_layout_replaces_a_table_the_root_declares_one_slot_short() {
     let slots: Vec<_> = ranges.iter().map(|r| (r.range_type, r.base_register, r.space, r.offset_in_table)).collect();
     assert_eq!(slots, [(0, 75, 1, 2), (2, 5, 1, 3)]);
 }
+
+#[test]
+fn pixel_layout_reads_four_word_typed_unordered_access_views() {
+    // ProjectScarlett: the program samples t91 at slot 2 and records the typed
+    // view u13 with four words at slot 3. The root declares u7 at slot 2.
+    let build = |rows: [[u32; 5]; 2]| {
+        let mut program = vec![0; 0x100];
+        program[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+        for (field, count, rows) in [(0xe8, 0xf8, [[3, 16, 1, 91, 0x008u32], [3, 24, 1, 13, 0x008]]), (0xf0, 0xfc, rows)] {
+            let offset = (program.len() - 16) as u64;
+            program[field..field + 8].copy_from_slice(&offset.to_le_bytes());
+            program[count..count + 4].copy_from_slice(&2u32.to_le_bytes());
+            program.extend(rows.into_iter().flatten().flat_map(u32::to_le_bytes));
+        }
+        let size = (program.len() - 16) as u32;
+        program[8..12].copy_from_slice(&size.to_le_bytes());
+        program
+    };
+    let program = build([[0x300, 16, 91, 4, 0x00808], [0x303, 24, 13, 4, 0x00804]]);
+    let range = |range_type, base_register| RootRange { range_type, num: 1, base_register, space: 0, offset_in_table: u32::MAX };
+    let root = RootSig {
+        version: 2,
+        flags: 0xc00,
+        params: vec![RootParam {
+            visibility: 0,
+            kind: RootParamKind::Table(vec![range(0, 301), range(0, 325), range(1, 7)]),
+        }],
+        num_static_samplers: 0,
+        static_samplers: Vec::new(),
+    };
+    let resources = [[3, 0, 91, 91], [6, 0, 13, 13]];
+    let layout = MeshLayout::read_stage(&program, &resources, &root, true).unwrap();
+    let view = layout.tables[&(16, 96)];
+    assert_eq!((view.kind, view.register, view.space), (1, 13, 0));
+    let RootParamKind::Table(ranges) = &layout.replacements[&0] else {
+        panic!("expected a table")
+    };
+    let slots: Vec<_> = ranges.iter().map(|r| (r.range_type, r.base_register, r.offset_in_table)).collect();
+    assert_eq!(slots, [(0, 91, 2), (1, 13, 3)]);
+    // Only a pixel program holds such a view, and only a typed one.
+    assert!(MeshLayout::read(&program, &resources, &root).is_none());
+    assert!(MeshLayout::read_stage(&program, &[[3, 0, 91, 91], [8, 0, 13, 13]], &root, true).is_none());
+    // Other four-word unordered-access shapes stay unrecognised.
+    let structured = build([[0x300, 16, 91, 4, 0x00808], [0x303, 24, 13, 16, 0x00804]]);
+    assert!(MeshLayout::read_stage(&structured, &resources, &root, true).is_none());
+}

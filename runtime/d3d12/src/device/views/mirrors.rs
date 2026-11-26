@@ -7,6 +7,7 @@ pub(in super::super) unsafe extern "system" fn cbv(
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    super::creation::record_stride(device, &_write, handle, None);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
     check_destination(handle);
     device.state.placements.views.set(handle.ptr, None, false);

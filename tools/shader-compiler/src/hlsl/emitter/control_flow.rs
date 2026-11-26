@@ -83,6 +83,13 @@ impl<'a> Emitter<'a> {
             // skipped, and in-body flags are cleared at the bottom of each iteration.
         }
         let labels: BTreeSet<usize> = target.values().copied().collect();
+        // The earliest forward branch to each label: a label is pending at `i` when
+        // some branch before `i` targets it, which this decides without rescanning
+        // every branch for every instruction.
+        let mut earliest: HashMap<usize, usize> = HashMap::new();
+        for (&branch, &label) in &target {
+            earliest.entry(label).and_modify(|first| *first = (*first).min(branch)).or_insert(branch);
+        }
         for l in &labels {
             self.line(&format!("bool j{l} = false;"));
         }
@@ -146,7 +153,7 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("tb_c{b} = false;"));
             }
             let mut active: Vec<usize> =
-                labels.iter().copied().filter(|&t| t > i && target.iter().any(|(&b, &bt)| bt == t && b < i)).collect();
+                labels.iter().copied().filter(|&t| t > i && earliest.get(&t).is_some_and(|&b| b < i)).collect();
             if self.page_waves || self.hoist_wave_exchanges {
                 let exchange = if self.page_waves {
                     page_waves::rendezvous(i, ins)?
@@ -202,7 +209,7 @@ impl<'a> Emitter<'a> {
             if ins.mnemonic == "tb_indexed_readlane" && !active.is_empty() {
                 self.end_guard(&mut open);
                 cur.clear();
-                self.emit_indexed_read(i, ins)?;
+                self.emit_indexed_read(i, ins, &active)?;
                 self.hoisted_swizzle = Some(i);
             }
             if self.micropoly_vote == Some(i) {
@@ -227,6 +234,11 @@ impl<'a> Emitter<'a> {
                     dpp16::fetch(self, i, ins, skipped.as_deref())?;
                 } else if self.pixel_wave && !is_row_move(ins) {
                     self.emit_pixel_quad_exchange(i, ins)?;
+                } else if self.straight_pixel_quad.is_some() {
+                    // Prefix analysis proves converged FI=1 axis moves with full row/bank masks.
+                    let source = r(&ins.src[0])?;
+                    let axis = if ins.aux.imm == 0xb1 { "X" } else { "Y" };
+                    self.line(&format!("uint q{i} = QuadReadAcross{axis}({source});"));
                 } else {
                     let source = r(&ins.src[0])?;
                     if ins.op == OP_DPP_BINARY {
@@ -299,7 +311,7 @@ impl<'a> Emitter<'a> {
                 self.end_guard(&mut open);
                 if !active.is_empty() {
                     let c: Vec<String> = active.iter().map(|t| format!("j{t}")).collect();
-                    self.line(&format!("if (!({})) {{", c.join(" || ")));
+                    self.line(&format!("if (!({})) {{", c.join(self.flag_or())));
                     open = true;
                 }
                 cur = active;
@@ -341,7 +353,7 @@ impl<'a> Emitter<'a> {
                     self.line(&format!("j{t} = false;"));
                 }
                 let exits: Vec<String> = labels.iter().filter(|&&t| t > i).map(|t| format!("j{t}")).collect();
-                let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(" || ")) };
+                let exit = if exits.is_empty() { String::new() } else { format!(" && !({})", exits.join(self.flag_or())) };
                 let guard = if self.wave_cull || self.light_grid || probe_trace
                     || self.wave_bounded_latches.contains(&i)
                     || self.packed.as_ref().is_some_and(|p| p.copy_backedges.contains(&i) || p.bounded_backedges.contains(&i))
@@ -469,22 +481,36 @@ impl<'a> Emitter<'a> {
             self.line(&format!("uint tb_pc = {entry}u; [loop] while (tb_pc != {n}u) {{"));
         }
         self.loop_depth += 1;
-        // Flat `if (tb_sel == K)` tests on a snapshot of the block id (FXC mishandles a
-        // `switch` whose selector is assigned inside its cases).
-        if barriers.is_empty() {
-            self.line("uint tb_sel = tb_pc; tb_pc = 0xffffffffu;");
-        } else {
+        // Blocks are tested in program order on the live block id, so one pass over them
+        // follows every forward jump and only a jump back needs another. Many blocks are
+        // nested by range, which skips most tests. (FXC mishandles a `switch` whose selector
+        // is assigned inside its cases.)
+        const RANGE: usize = 24;
+        let spans: &[usize] = match starts.len() {
+            0..=RANGE => &[],
+            blocks if blocks <= RANGE * RANGE => &[RANGE],
+            _ => &[RANGE * RANGE, RANGE],
+        };
+        if !barriers.is_empty() {
             let at = barriers.iter().map(|i| format!("tb_pc == {i}u")).collect::<Vec<_>>().join(" || ");
             self.line(&format!("bool tb_wait = {at};"));
             // When lanes stand at different barriers the earliest goes first.
             self.line("bool tb_busy = WaveActiveAnyTrue(!tb_wait); uint tb_low = WaveActiveMin(tb_pc);");
             self.line("tb_wait = tb_wait && (tb_busy || tb_pc != tb_low);");
-            self.line("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc; if (!tb_wait) tb_pc = 0xffffffffu;");
+            // The barrier a lane may enter in this pass. One it reaches later waits for the next.
+            self.line("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc;");
         }
         let insns = self.insns.clone();
         for (b, &start) in starts.iter().enumerate() {
             let end = starts.get(b + 1).copied().unwrap_or(n);
-            self.line(&format!("if (tb_sel == {start}u) {{"));
+            for &span in spans {
+                if b % span == 0 {
+                    let to = starts.get(b + span).copied().unwrap_or(n);
+                    self.line(&format!("if (tb_pc - {start}u < {}u) {{", to - start));
+                }
+            }
+            let entered = if barriers.contains(&start) { format!(" && tb_sel == {start}u") } else { String::new() };
+            self.line(&format!("if (tb_pc == {start}u{entered}) {{"));
             self.drop_heap_handles();
             for i in start..end {
                 let ins = &insns[i];
@@ -514,12 +540,25 @@ impl<'a> Emitter<'a> {
                 format!("{end}u")
             };
             self.line(&format!("tb_pc = {next}; }}"));
+            for &span in spans.iter().rev() {
+                if b % span == span - 1 || b + 1 == starts.len() { self.line("}"); }
+            }
         }
-        // No block matched (cannot happen for a well-formed program): stop.
-        self.line(&format!("if (tb_pc == 0xffffffffu) tb_pc = {n}u;"));
         self.line("}");
         self.drop_heap_handles();
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(())
+    }
+}
+
+impl Emitter<'_> {
+    /// How a guard combines jump flags. `||` makes one block per flag, and a
+    /// guard can name hundreds. Compute programs compile unoptimised or under
+    /// a DXC budget, so they take `|`: the resolve kernels' unoptimised DXIL
+    /// lost a third of its blocks and DXC finished optimising in 45 s instead
+    /// of 83-110 s. Optimised graphics stages keep `||`, which DXC threads
+    /// into smaller code (a mesh shader grew from 18 to 26 KiB with `|`).
+    fn flag_or(&self) -> &'static str {
+        if self.ex.stage == Stage::Compute { " | " } else { " || " }
     }
 }

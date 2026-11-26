@@ -592,23 +592,23 @@ fn wide_group_shared_accesses_move_consecutive_dwords() {
     // LLVM gfx1030: ds_read_b96 v[8:10], v1 offset:16
     let hlsl = lds([0xdbf8_0010, 0x0800_0001]);
     for (v, byte) in [(8, 16), (9, 20), (10, 24)] {
-        assert!(hlsl.contains(&format!("v{v} = tb_lds[((t")) && hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u]")), "{hlsl}");
+        assert!(hlsl.contains(&format!("v{v} = tb_lds_load((t")) && hlsl.contains(&format!("addr + {byte}u));")), "{hlsl}");
     }
     assert!(!hlsl.contains("v11 ="), "{hlsl}");
     // ds_read_b128 v[1:4], v1: the address is read before v1 is overwritten.
     let hlsl = lds([0xdbfc_0000, 0x0100_0001]);
     let snapshot = hlsl.find("addr = v1;").expect(&hlsl);
     assert!(snapshot < hlsl.find("v1 = tb_lds").expect(&hlsl), "{hlsl}");
-    assert!(hlsl.contains("addr + 12u) >> 2) & 8191u]") && hlsl.contains("v4 = tb_lds"), "{hlsl}");
+    assert!(hlsl.contains("addr + 12u))") && hlsl.contains("v4 = tb_lds_load"), "{hlsl}");
     // ds_write_b96 v1, v[4:6] offset:12
     let hlsl = lds([0xdb78_000c, 0x0000_0401]);
     for (v, byte) in [(4, 12), (5, 16), (6, 20)] {
-        assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+        assert!(hlsl.contains(&format!("tb_lds_store((t0addr + {byte}u), v{v});")), "{hlsl}");
     }
     // ds_write2st64_b64 v1, v[4:5], v[6:7] offset0:1 offset1:2: 512-byte units.
     let hlsl = lds([0xd93c_0201, 0x0006_0401]);
     for (v, byte) in [(4, 512), (5, 516), (6, 1024), (7, 1028)] {
-        assert!(hlsl.contains(&format!("addr + {byte}u) >> 2) & 8191u] = v{v};")), "{hlsl}");
+        assert!(hlsl.contains(&format!("tb_lds_store((t0addr + {byte}u), v{v});")), "{hlsl}");
     }
     // ds_read_b128 v[8:11], v1 gds
     assert!(translate(Stage::Compute, &[0xdbfe_0000, 0x0800_0001]).unwrap_err().contains("GDS"));

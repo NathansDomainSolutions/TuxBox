@@ -189,12 +189,15 @@ class RuntimeShaderWorkers(unittest.TestCase):
         self.assertEqual(seen, [True])
 
     def test_job_count_and_fifo_across_request_types(self):
+        for cpus, default in ((1, 1), (2, 2), (3, 2), (8, 4), (32, 16), (128, 32)):
+            with patch("os.sched_getaffinity", return_value=set(range(cpus))):
+                self.assertEqual(runtime_jobs({}, Mock()), default, cpus)
         report = Mock()
         with patch("os.sched_getaffinity", return_value={0, 1, 2}):
-            self.assertEqual(runtime_jobs({}, report), 3)
+            self.assertEqual(runtime_jobs({}, report), 2)
             self.assertEqual(runtime_jobs({"TUXBOX_RUNTIME_SHADER_JOBS": "1"}, report), 1)
             self.assertEqual(runtime_jobs({"TUXBOX_RUNTIME_SHADER_JOBS": "8"}, report), 3)
-            self.assertEqual(runtime_jobs({"TUXBOX_RUNTIME_SHADER_JOBS": "0"}, report), 3)
+            self.assertEqual(runtime_jobs({"TUXBOX_RUNTIME_SHADER_JOBS": "0"}, report), 2)
             report.assert_called_once()
         paths = [self.request("old", ".link"), self.request("middle", ".stencil"), self.request("new")]
         for n, path in enumerate(paths):

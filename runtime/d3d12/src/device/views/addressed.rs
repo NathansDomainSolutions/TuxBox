@@ -225,6 +225,8 @@ pub(in super::super) unsafe extern "system" fn address_srv(
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    let stride = (desc.view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER).then(|| buffer_stride(&desc.view)).flatten();
+    super::creation::record_stride(device, &_write, handle, stride);
     check_destination(handle);
     crate::commands::page_mapping::GPU_APERTURE.wait(desc.address,1)
         .unwrap_or_else(|e| fail_call(format_args!("address SRV pending GPU mapping: {:?}", e.code())));
@@ -318,6 +320,10 @@ pub(in super::super) unsafe extern "system" fn address_uav(
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    let stride = (desc.view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        .then(|| element_stride(desc.view.Format.0, unsafe { desc.view.Anonymous.Buffer }.StructureByteStride))
+        .flatten();
+    super::creation::record_stride(device, &_write, handle, stride);
     check_destination(handle);
     if desc.address == 0
         || desc.counter_address != 0

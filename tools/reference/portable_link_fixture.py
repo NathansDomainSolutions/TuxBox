@@ -13,13 +13,15 @@ def signature(rows):
         names.extend(name.encode("ascii")+b"\0")
     return bytes(data+names)
 
+# LLVM gfx1030: fullscreen triangle from v0 (VertexID); constant raw
+# parameter bits in v8:v11, POS0 and PARAM0 exports.
+VERTEX_CODE=(0x7e0202f3,0x7e0402ff,0x40400000,0x7d840082,0x02080501,
+             0x7d840081,0x020a0501,0x7e0c02f0,0x7e0e02f2,
+             0x7e1002ff,0x89abcdef,0x7e1202ff,0x3e800000,0x7e1402f0,
+             0x7e1602f2,0xf80000cf,0x07060504,0xf8000a0f,0x0b0a0908,0xbf810000)
+
 def vertex(kind=3):
-    # LLVM gfx1030: fullscreen triangle from v0 (VertexID); constant raw
-    # parameter bits in v8:v11, POS0 and PARAM0 exports.
-    code=[0x7e0202f3,0x7e0402ff,0x40400000,0x7d840082,0x02080501,
-          0x7d840081,0x020a0501,0x7e0c02f0,0x7e0e02f2,
-          0x7e1002ff,0x89abcdef,0x7e1202ff,0x3e800000,0x7e1402f0,
-          0x7e1602f2,0xf80000cf,0x07060504,0xf8000a0f,0x0b0a0908,0xbf810000]
+    code=list(VERTEX_CODE)
     image=bytearray(0x170)
     def q(at,v):struct.pack_into("<Q",image,at,v)
     q(0,6)

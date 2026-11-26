@@ -19,7 +19,7 @@ REFUSALS = (
     ("wave_other", r"wave reduction\b"),
     ("exec_other", r"unverified EXEC\b"),
     ("scalar_buffer", r"s_buffer_load\b"),
-    ("sampler", r"(?:unsupported|unverified|unmapped)\b[^\n]*\bsampler\b"),
+    ("sampler", r"(?:(?:unsupported|unverified|unmapped)\b[^\n]*\bsampler\b|not a sampler descriptor)"),
     ("vector_op", r"unsupported vector op\b"),
     ("scalar_op", r"unsupported scalar op\b"),
     ("mesh", r"unverified mesh shader bindings\b"),

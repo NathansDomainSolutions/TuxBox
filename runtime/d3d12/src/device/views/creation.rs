@@ -1,6 +1,18 @@
 //! Creating views and samplers in descriptor heaps.
 use super::*;
 
+/// Keep a new view's console buffer stride for heap-indexed IDXEN accesses:
+/// by native handle for later copies, and by guest slot in a paged heap.
+pub(super) fn record_stride(
+    device: &Device,
+    write: &super::super::descriptor_paging::Write,
+    handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    stride: Option<u32>,
+) {
+    device.state.view_strides.store(handle.ptr, stride);
+    write.set_stride(stride.unwrap_or(0));
+}
+
 pub(in super::super) unsafe extern "system" fn srv(
     device: &Device,
     object: *mut c_void,
@@ -8,6 +20,10 @@ pub(in super::super) unsafe extern "system" fn srv(
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    let stride = unsafe { desc.as_ref() }
+        .filter(|view| view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+        .and_then(buffer_stride);
+    record_stride(device, &_write, handle, stride);
     let resource = unsafe { view_resource(device, object, desc, handle) };
     let proxy = unsafe { super::super::resource_proxy(object, identity(device).as_raw()) };
     let mut alias = None;
@@ -66,6 +82,10 @@ pub(in super::super) unsafe extern "system" fn uav(
     mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
     let _write = super::super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    let stride = unsafe { desc.as_ref() }
+        .filter(|view| view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
+        .and_then(|view| element_stride(view.Format.0, unsafe { view.Anonymous.Buffer }.StructureByteStride));
+    record_stride(device, &_write, handle, stride);
     crate::diagnostics::display::texture_view(handle.ptr, None, None);
     let owner = identity(device).as_raw();
     let proxy = unsafe { super::super::resource_proxy(object, owner) };

@@ -57,6 +57,7 @@ pub(in crate::hlsl) fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Optio
         let off = insns[first].offset;
         let bad = |what: &str| format!("wave reduction at {off:#x}: {what}");
         let red = insns[first].mnemonic.clone();
+        wave_sum::merge_select_copy(insns, first);
         // A full saved-EXEC extrema reduction can begin with quad shuffles,
         // then combine different quads. A quad followed solely by a lane read
         // still selects within its quad and must not become a whole-wave min/max.
@@ -78,6 +79,13 @@ pub(in crate::hlsl) fn lower_wave_reductions(insns: &mut [Insn]) -> Result<Optio
         if matches!(insns[first].src.first(), Some(Opnd::Raw(233 | 234))) && !wave_sum::has_prologue(insns, first) {
             // No EXEC save before it: an ordinary DPP8 operation; see `dpp16::prepare`.
             at = first + 1;
+            continue;
+        }
+        if let Some(next) = (red == "v_add_nc_u32").then(|| wave_sum::lower_row_scan(insns, first)).flatten() {
+            if width.replace(32).is_some_and(|w| w != 32) {
+                return Err(bad("conflicting integer sum wave widths"));
+            }
+            at = next;
             continue;
         }
         if insns[first].src.first() == Some(&Opnd::Raw(250))

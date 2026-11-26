@@ -8,6 +8,19 @@ impl<'a> Emitter<'a> {
     /// 4 for compute (observed: PS s8/s9/s10 = params 0/1/2, VS s12 = param 4, CS s5/s7 =
     /// params 1/3). `None` when the root signature is unavailable or the SGPR is not a table.
     pub(in crate::hlsl) fn root_table(&self, sgpr: u8) -> Option<&[crate::meta::RootRange]> {
+        // The FSSM user-data records name the root parameter of each descriptor-table
+        // pointer and its user SGPR (location = parameter << 8 | SGPR). Where a record
+        // names this SGPR it decides: a `s_swappc_b64 s4, s4` vertex program, for one,
+        // can still receive its tables in s8/s9 (4b929a1c).
+        let named = tuxbox_dxbc::compute_table::user_data_records(&self.ex.fssm)
+            .and_then(|mut rows| rows.find(|&[class, .., location]| class == 3 && location & 0xff == u32::from(sgpr)))
+            .map(|[.., location]| (location >> 8) as usize);
+        if let Some(parameter) = named {
+            return match &self.ex.root_sig.as_ref()?.params.get(parameter)?.kind {
+                crate::meta::RootParamKind::Table(r) => Some(r),
+                _ => None,
+            };
+        }
         // Root descriptor-table pointers arrive in consecutive user SGPRs: from s4 in compute
         // shaders and s8 in the other stages. Vertex shaders compiled to feed a geometry
         // shader ("MainForGS") start with `s_swappc_b64 s12, s12` and receive them from s19

@@ -2,7 +2,7 @@
 
 TuxBox is licensed under the Apache License 2.0. A contribution in a pull request is licensed under the same terms. Third-party materials keep their own terms. [License](LICENSE) · [Third-party notices](docs/REFERENCES.md#shader-compiler-attribution)
 
-Open pull requests against `main`. [Source layout](docs/SOURCE_LAYOUT.md) explains where code goes.
+Open pull requests against `main`. [Source layout](docs/SOURCE_LAYOUT.md) explains where code goes. If you use an AI coding agent, point it at [AGENTS.md](AGENTS.md).
 
 ## Prepare a checkout
 
@@ -38,6 +38,8 @@ On Linux it also runs the [D3D12 regression controls](tools/check_d3d12_regressi
 python tuxbox.py check --proton PROTON --prefix PREFIX --windows-dxc DXC/bin/x64
 ```
 
+A change to what the translator emits for 64-lane programs also shows in a [recorded set of outputs](tools/shader-compiler/src/tests/hlsl/host_profiles.txt) for each [host profile](docs/USAGE.md#host-profile). The test names the profile affected. Include the updated record, and say in the pull request why that profile changed.
+
 With the same options it runs the [shader translator checks](tools/check_translator_gpu.py): synthetic console programs translated, run on the GPU and compared word for word with a reference model. They also need `llvm-mc` from LLVM. When you add or fix an instruction, add it to one of these checks.
 
 Put the printed summary, your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/results.json`.
@@ -45,6 +47,17 @@ Put the printed summary, your GPU, driver and backend in the pull request. Pass 
 If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.
 
 CI has no GPU, so it cannot run Lanes. A reviewer should not merge a pull request without a passing GPU run, from the author or from someone who has the hardware. `python tuxbox.py check --no-gpu` runs only the first group while you work.
+
+### AMD and NVIDIA
+
+A change that fixes one vendor must not break the other.
+
+- **Shared code needs both.** A change under `runtime/` or `tools/shader-compiler/`, or to how the launcher translates shaders, is merged after a check on an AMD card and an NVIDIA card. The two runs can come from different people.
+- **Choose paths by capability.** Code that differs between hosts reads the [host profile](docs/USAGE.md#host-profile). The unit tests refuse vendor checks elsewhere in the provider and the translator.
+- **Try the other path.** `TUXBOX_HOST_PROFILE` runs another profile's code on your card, but only that driver's own hardware shows its behaviour.
+- **Failures that `main` also has** don't block a change. Name them in the pull request.
+
+Pass `--adapter` to choose a card on a machine with more than one.
 
 ## Code checks
 

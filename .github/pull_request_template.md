@@ -13,6 +13,8 @@ python tuxbox.py check
 
 GPU, driver and backend:
 
+- [ ] This changes code both vendors run, and the check passed on an AMD and an NVIDIA card ([why](../CONTRIBUTING.md#amd-and-nvidia)). Otherwise, say which vendor still needs to run it:
+
 Paste the summary printed at the end:
 
 ```text

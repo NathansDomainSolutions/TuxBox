@@ -1,52 +1,7 @@
 //! Regression tests for cross-submission wait elision, failed mid-list split
 //! close semantics, null blend factor replay, and held-wait drop guards.
 use super::*;
-use windows::Win32::Foundation::E_INVALIDARG;
-
-fn create_committed_buffer(device: &ComObj, bytes: u64) -> ComObj {
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let mut resource = ptr::null_mut();
-    let create: unsafe extern "system" fn(
-        *mut c_void,
-        *const D3D12_HEAP_PROPERTIES,
-        D3D12_HEAP_FLAGS,
-        *const D3D12_RESOURCE_DESC,
-        D3D12_RESOURCE_STATES,
-        *const D3D12_CLEAR_VALUE,
-        *const windows::core::GUID,
-        *mut *mut c_void,
-    ) -> HRESULT = unsafe { vslot(device.0, 27) };
-    let hr = unsafe {
-        create(
-            device.0,
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            ptr::null(),
-            &ID3D12Resource::IID,
-            &mut resource,
-        )
-    };
-    assert!(hr.is_ok(), "CreateCommittedResource failed: {hr:?}");
-    ComObj(resource)
-}
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
 
 fn queue_signal(queue: &ComObj, fence: &ComObj, value: u64) {
     let sig: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT =
@@ -208,10 +163,9 @@ fn gpu_cross_submission_in_flight_write_blocks_unsafe_elision() {
     );
 }
 
-/// F2 regression: when `split_active()` fails inside `Close()` due to an earlier
-/// native recording error (such as a matching-state ResourceBarrier), `phase`
+/// F2 regression: when `split_active()` fails inside `native.Close()`, `phase`
 /// must transition to `native_open: false` so the guest's subsequent `Close()`
-/// does not double-close the native command list or overwrite the original error.
+/// does not double-close the native command list or overwrite an earlier error.
 #[test]
 fn gpu_failed_mid_list_split_close_does_not_double_close_or_clobber_error() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,45 +175,32 @@ fn gpu_failed_mid_list_split_close_does_not_double_close_or_clobber_error() {
     let mem = GuestMem::new(65536);
     mem.write64(0, 1);
 
-    let buf = create_committed_buffer(&device, 256);
     let list = GuestList::new(&device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    list.write64(mem.addr(8), 0x1234);
 
-    // Record a matching-state transition barrier (COMMON -> COMMON), which D3D12
-    // rejects when closing the native command list with E_INVALIDARG.
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                // Borrow `buf.0` without AddRef; ManuallyDrop prevents Release.
-                pResource: std::mem::ManuallyDrop::new(Some(unsafe {
-                    ID3D12Resource::from_raw(buf.0)
-                })),
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                StateBefore: D3D12_RESOURCE_STATE_COMMON,
-                StateAfter: D3D12_RESOURCE_STATE_COMMON,
-            }),
-        },
-    };
-    let resource_barrier: unsafe extern "system" fn(
-        *mut c_void,
-        u32,
-        *const D3D12_RESOURCE_BARRIER,
-    ) = unsafe { vslot(list.list.0, 26) };
-    unsafe { resource_barrier(list.list.0, 1, &barrier) };
+    // Pre-close the underlying native list so `split_active()`'s `native.Close()`
+    // fails deterministically with `E_FAIL` across `vkd3d`, `vkd3d-proton` (which
+    // accepts same-state transition barriers without failing `Close()`), and
+    // Windows D3D12, while `state.phase` still expects `native_open: true`.
+    let guest = unsafe { &*(list.list.0 as *const List) };
+    let pre_close = unsafe { recording(guest).active.native.Close() };
+    assert!(
+        pre_close.is_ok(),
+        "pre-closing native list failed: {pre_close:?}"
+    );
 
-    // Mid-list wait triggers split_active() -> native.Close() returns E_INVALIDARG
+    // Mid-list wait triggers split_active() -> native.Close() returns E_FAIL
     // and must immediately mark `native_open: false`.
     list.wait64(mem.addr(0), 7, 1);
-    let guest = unsafe { &*(list.list.0 as *const List) };
     assert!(
         matches!(recording(guest).phase, ListState::Open { native_open: false }),
         "F2 regression: failed split_active() must mark native_open = false"
     );
-    assert_eq!(recording(guest).error, E_INVALIDARG);
+    assert_eq!(recording(guest).error, E_FAIL);
 
-    // Guest Close() must NOT call native.Close() again and must preserve E_INVALIDARG
-    // (a double-Close on D3D12 would trigger EXECUTION ERROR #547 and return E_FAIL).
+    // Substitute a distinct sentinel error and verify guest Close() skips calling
+    // `native.Close()` again and preserves the earlier error instead of overwriting it.
+    recording(guest).error = E_INVALIDARG;
     let hr = list.close();
     assert_eq!(
         hr, E_INVALIDARG,

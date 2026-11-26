@@ -1,16 +1,16 @@
-"""Mirror a game's output to its console and a persistent launch log."""
-from contextlib import contextmanager
+"""Show a game's output in the console and, on request, save it to a log."""
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import selectors
 import subprocess
 import sys
-import tempfile
 from threading import Lock
 
 
-def log_directory():
+def capture_directory():
+    """Where captures go when no log file says otherwise."""
     if os.name == "nt":
         return Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData/Local") / "TuxBox/logs"
     return Path(os.getenv("XDG_STATE_HOME") or Path.home() / ".local/state") / "project-tuxbox/logs"
@@ -18,30 +18,16 @@ def log_directory():
 
 @contextmanager
 def game_log(executable, path=None):
-    if path is None:
-        directory = log_directory()
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
-        fd, name = tempfile.mkstemp(dir=directory, prefix=f"{executable.stem}-{stamp}-", suffix=".log")
-        try:
-            stream = os.fdopen(fd, "wb")
-        except BaseException:
-            os.close(fd)
-            try:
-                os.unlink(name)
-            except OSError:
-                pass
-            raise
-        path = Path(name)
-    else:
+    """Show the launch in the terminal, and append it to `path` when one is given."""
+    if path is not None:
         path = path.expanduser().resolve()
         if path == executable.resolve() or (path.exists() and executable.exists() and path.samefile(executable)):
             raise ValueError("Choose a log file separate from the game executable")
         path.parent.mkdir(parents=True, exist_ok=True)
-        stream = path.open("ab")
-    with stream:
+    with nullcontext() if path is None else path.open("ab") as stream:
         log = GameLog(path, stream)
-        log.status(f"Game log: {path}")
+        if path is not None:
+            log.status(f"Game log: {path}")
         try:
             yield log
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -57,14 +43,23 @@ class GameLog:
         self.stdout = sys.stdout
         self.stderr = sys.stderr
         self.lock = Lock()
-        self.line_ended = stream.tell() == 0
+        self.line_ended = stream is None or stream.tell() == 0
+
+    def capture_parent(self):
+        """The folder for captures recorded during this launch."""
+        if self.path is not None:
+            return self.path.parent
+        directory = capture_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
     def _write(self, data, console, *, separate=False):
         with self.lock:
             if separate and not self.line_ended:
                 data = b"\n" + data
-            self.stream.write(data)
-            self.stream.flush()
+            if self.stream is not None:
+                self.stream.write(data)
+                self.stream.flush()
             self.line_ended = data.endswith(b"\n")
             if console is not None:
                 try:

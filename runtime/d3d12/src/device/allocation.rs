@@ -298,6 +298,36 @@ pub(super) fn allocation_info_for(
     unsafe { device.GetResourceAllocationInfo(visible, core::slice::from_ref(desc)) }
 }
 
+/// Requirements of a 2D texture with an undefined layout at 4 KiB alignment.
+///
+/// XG lays these out as the 4 KiB swizzle. GTA sizes its texture memory and its file
+/// reads with this answer, then creates the texture with that swizzle. A host driver may
+/// use smaller tiles for narrow images, and a read that does not fit its stream fails.
+/// Keep the host's answer when it needs more, so host heap placements still fit.
+fn small_texture(
+    native: &ID3D12Device,
+    visible: u32,
+    desc: &D3D12_RESOURCE_DESC,
+) -> Option<D3D12_RESOURCE_ALLOCATION_INFO> {
+    const NO_METADATA: i32 = 0x0030_0000;
+    const TILE_4K: D3D12_TEXTURE_LAYOUT = D3D12_TEXTURE_LAYOUT(0x105);
+    let small = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN
+        || desc.Alignment != small
+        || desc.Flags.0 & !(NO_METADATA | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) != 0
+    {
+        return None;
+    }
+    let plane = super::placement::color_plane(&D3D12_RESOURCE_DESC { Layout: TILE_4K, ..*desc }).ok()?;
+    let mut info = allocation_info_for(native, visible, desc);
+    if info.SizeInBytes == u64::MAX || info.Alignment != small {
+        return None;
+    }
+    info.SizeInBytes = info.SizeInBytes.max(plane.size);
+    Some(info)
+}
+
 // Like GetResourceAllocationInfo, this Xbox vtable entry places the struct
 // return pointer before the device. GTA queries default, upload and readback.
 pub(super) unsafe extern "system" fn custom_heap_properties(
@@ -353,7 +383,8 @@ unsafe fn info_impl(
         !packed_uav_formats(d.Format, d.Flags).is_empty()
             && !super::dxgi::supports_native_packed_uav(device, d.Format)
     };
-    if descs.iter().any(|d| super::placement::console_layout(d.Layout.0) || needs_packed(d)) {
+    let small = |d: &D3D12_RESOURCE_DESC| small_texture(&device.native, visible, d);
+    if descs.iter().any(|d| super::placement::console_layout(d.Layout.0) || needs_packed(d) || small(d).is_some()) {
         // The guest will allocate these bytes itself and pass the address to
         // CreatePlacedResourceX. Account for the Xbox planes and batch padding.
         let mut bytes = 0u64;
@@ -370,6 +401,8 @@ unsafe fn info_impl(
                     },
                     Err(_) => invalid,
                 }
+            } else if let Some(item) = small(desc) {
+                item
             } else if needs_packed(desc) {
                 allocation_info_for(&device.native, visible, desc)
             } else {
@@ -456,14 +489,16 @@ pub(super) unsafe extern "system" fn info2(
     let mut placements = Vec::new();
     if !details.is_null() && placements.try_reserve_exact(inputs.len()).is_err() { return out; }
     for d in inputs {
+        let guest = D3D12_RESOURCE_DESC {
+            Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
+            DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
+            SampleDesc: d.SampleDesc, Layout: d.Layout, Flags: d.Flags,
+        };
         let requirement = if d.Layout.0 >= 0x100 {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
-                DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
-                SampleDesc: d.SampleDesc, Layout: d.Layout, Flags: d.Flags,
-            };
             let mut item = invalid;
-            unsafe { info(&mut item, device, visible, 1, &desc) };
+            unsafe { info(&mut item, device, visible, 1, &guest) };
+            item
+        } else if let Some(item) = small_texture(&device.native, visible, &guest) {
             item
         } else if !super::dxgi::supports_native_packed_uav(device, d.Format)
             && let Some(requirement) = packed_requirements(&device.native, visible, d)
@@ -474,11 +509,6 @@ pub(super) unsafe extern "system" fn info2(
             // requirements must be queried with the same flags.
             let mut native = *d;
             native.Flags.0 &= super::format::HOST_FLAGS;
-            let guest = D3D12_RESOURCE_DESC {
-                Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
-                DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
-                SampleDesc: d.SampleDesc, Layout: d.Layout, Flags: d.Flags,
-            };
             if let Some(primary) = super::depth::primary(&guest) {
                 native.Format = primary.Format;
                 native.Flags = primary.Flags;
@@ -486,11 +516,6 @@ pub(super) unsafe extern "system" fn info2(
             unsafe { host.GetResourceAllocationInfo2(visible, 1, &native, None) }
         } else { return out };
         if trace::matches(requirement.SizeInBytes) {
-            let guest = D3D12_RESOURCE_DESC {
-                Dimension: d.Dimension, Alignment: d.Alignment, Width: d.Width, Height: d.Height,
-                DepthOrArraySize: d.DepthOrArraySize, MipLevels: d.MipLevels, Format: d.Format,
-                SampleDesc: d.SampleDesc, Layout: d.Layout, Flags: d.Flags,
-            };
             trace::report("info2-item", core::slice::from_ref(&guest), &requirement);
         }
         if requirement.Alignment == 0 || requirement.SizeInBytes == u64::MAX {

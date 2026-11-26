@@ -4,7 +4,7 @@ use super::{Queue, reject};
 use core::{ptr, slice};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak, mpsc};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, HANDLE, S_OK};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -139,7 +139,7 @@ impl Mappings {
         ));
     }
 
-    fn apply(&self, imports: &mut HashMap<usize, Range<u64>>) -> Result<()> {
+    fn apply(&self, imports: &mut HashMap<usize, (Range<u64>, Arc<AtomicBool>)>) -> Result<()> {
         let mut batches = Vec::new();
         batches
             .try_reserve_exact(self.batches.len())
@@ -157,12 +157,12 @@ impl Mappings {
         }
         let overlapping: Vec<(usize, Range<u64>)> = imports
             .iter()
-            .filter(|(_, import)| {
+            .filter(|(_, (import, _))| {
                 self.spans
                     .iter()
                     .any(|r| r.start < import.end && import.start < r.end)
             })
-            .map(|(key, import)| (*key, import.clone()))
+            .map(|(key, (import, _))| (*key, import.clone()))
             .collect();
         // Imports whose backing pages this batch really replaces. A GPU import
         // keeps the physical pages it was created from, so it cannot follow the
@@ -208,7 +208,9 @@ impl Mappings {
         }
         .ok()?;
         for key in retired {
-            imports.remove(&key);
+            if let Some((_, live)) = imports.remove(&key) {
+                live.store(false, Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -222,7 +224,7 @@ struct Pending {
 #[derive(Default)]
 struct State {
     pending: Vec<Weak<Pending>>,
-    imports: HashMap<usize, Range<u64>>,
+    imports: HashMap<usize, (Range<u64>, Arc<AtomicBool>)>,
     next_import: usize,
 }
 
@@ -234,21 +236,27 @@ pub(crate) static GPU_APERTURE: LazyLock<Registry> = LazyLock::new(Registry::def
 
 pub(crate) struct ImportPin {
     key: usize,
+    live: Arc<AtomicBool>,
 }
 impl ImportPin {
+    #[cfg(test)]
+    pub(crate) fn key(&self) -> usize {
+        self.key
+    }
+
+    pub(crate) fn live_flag(&self) -> Arc<AtomicBool> {
+        self.live.clone()
+    }
+
     /// False once a page remap has replaced the pages this import was created
     /// from. A retired import must not be reused for the address.
     pub(crate) fn is_live(&self) -> bool {
-        GPU_APERTURE
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .imports
-            .contains_key(&self.key)
+        self.live.load(Ordering::Acquire)
     }
 }
 impl Drop for ImportPin {
     fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
         GPU_APERTURE
             .0
             .lock()
@@ -301,8 +309,11 @@ impl Registry {
         self.after_pending(address, bytes, |state| {
             let key = state.next_import;
             state.next_import = key.checked_add(1).ok_or(E_OUTOFMEMORY)?;
-            state.imports.insert(key, address..address + bytes);
-            Ok(ImportPin { key })
+            let live = Arc::new(AtomicBool::new(true));
+            state
+                .imports
+                .insert(key, (address..address + bytes, live.clone()));
+            Ok(ImportPin { key, live })
         })
     }
     fn register(&self, mapping: &Arc<Pending>) {
@@ -310,6 +321,20 @@ impl Registry {
         state.pending.retain(|p| p.strong_count() != 0);
         state.pending.push(Arc::downgrade(mapping));
     }
+
+    #[cfg(test)]
+    pub(crate) fn retire_pin_for_test(&self, key: usize) {
+        if let Some((_, live)) = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .imports
+            .remove(&key)
+        {
+            live.store(false, Ordering::Release);
+        }
+    }
+
     fn apply(&self, mappings: &Mappings) -> Result<()> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         mappings.apply(&mut state.imports)

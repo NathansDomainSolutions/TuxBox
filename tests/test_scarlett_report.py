@@ -17,6 +17,7 @@ class ScarlettReport(unittest.TestCase):
             "unsupported compute DS swizzle encoding": "compute_swizzle",
             "v_readlane at 0x20: v2 lane 32 read before any v_writelane": "readlane_uninitialized",
             "s_load at 0xec: dynamic soffset unsupported": "scalar_dynamic_offset",
+            "mimg at 0x2d4: s12 not a sampler descriptor (Some(InlineWord(12470))) words [0x30b6, 0x0, 0x0, 0x0]": "sampler",
         }
         for reason, expected in cases.items():
             with self.subTest(reason=reason):

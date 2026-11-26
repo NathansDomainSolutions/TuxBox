@@ -17,3 +17,14 @@ fn wave_range_compatibility_checks_interval_overlap() {
     assert_eq!(check_wave_range((64, 64), (0, 0)), None);
     assert_eq!(check_wave_range((64, 64), (64, 32)), None);
 }
+
+#[test]
+fn only_a_64_lane_program_on_a_32_lane_host_is_translated_again() {
+    assert!(needs_narrow_waves(Some((64, 64)), (32, 32)));
+    assert!(!needs_narrow_waves(Some((64, 64)), (32, 64)));
+    assert!(!needs_narrow_waves(Some((64, 64)), (64, 64)));
+    assert!(!needs_narrow_waves(Some((32, 32)), (32, 32)));
+    assert!(!needs_narrow_waves(None, (32, 32)));
+    // The translation runs waves of 32, so a host limited below that cannot use it.
+    assert!(!needs_narrow_waves(Some((64, 64)), (16, 16)));
+}

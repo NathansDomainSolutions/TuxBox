@@ -44,7 +44,7 @@ def performance_capture(backend, env, executable, log):
         raise ValueError("Install MangoHud and its Vulkan layer to use --mangohud")
 
     gpu = telemetry_gpu(env)
-    directory = Path(mkdtemp(prefix="mangohud-", dir=log.path.parent)).resolve()
+    directory = Path(mkdtemp(prefix="mangohud-", dir=log.capture_parent())).resolve()
     config = directory / "MangoHud.conf"
     config.write_text("fps\nframetime\nframe_timing\ncpu_stats\ngpu_stats\nvram\nram\n"
                       "autostart_log=1\nlog_interval=0\npermit_upload=0\n"

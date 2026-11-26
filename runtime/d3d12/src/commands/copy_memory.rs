@@ -65,13 +65,14 @@ fn plan(guest_offset: u64, guest_bytes: u64, total: u64, regions: &[Region]) -> 
     }
     // A single-subresource texture can arrive with its rows padded to an
     // aligned height (a 128x4 RGBA16 target uploads 0x2000 bytes for a 0x1000
-    // footprint). Only the footprint is read, so accept a tail of at most one
-    // footprint. Larger buffers stay rejected.
+    // footprint, and 0x4000 when its height is padded to a 16-row tile). Only
+    // the footprint is read, so accept a tail of at most one footprint, or
+    // whole rows up to the height of a 4 KiB tile. Larger buffers stay rejected.
     if let [region] = regions
         && guest_offset == 0
         && region.offset == 0
         && guest_bytes >= region.span
-        && guest_bytes - region.span <= region.span
+        && (guest_bytes - region.span <= region.span || tile_padded(guest_bytes, region))
     {
         return Some(Plan::One(region.index));
     }
@@ -87,6 +88,18 @@ fn plan(guest_offset: u64, guest_bytes: u64, total: u64, regions: &[Region]) -> 
                 )
         })
         .map(|region| Plan::One(region.index))
+}
+
+/// Rows of the tallest 4 KiB tile: 64 rows of 64 bytes for 8-bit texels.
+const TILE_ROWS: u64 = 64;
+
+/// The guest range is whole rows of this footprint's pitch, padded to at most
+/// the next multiple of a tile's height.
+fn tile_padded(guest_bytes: u64, region: &Region) -> bool {
+    let pitch = u64::from(region.pitch);
+    pitch != 0
+        && guest_bytes.is_multiple_of(pitch)
+        && guest_bytes / pitch <= region.span.div_ceil(pitch).next_multiple_of(TILE_ROWS)
 }
 
 fn footprint_bytes(pitch: u32, rows: u32, depth: u32) -> Option<u64> {

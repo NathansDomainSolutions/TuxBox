@@ -208,8 +208,8 @@ fn accepts_full_mask_branches_and_uniform_scalar_reads() {
     ] {
         let translated = translate(&shader(32, shape)).expect("bounded reduction");
         assert_eq!(translated.required_wave_size, Some(32));
-        assert!(translated.hlsl.contains("if (vcc_lo == 0u)"));
-        assert!(translated.hlsl.contains("if (exec_lo == 0u)"));
+        assert!(translated.hlsl.contains(" | (vcc_lo == 0u);"));
+        assert!(translated.hlsl.contains(" | (exec_lo == 0u);"));
         assert!(!translated.hlsl.contains("++tb_guard < 65536u"));
     }
 }
@@ -221,16 +221,28 @@ fn refuses_unproved_ctrl_flow_and_buffer_accesses() {
         Shape::BypassDescriptor,
         Shape::ClobberDescriptor,
         Shape::BypassCounterInit,
-        Shape::EmptyExec,
-        Shape::ClobberSavedExec,
-        Shape::NoBitmapUpdate,
-        Shape::TruncatedBitmapUpdate,
         Shape::UnresolvedOffset,
     ] {
         let native = translate(&shader(32, shape))
             .ok()
             .and_then(|t| t.required_wave_size);
         assert_eq!(native, None, "{shape:?}");
+    }
+}
+
+#[test]
+fn unbounded_loops_with_uniform_scalars_keep_the_watchdog() {
+    // No termination proof, but every scalar stays wave-uniform: the lanes
+    // branch together and leave each loop together, watchdog included.
+    for shape in [
+        Shape::EmptyExec,
+        Shape::ClobberSavedExec,
+        Shape::NoBitmapUpdate,
+        Shape::TruncatedBitmapUpdate,
+    ] {
+        let translated = translate(&shader(32, shape)).unwrap_or_else(|e| panic!("{shape:?}: {e}"));
+        assert_eq!(translated.required_wave_size, Some(32), "{shape:?}");
+        assert!(translated.hlsl.contains("++tb_guard < 65536u"), "{shape:?}");
     }
 }
 

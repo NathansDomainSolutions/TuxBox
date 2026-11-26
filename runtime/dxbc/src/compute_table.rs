@@ -16,6 +16,8 @@ pub struct Binding {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ResolveConstants {
+    /// The root parameter that holds the constants.
+    pub param: u32,
     pub register: u32,
     pub space: u32,
 }
@@ -162,7 +164,13 @@ fn read_bindings(
         let descriptor_location = if let Some((_, normalized)) = raster_table {
             normalized
         } else if stage <= 1 && matches!(class, 0x300 | 0x302 | 0x303)
-            && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) } else { location };
+            && (location >> 8) & 0xff == 9 { 0x800 | (location & 0xff) }
+        // A compute root can have more than two tables. A descriptor in a later
+        // one is encoded like one in table 1; with a root, the user-data check
+        // below confirms its parameter and SGPR from the real location.
+        else if stage == 5 && root.is_some() && matches!(class, 0x300 | 0x302 | 0x303)
+            && location >> 16 >= 2 && matches!(location & 0xff, 4 | 8) { 0x10500 | (location & 0xff) }
+        else { location };
         let (kind, psv_type) = match (class, descriptor_location) {
             (0x300, 0x408 | 0x10508) if stage == 5 => (0, 3), // typed SRV
             // A four-dword buffer descriptor represents typed, raw or structured
@@ -194,13 +202,16 @@ fn read_bindings(
             (0x300, 0x804) if stage <= 1 && (4..=2048).contains(&shape) && shape % 4 == 0 => {
                 let named = |ty| rows.chunks_exact(stride)
                     .any(|r| word(r, 0) == Some(ty) && word(r, 8) == Some(register) && word(r, 12) == Some(register));
-                // Only under the newly reflected roots, so other paths keep their result.
-                (0, if named(5) || multi_table.is_none() { 5 } else { 3 })
+                // Only under a reflected root, so root-less translations keep their result.
+                (0, if named(5) || root.is_none() { 5 } else { 3 })
             }
             (0x302, 0x804) if stage <= 1 => (2, 2),
             (2, 0x10904) if stage == 0 => (4, 2), // root constants in s9
             (2, _) if raster_constants && location & 0xff == 4 => (4, 2),
             (2, 0x10504 | 0x20604) if stage == 5 => (4, 2),
+            // Constants in a later parameter of an extended compute root; the
+            // user-data check below confirms parameter, register and size.
+            (2, _) if stage == 5 && root.is_some() && location >> 16 >= 2 => (4, 2),
             (0x100, _) if raster_root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
             (0x401, _) => (3, 1),                 // inlined static sampler
             _ => return None,
@@ -224,10 +235,19 @@ fn read_bindings(
                     || !user_layout.contains(&[0, 0, num32, register, location >> 8]) {
                     return None;
                 }
+                let constants = ResolveConstants { param: table, register, space };
                 if resolve_register == Some(register) && location == 0x20604 && num32 == 4 {
-                    resolve_constants = Some(ResolveConstants { register, space });
+                    resolve_constants = Some(constants);
                 } else if (reg, sp) != (register, space) {
-                    return None;
+                    // The console reads root constants from user SGPRs, so a
+                    // title may pair this program with a root whose constants
+                    // carry another register. The user-data record above
+                    // already matched their parameter and size; a reflected
+                    // root moves that parameter to the program's register.
+                    if resolve_constants.is_some_and(|c: ResolveConstants| c != constants) {
+                        return None;
+                    }
+                    resolve_constants = Some(constants);
                 }
             } else if kind == ROOT_SRV {
                 let param = root.params.get(table as usize)?;

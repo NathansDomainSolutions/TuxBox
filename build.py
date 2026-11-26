@@ -333,6 +333,8 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         controls = tools.compile(src / "input.cpp", objects)
         game = tools.compile(src / "game.cpp", objects)
         subprocess.run([sys.executable, str(src / "shader_fixture.py"), "xbox_shader.h"], cwd=objects, check=True)
+        subprocess.run([sys.executable, str(src / "raster_fixture.py"), "raster_shader.h"], cwd=objects, check=True)
+        subprocess.run([sys.executable, str(src / "wave_alloc_fixture.py"), "wave_alloc_shader.h"], cwd=objects, check=True)
         selftest = tools.compile(src / "selftest.cpp", objects, f"/I{objects}")
         xmem, d3d, gameinput = OUTPUT / "xmem-smoke", OUTPUT / "d3d12-smoke", OUTPUT / "gameinput"
         tools.link(objects / "lanes.exe", course, screen, controls, game, selftest, xmem / "xmem.lib",

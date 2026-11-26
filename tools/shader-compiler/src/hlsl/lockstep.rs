@@ -177,7 +177,10 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
             if inputs == Class::Conflict {
                 return None;
             }
-            if name == ray_resolve::READ_LANE || name == COUNT_LANES || name == "tb_first_active_lane"
+            if name == ray_resolve::READ_LANE
+                || name == super::indexed_lane::WAVE32_READ_LANE
+                || name == COUNT_LANES
+                || name == "tb_first_active_lane"
                 || (name.starts_with("s_ff1_i32") && op.src == [Opnd::ExecLo])
             {
                 state.set(destination?, 1, Class::Uniform);

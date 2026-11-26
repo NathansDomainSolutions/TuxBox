@@ -211,3 +211,63 @@ fn a_static_sampler_the_root_leaves_out_takes_its_declared_register() {
     elsewhere[10] = 1;
     assert_eq!(omitted(&[(17, 1), (1, 1)], &[17, 1], &[elsewhere]), None);
 }
+
+#[test]
+fn a_literal_state_no_static_sampler_has_takes_a_private_register() {
+    // The program above: a comparison state, then a linear clamped one.
+    let words = [
+        0xb008_30b6u32, // s_movk_i32 s8
+        0xbe89_03ff, 0x00c0_0000,
+        0xbe8a_03ff, 0x1850_0000,
+        0xbe8b_03ff, 0x8000_0000,
+        0xf0a0_0f08, 0x0040_0a0a, // image_sample_c
+        0xb008_0092, // s_movk_i32 s8, clamp
+        0xbe8b_0380, // s_mov_b32 s11, 0
+        0xf080_0f08, 0x0040_0a0a, // image_sample
+        0xbf81_0000,
+    ];
+    let isa: Vec<_> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let carried = super::descriptor([0x92, 0xc00000, 0x18500000, 0], 1, 1, 0, false).unwrap();
+    let shadow = [0x95, 4, 4, 3, 0, 1, 4, 2, 0, 12.0_f32.to_bits(), 20, 32765, 5];
+    let unmatched = |statics: &[[u32; 13]], first| super::unmatched_states(&isa, 5, statics, first);
+    // Only the state the root lacks is added, from the first free register.
+    assert_eq!(unmatched(&[carried], 20), Some(vec![shadow]));
+    // The register a static sampler has does not matter, only its state.
+    let mut other = carried;
+    other[10] = 17;
+    assert_eq!(unmatched(&[other], 20), Some(vec![shadow]));
+    // One visible only to another stage does not count; both states are added.
+    other[12] = 1;
+    let both = unmatched(&[other], 20).unwrap();
+    assert_eq!(both.iter().map(|s| (s[10], s[11], s[12])).collect::<Vec<_>>(), [(20, 32765, 5), (21, 32765, 5)]);
+    assert!(both.iter().any(|s| s[..10] == shadow[..10]) && both.iter().any(|s| s[..10] == carried[..10]));
+    // The root has every state, has no static samplers of its own (`private`
+    // recovers those), or was built with private samplers already.
+    let mut carried_shadow = shadow;
+    carried_shadow[11] = 1;
+    assert_eq!(unmatched(&[carried, carried_shadow], 20), None);
+    assert_eq!(unmatched(&[], 0), None);
+    assert_eq!(unmatched(&[carried, shadow], 21), None);
+    assert_eq!(unmatched(&[carried], u32::MAX - 1), None);
+}
+
+#[test]
+fn private_sampler_registers_follow_every_sampler_register_of_the_root() {
+    use crate::rootsig::{RootParam, RootParamKind, RootRange, RootSig};
+    let table = |range_type, base_register, num| RootParam {
+        visibility: 0,
+        kind: RootParamKind::Table(vec![RootRange { range_type, num, base_register, space: 2, offset_in_table: 0 }]),
+    };
+    let mut statics = super::descriptor([0x92, 0xc00000, 0x18500000, 0], 6, 1, 0, false).unwrap();
+    let mut root = RootSig { version: 2, flags: 0, params: vec![table(3, 0, 4)], num_static_samplers: 1, static_samplers: vec![statics] };
+    assert_eq!(super::private_base(&root), Some(7));
+    // Sampler tables count in any space; views do not.
+    root.params = vec![table(3, 9, 3), table(0, 40, 1)];
+    assert_eq!(super::private_base(&root), Some(12));
+    statics[10] = 30;
+    root.static_samplers = vec![statics];
+    assert_eq!(super::private_base(&root), Some(31));
+    // An unbounded sampler range leaves no register after it.
+    root.params = vec![table(3, 9, u32::MAX)];
+    assert_eq!(super::private_base(&root), None);
+}

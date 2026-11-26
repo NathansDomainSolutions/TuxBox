@@ -13,6 +13,7 @@ class PerformanceTests(unittest.TestCase):
     def test_pipeline_timings_group_driver_retries_and_read_partial_traces(self):
         with TemporaryDirectory(prefix="pipeline timings ") as tmp:
             log = Mock(path=Path(tmp) / "run.log")
+            log.capture_parent.return_value = Path(tmp)
             env = {}
             with pipeline_capture("proton", env, log):
                 first = Path(env["VKD3D_QUEUE_PROFILE"].removeprefix("Z:").replace("\\", "/"))
@@ -43,6 +44,7 @@ class PerformanceTests(unittest.TestCase):
         with TemporaryDirectory(prefix="hud test ") as tmp, patch("shutil.which", return_value="/usr/bin/mangohud"), \
                 patch("project_tuxbox.mangohud.monotonic", side_effect=[0.0, 1.0]):
             log = Mock(path=Path(tmp) / "run.log")
+            log.capture_parent.return_value = Path(tmp)
             env = {"MANGOHUD_CONFIG": "no_display", "DISABLE_MANGOHUD": "1",
                    "TUXBOX_MANGOHUD_PCI": "0000:01:00.0"}
             with self.assertRaises(KeyboardInterrupt):

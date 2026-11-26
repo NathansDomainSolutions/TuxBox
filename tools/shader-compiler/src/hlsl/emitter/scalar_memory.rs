@@ -14,6 +14,21 @@ impl<'a> Emitter<'a> {
                 self.touch(&dst);
                 let byte_offset = if ins.aux.imm == 0 { value }
                     else { format!("({value} + {:#x}u)", ins.aux.imm as u32) };
+                // Word 1 of a buffer V# holds its stride in bits 16..29. With the
+                // runtime's stride table it carries the slot's stride the same way,
+                // so an IDXEN access can scale its index (`raw_address`). The slot
+                // is read before the destination, which may be the offset register.
+                if let (true, 2, Opnd::Sgpr(base @ 0..=104)) = (self.heap_strides, ins.op, dst) {
+                    let slot = format!("t{}", self.tmp);
+                    self.tmp += 1;
+                    self.line(&format!("uint {slot} = {byte_offset} >> 5;"));
+                    self.ws(&dst, &format!("tb_heap_index({slot})"))?;
+                    let word1 = sreg_opnd(base + 1);
+                    self.touch(&word1);
+                    self.ws(&word1, &format!("((tb_heap_strides.Load(4u * {slot}) & 0x3fffu) << 16)"))?;
+                    self.heap_strides_used = true;
+                    return Ok(());
+                }
                 self.ws(&dst, &format!("tb_heap_index({byte_offset} >> 5)"))?;
                 return Ok(());
             }

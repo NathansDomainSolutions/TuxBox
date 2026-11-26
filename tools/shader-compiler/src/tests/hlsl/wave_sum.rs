@@ -797,3 +797,281 @@ fn execz_skip_allows_uniform_merge_branch_in_window() {
         assert!(check_control_flow(&ops, width).is_ok());
     }
 }
+
+#[test]
+fn portable_reduction_flattens_all_local_coordinates() {
+    let (mut shader, _, _) = fixture::shader(64);
+    for group in [[8, 8, 1], [4, 4, 4], [1, 8, 8], [16, 1, 4]] {
+        shader.psv_threads = Some(group);
+        let translated = super::super::translate(&shader).expect("single complete logical wave");
+        assert_eq!(translated.required_wave_size, None, "{group:?}");
+        assert_eq!(translated.portable_compute_group, Some(group));
+        assert!(!translated.hlsl.contains("WaveReadLaneAt("));
+        assert!(!translated.hlsl.contains("[WaveSize("));
+        let lane = portable_lane_id(group);
+        assert!(translated.hlsl.contains(&format!("tb_reduction_read({lane},")));
+        assert!(!translated.hlsl.contains("tb_reduction_read(gtid.x,"));
+    }
+    for group in [[8, 8, 2], [4, 4, 8]] {
+        shader.psv_threads = Some(group);
+        let translated = super::super::translate(&shader).unwrap();
+        assert_eq!(translated.required_wave_size, Some(64));
+    }
+}
+
+#[test]
+fn straight_exchange_accepts_only_complete_single_wave_groups() {
+    let (mut shader, _, _) = fixture::shader(32);
+    let words = [0x2800_00e9u32, 0xde54_c100, 0xd760_0007, 0x0001_0100, 0xbf81_0000];
+    shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    shader.isa_data = shader.isa.clone();
+    for group in [[8, 4, 1], [4, 4, 2], [1, 4, 8]] {
+        shader.psv_threads = Some(group);
+        let t = super::super::translate(&shader).unwrap();
+        assert_eq!(t.required_wave_size, None);
+        assert_eq!(t.portable_compute_group, Some(group));
+        let lane = portable_lane_id(group);
+        assert!(t.hlsl.contains(&format!("tb_reduction_read({lane}, v0,")));
+        assert!(!t.hlsl.contains("tb_reduction_read(gtid.x,"));
+    }
+    let ops = crate::rdna2::disassemble(&shader.isa);
+    for group in [[8, 8, 1], [4, 4, 4], [4, 4, 1], [0, 32, 1], [u32::MAX, 2, 1]] {
+        assert!(!straight_exchange(&mut ops.clone(), group), "{group:?}");
+    }
+    // With no lane read, DPP8 has the same eight-lane groups for either wave width.
+    let mut no_read = ops;
+    no_read.remove(1);
+    for group in [[8, 8, 1], [4, 4, 4]] {
+        assert!(straight_exchange(&mut no_read.clone(), group));
+    }
+}
+
+#[test]
+fn straight_dpp8_portability_spans_multiple_waves_without_cross_wave_reads() {
+    let (mut shader, _, _) = fixture::shader(64);
+    let words = [0x2800_00e9u32, 0xde54_c100, 0xbf81_0000];
+    shader.isa = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    shader.isa_data = shader.isa.clone();
+    for group in [[128, 1, 1], [8, 12, 1], [16, 8, 2], [32, 32, 1], [4, 4, 64]] {
+        shader.psv_threads = Some(group);
+        let t = super::super::translate(&shader).expect("convergent DPP8 exchange");
+        let count = group.into_iter().product::<u32>();
+        assert_eq!(t.required_wave_size, None);
+        assert_eq!(t.portable_compute_group, Some(group));
+        assert!(t.hlsl.contains(&format!("tb_reduction_lanes[{count}]")));
+        assert!(t.hlsl.contains(&format!("({} & ~7u)", portable_lane_id(group))));
+        assert!(!t.hlsl.contains("WaveReadLaneAt("));
+    }
+    let ops = crate::rdna2::disassemble(&shader.isa);
+    for group in [[1, 1, 128], [31, 1, 1], [100, 1, 1], [1024, 2, 1], [0, 32, 1]] {
+        assert!(!straight_exchange(&mut ops.clone(), group), "{group:?}");
+    }
+}
+
+/// The compaction scan from ProjectScarlett compute shaders (0c40c71fbff2 at
+/// 0x97c): a masked select copied to the accumulator, a DPP16 row-shift
+/// inclusive scan, the cross-row add, and the exclusive result.
+fn row_scan_shader(words_before_scan: &[u32]) -> ShaderExtract {
+    let (mut ex, _, _) = fixture::shader(32);
+    let mut words = vec![
+        0xbe82_3dc1,              // s_or_saveexec_b32 s2, -1
+        0xd501_0001, 0x000a_1a80, // v_cndmask_b32 v1, 0, v13, s2
+        0x7e04_0301,              // v_mov_b32 v2, v1
+    ];
+    words.extend_from_slice(words_before_scan);
+    words.extend([
+        0x4a04_04fa, 0xff09_1102, // v_add_nc_u32 v2, row_shr:1 bound_ctrl
+        0x4a04_04fa, 0xff01_1202, // row_shr:2
+        0x4a04_04fa, 0xff01_1402, // row_shr:4
+        0x4a04_04fa, 0xff01_1802, // row_shr:8
+        0xbefe_03ff, 0xffff_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xd778_4803, 0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi
+        0x4a04_0503,              // v_add_nc_u32 v2, v3, v2
+        0xbefe_03c1,              // s_mov_b32 exec_lo, -1
+        0x4c04_0302,              // v_sub_nc_u32 v2, v2, v1
+        0xbefe_0302,              // s_mov_b32 exec_lo, s2
+        0xbf81_0000,              // s_endpgm
+    ]);
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    ex.isa_data = ex.isa.clone();
+    ex
+}
+
+#[test]
+fn row_shift_scan_after_a_select_copy_is_a_wave_prefix_sum() {
+    let translated = super::super::translate(&row_scan_shader(&[])).expect("row scan");
+    assert_eq!(translated.required_wave_size, Some(32));
+    let hlsl = translated.hlsl;
+    // The copy becomes the same select into the accumulator.
+    assert!(hlsl.contains("v2 = select(tb_live, (uint)(") || hlsl.contains("v2 = ((s2 & 1u)"), "{hlsl}");
+    assert!(hlsl.contains("_scan = WavePrefixSum(v2) + v2;"), "{hlsl}");
+    assert!(hlsl.contains("if (WaveGetLaneIndex() >= 16u) v3 = WaveReadLaneAt("), "{hlsl}");
+    assert!(!hlsl.contains("v_permlanex16"), "{hlsl}");
+}
+
+#[test]
+fn row_scan_needs_every_lane_and_the_exact_shifts() {
+    // EXEC changes between the SAVEEXEC and the scan.
+    assert!(super::super::translate(&row_scan_shader(&[0xbefe_0302])).is_err());
+    // A different shift sequence (row_shr:3 in the second step) is not a scan.
+    let mut ex = row_scan_shader(&[]);
+    let mut words: Vec<u32> = ex.isa.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    let second = words.iter().position(|&w| w == 0xff01_1202).unwrap();
+    words[second] = 0xff01_1302;
+    ex.isa = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    ex.isa_data = ex.isa.clone();
+    assert!(super::super::translate(&ex).is_err());
+}
+
+#[test]
+fn select_copy_merge_keeps_both_registers() {
+    let select = |dst: u8, mask: u8| {
+        let mut i = insn("v_cndmask_b32", Enc::Vop3, 1, vec![Opnd::Vgpr(dst)],
+            vec![Opnd::ConstInt(0), Opnd::Vgpr(13), Opnd::Sgpr(mask)]);
+        i.raw = vec![0xd501_0000 | u32::from(dst), 0x000a_1a80];
+        i
+    };
+    let mut copy = insn("v_mov_b32", Enc::Vop1, 1, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]);
+    copy.offset = 8;
+    let add = insn("v_add_nc_u32", Enc::Vop2, 37, vec![Opnd::Vgpr(2)], vec![Opnd::Raw(250), Opnd::Vgpr(2)]);
+    let mut ops = vec![select(1, 2), copy, add.clone()];
+    merge_select_copy(&mut ops, 2);
+    assert_eq!(ops[0].dst, [Opnd::Vgpr(1)]);
+    assert_eq!(ops[1].mnemonic, "v_cndmask_b32");
+    assert_eq!(ops[1].dst, [Opnd::Vgpr(2)]);
+    assert_eq!(ops[1].src, ops[0].src);
+    assert_eq!((ops[1].offset, ops[1].raw[0] & 0xff), (8, 2));
+    // A select that reads the accumulator keeps its copy.
+    let mut reads = select(1, 2);
+    reads.src[1] = Opnd::Vgpr(2);
+    let mut ops = vec![reads, ops[1].clone(), add];
+    ops[1] = insn("v_mov_b32", Enc::Vop1, 1, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]);
+    merge_select_copy(&mut ops, 2);
+    assert_eq!(ops[1].mnemonic, "v_mov_b32");
+}
+
+/// A single DPP8/DPP16 shuffle as the pattern matchers expect: `v_add_nc_u32`
+/// with the selector as a raw operand and the control word in the second word.
+fn dpp_ins(acc: u8, selector: u16, ctrl: u32) -> Insn {
+    Insn {
+        offset: 0,
+        dwords: 1,
+        enc: Enc::Vop2,
+        op: 0,
+        raw: vec![0, ctrl << 8 | u32::from(acc)],
+        mnemonic: "v_add_nc_u32".into(),
+        dst: vec![Opnd::Vgpr(acc)],
+        src: vec![Opnd::Raw(selector), Opnd::Vgpr(acc)],
+        aux: Default::default(),
+    }
+}
+
+/// A wave32 masked DPP exclusive prefix: save-EXEC, cndmask, the inclusive
+/// row_shr scan, the cross-row carry, the input subtraction and the final move.
+/// The permlanex temporary is v3 and the accumulator is v2.
+fn wave32_prefix() -> Vec<Insn> {
+    let mut ops = vec![
+        insn("v_mov_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(0)], vec![Opnd::ConstInt(1)]),
+        insn("s_or_saveexec_b32", Enc::Sop1, 0, vec![Opnd::Sgpr(0)], vec![Opnd::ConstInt(-1)]),
+        insn("v_cndmask_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(1)],
+             vec![Opnd::ConstInt(0), Opnd::Vgpr(0), Opnd::Sgpr(0)]),
+        insn("v_mov_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(1)]),
+        dpp_ins(2, 250, 0xff0911),
+        dpp_ins(2, 250, 0xff0112),
+        dpp_ins(2, 250, 0xff0114),
+        dpp_ins(2, 250, 0xff0118),
+        insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Literal(0xffff0000)]),
+        insn("v_permlanex16_b32", Enc::Vop1, 0, vec![Opnd::Vgpr(3)],
+             vec![Opnd::Vgpr(2), Opnd::ConstInt(-1), Opnd::ConstInt(-1)]),
+        insn("v_add_nc_u32", Enc::Vop2, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(3), Opnd::Vgpr(2)]),
+        insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::ConstInt(-1)]),
+        insn("v_sub_nc_u32", Enc::Vop2, 0, vec![Opnd::Vgpr(2)], vec![Opnd::Vgpr(2), Opnd::Vgpr(1)]),
+        insn("s_mov_b32", Enc::Sop1, 0, vec![Opnd::ExecLo], vec![Opnd::Sgpr(0)]),
+        insn("v_mov_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(4)], vec![Opnd::Vgpr(2)]),
+    ];
+    offsets(&mut ops);
+    ops
+}
+
+#[test]
+fn wave32_prefix_after_an_early_exit_is_not_a_scan_region() {
+    // An exclusive prefix is a whole-wave collective, not a scan region: an
+    // early exit before it must not be rejected as a divergence of a DPP
+    // reduction, and the pipeline's control-flow validation must not see it.
+    let mut ops = vec![insn("s_endpgm", Enc::Sopp, 1, vec![], vec![])];
+    ops.extend(wave32_prefix());
+    offsets(&mut ops);
+    let width = super::super::wave_alloc::prepare(&mut ops, Stage::Compute).unwrap();
+    assert_eq!(width, Some(32));
+    assert!(ops.iter().any(|i| i.mnemonic == "tb_wave_exclusive_prefix_u32"),
+            "the prefix must be lowered");
+    assert!(super::super::wave_sum::check_control_flow(&ops, 32).is_ok(),
+            "the rewritten prefix must not be validated as a reduction region");
+}
+
+#[test]
+fn wave32_prefix_is_rejected_when_the_scratch_temp_is_read_later() {
+    // The clean prefix is lowered to the exclusive-prefix pseudo-op.
+    let mut clean = wave32_prefix();
+    let width = super::super::wave_alloc::prepare(&mut clean, Stage::Compute).unwrap();
+    assert_eq!(width, Some(32));
+    assert!(clean.iter().any(|i| i.mnemonic == "tb_wave_exclusive_prefix_u32"),
+            "the clean prefix must be lowered");
+
+    // A later read of the nopped permlanex temporary (v3) would receive stale
+    // data, so the liveness proof must reject the lowering.
+    let mut live = wave32_prefix();
+    live.push(insn("v_mov_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(5)], vec![Opnd::Vgpr(3)]));
+    offsets(&mut live);
+    let width = super::super::wave_alloc::prepare(&mut live, Stage::Compute).unwrap();
+    assert_eq!(width, None, "a live scratch temporary must prevent the lowering");
+    assert!(!live.iter().any(|i| i.mnemonic == "tb_wave_exclusive_prefix_u32"));
+}
+
+/// Disassemble the 64-lane whole-wave total from the wave-guard fixture.
+fn wave64_total() -> Vec<Insn> {
+    let raw = [
+        0xbe80_25c1u32,
+        0xd501_0002, 0x0002_0080,
+        0x4a04_04e9, 0xde54_c102,
+        0x4a04_04e9, 0x9360_1202,
+        0x4a04_04e9, 0x0009_2402,
+        0x4a04_04fa, 0xff09_4002,
+        0xd778_0003, 0x0201_0102,
+        0x4a04_0503,
+        0xd760_0006, 0x0001_4102,
+        0x4a04_0406,
+        0xd760_0007, 0x0001_0102,
+        0xbefe_0400,
+    ];
+    let block: Vec<u8> = raw.iter().flat_map(|w| w.to_le_bytes()).collect();
+    crate::rdna2::disassemble(&block)
+}
+
+/// Append a plain vector move that reads `reg`, mirroring a later use of a
+/// scratch register.
+fn read_later(ops: &mut Vec<Insn>, reg: Opnd, new_reg: u8) {
+    let last = ops.last().unwrap().offset + ops.last().unwrap().dwords * 4;
+    ops.push(insn("v_mov_b32", Enc::Vop2, 0, vec![Opnd::Vgpr(new_reg)], vec![reg]));
+    ops.last_mut().unwrap().offset = last;
+}
+
+#[test]
+fn wave64_total_is_rejected_when_a_scratch_temp_is_read_later() {
+    // The clean 64-lane total (pixel) is lowered to the WaveActiveSum pseudo-op.
+    let mut clean = wave64_total();
+    let width = super::super::wave_alloc::prepare(&mut clean, Stage::Pixel).unwrap();
+    assert_eq!(width, Some(64), "the clean total must be lowered");
+    assert!(clean.iter().any(|i| i.mnemonic == "tb_wave_total_u32"));
+
+    // A later read of the accumulator (v2), the permlanex temp (v3) or the
+    // cross-half readlane result (v6, consumed as an SGPR) would receive stale
+    // data, so the liveness proof must reject the lowering.
+    for (reg, new_reg) in [(Opnd::Vgpr(2), 40u8), (Opnd::Vgpr(3), 41u8), (Opnd::Sgpr(6), 42u8)] {
+        let mut live = wave64_total();
+        read_later(&mut live, reg, new_reg);
+        let width = super::super::wave_alloc::prepare(&mut live, Stage::Pixel).unwrap();
+        assert_eq!(width, None, "a live scratch register must prevent the lowering");
+        assert!(!live.iter().any(|i| i.mnemonic == "tb_wave_total_u32"));
+    }
+}

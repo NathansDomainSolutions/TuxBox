@@ -21,6 +21,7 @@ use windows::core::Result;
 
 use super::title_memory::GuestMemory;
 mod index_map;
+mod strides;
 pub(crate) use index_map::index_map;
 
 #[derive(Default)]
@@ -266,6 +267,7 @@ struct NativeArena {
     imported: super::placement::DescriptorRange<super::views::DescriptorBacking>,
     placed: super::placement::DescriptorRange<super::placement::PlacedView>,
     scenes: super::placement::DescriptorRange<super::blas::SceneView>,
+    _strides: super::placement::DescriptorRange<u32>,
     _staging: ID3D12DescriptorHeap,
     visible: ID3D12DescriptorHeap,
     device: ID3D12Device,
@@ -286,6 +288,7 @@ pub(crate) struct Arena {
     // Guest ranges can overlap. Keep stable slots for every table that has
     // been referenced; a CPU descriptor update is published to each alias.
     tables: Mutex<Tables>,
+    strides: Mutex<strides::Strides>,
 }
 
 impl Drop for Arena {
@@ -359,6 +362,11 @@ impl Arena {
             .views
             .heap(device, &staging, &cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
             .ok_or(E_INVALIDARG)?;
+        let strides = owner
+            .state
+            .view_strides
+            .heap(device, &staging, &cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            .ok_or(E_INVALIDARG)?;
         let arena = Arc::new(Self {
             base_address,
             native: Some(NativeArena {
@@ -366,6 +374,7 @@ impl Arena {
                 imported,
                 placed,
                 scenes,
+                _strides: strides,
                 _staging: staging,
                 visible,
                 device: device.clone(),
@@ -380,6 +389,7 @@ impl Arena {
             inline,
             authored: Mutex::default(),
             tables: Mutex::new(Tables::default()),
+            strides: Mutex::default(),
         });
         let mut entries = registry.arenas.lock().unwrap_or_else(|e| e.into_inner());
         entries.insert(arena.base(), Arc::downgrade(&arena));
@@ -627,6 +637,8 @@ impl Arena {
 pub(super) struct Write {
     arena: Option<Arc<Arena>>,
     address: usize,
+    // The console buffer stride of the new view (0 when it has none).
+    stride: std::cell::Cell<u32>,
 }
 impl Write {
     pub(super) fn new(registry: &Registry, handle: &mut D3D12_CPU_DESCRIPTOR_HANDLE) -> Self {
@@ -635,12 +647,19 @@ impl Write {
         if let Some(a) = &arena {
             *handle = a.cpu(address);
         }
-        Self { arena, address }
+        Self { arena, address, stride: std::cell::Cell::new(0) }
+    }
+
+    pub(super) fn set_stride(&self, stride: u32) {
+        self.stride.set(stride);
     }
 }
 impl Drop for Write {
     fn drop(&mut self) {
         if let Some(arena) = &self.arena {
+            // Every write replaces the slot's stride, so a later view of another
+            // kind does not inherit one.
+            arena.set_strides(self.address, &[self.stride.get()]);
             arena.author(self.address, 1);
             arena.publish(self.address, 1);
         }

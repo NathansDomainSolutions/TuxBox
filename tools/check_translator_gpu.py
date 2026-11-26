@@ -7,6 +7,7 @@ model. No game data is used. Builds the translator's example emitters first.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -46,15 +47,30 @@ CHECKS = {
     "sad-mad64": assembled("check_sad_mad64_gpu"),
     "f64": assembled("check_f64_exact_gpu"),
     "swizzle": Check("check_compute_swizzle", emitter="compute_swizzle"),
+    "readlane": Check("check_readlane_gpu", emitter="readlane_probe", dxc=True),
     **{f"wave-extrema-{width}": Check("check_wave_extrema", emitter="wave_extrema", dxc=True,
                                       extra=("--width", str(width)))
        for width in (32, 64)},
     **{f"wave-guard-{width}-{variant}": Check("check_wave_guard", emitter="wave_guard",
                                               extra=("--width", str(width), "--variant", variant))
        for width in (32, 64) for variant in ("original", "chain", "chain-zero")},
+    "wave-guard-64-2d": Check("check_wave_guard", emitter="wave_guard",
+                              extra=("--width", "64", "--group", "8", "8", "1")),
+    "wave-guard-64-3d": Check("check_wave_guard", emitter="wave_guard",
+                              extra=("--width", "64", "--group", "4", "4", "4")),
     "lockstep": Check("check_lockstep_gpu", emitter="lockstep", llvm=True, dxc=True),
+    "lds-bounds": Check("check_lds_bounds_gpu", emitter="lds_bounds", dxc=True),
+    "paired-wave64": Check("check_paired_wave64", emitter="paired_wave64", llvm=True, dxc=True),
+    "mask-ballots": Check("check_mask_ballots_gpu", emitter="mask_ballots", llvm=True, dxc=True),
     "dpp8-exchange": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True),
+    **{f"dpp8-exchange-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
+                                       extra=("--layout", layout))
+       for layout in ("2d", "3d")},
+    **{f"dpp8-multiwave-{layout}": Check("check_dpp8_exchange", emitter="lone_lane_probe", dxc=True,
+                                        extra=("--layout", layout, "--multiwave"))
+       for layout in ("linear", "2d", "3d")},
     "pixel-heap-offsets": Check("check_pixel_heap_offsets", emitter="pixel_heap_offsets", dxc=True),
+    "straight-pixel-quads": Check("check_straight_pixel_quads", emitter="straight_pixel_quads", dxc=True),
     "pixel-link": Check("check_portable_pixel_link", emitter="xshader", dxc=True),
     "pixel-link-slot86": Check("check_slot86_portable_link", emitter="xshader", dxc=True),
     "raw-index": Check("check_raw_index",
@@ -115,6 +131,55 @@ def command_for(name, emitters, tools, host, work):
     return command + ["--work", str(work / name), "--output", str(work / f"{name}.json")]
 
 
+def vulkan_device(adapter, summary):
+    """The fields `vulkaninfo --summary` lists for a PCI vendor:device ID, or None."""
+    wanted = tuple(int(part, 16) for part in adapter.split(":"))
+    for block in re.split(r"^GPU\d+:\s*$", summary, flags=re.MULTILINE)[1:]:
+        fields = dict(re.findall(r"^\s*(vendorID|deviceID|deviceName|deviceUUID)\s*=\s*(.+?)\s*$", block, re.MULTILINE))
+        if (int(fields.get("vendorID", "-1"), 16), int(fields.get("deviceID", "-1"), 16)) == wanted:
+            return fields
+    return None
+
+
+def vulkan_device_name(adapter, summary):
+    """The device name `vulkaninfo --summary` lists for a PCI vendor:device ID, or None."""
+    return (vulkan_device(adapter, summary) or {}).get("deviceName")
+
+
+def device_filter(fields):
+    """The environment that makes DXVK expose only this device.
+
+    A Proton guest can see a device under another name than the host prints:
+    "AMD Radeon RX 6900 XT (RADV NAVI21)" on the host was
+    "Radeon RX 6800/6800 XT / 6900 XT" in the guest. The device UUID is the
+    same on both sides, so filter by it. DXVK compares the UUID as 32 hex
+    digits. Without a UUID, fall back to the name.
+    """
+    uuid = re.sub(r"[^0-9a-f]", "", fields.get("deviceUUID", "").lower())
+    if len(uuid) == 32:
+        return {"DXVK_FILTER_DEVICE_UUID": uuid}
+    name = fields.get("deviceName")
+    return {"VKD3D_FILTER_DEVICE_NAME": name, "DXVK_FILTER_DEVICE_NAME": name} if name else {}
+
+
+def select_adapter(adapter):
+    """Have DXVK expose only the requested adapter.
+
+    The guests create their device on the default adapter, so on a machine
+    with several GPUs they would otherwise run on whichever one comes first.
+    """
+    try:
+        summary = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True,
+                                 timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    fields = vulkan_device(adapter, summary)
+    if not fields:
+        return None
+    os.environ.update(device_filter(fields))
+    return fields.get("deviceName")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ("provider", "proton", "prefix", "compiler-dir", "dxc", "work"):
@@ -135,6 +200,9 @@ def main(argv=None):
         ap.error("choose a fresh work directory")
     work.mkdir(parents=True)
     emitters = build_emitters()
+    device = select_adapter(a.adapter)
+    print(f"adapter {a.adapter.lower()}: {device or 'default Vulkan device (vulkaninfo did not list it)'}",
+          flush=True)
     host = {"provider": a.provider.resolve(), "proton": a.proton.resolve(), "prefix": a.prefix.resolve(),
             "compiler-dir": a.compiler_dir.resolve(), "adapter": a.adapter.lower()}
     results = []

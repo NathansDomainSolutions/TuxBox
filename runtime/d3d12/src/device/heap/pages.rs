@@ -43,13 +43,21 @@ impl PagePools {
         token
     }
 
-    pub(super) fn import(&self, device: &ID3D12Device13, base: u64, size: u64, pin: ImportPin, source: &'static str) -> windows::core::Result<Arc<ImportedHeap>> {
+    /// Import the guest pages at `base` from `backing`. Caches stay keyed on
+    /// the guest address: a remap retires imports by the address it changes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn import(&self, device: &ID3D12Device13, base: u64, backing: super::backing::Backing, size: u64,
+        pin: ImportPin, source: &'static str, mirror: bool) -> windows::core::Result<Arc<ImportedHeap>> {
+        let memory = backing.address;
         let open = || -> windows::core::Result<Arc<ImportedHeap>> {
-            let native = unsafe { device.OpenExistingHeapFromAddress1(base as _, size as usize) }.map_err(|error| {
+            if mirror {
+                return super::shadow::open_shadow_sized(device, backing, size, pin, source);
+            }
+            let native = unsafe { device.OpenExistingHeapFromAddress1(memory as _, size as usize) }.map_err(|error| {
                 trace_import_failure(source, "sized", size, error.code());
                 error
             })?;
-            Ok(Arc::new(ImportedHeap { native, _pin: pin }))
+            Ok(Arc::new(ImportedHeap::direct(native, pin, backing)))
         };
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             use std::sync::atomic::AtomicU64;
@@ -57,35 +65,36 @@ impl PagePools {
             if let Some(pool) = pools.values_mut().find(|pool| pool.start <= base && base + size <= pool.end) {
                 static OPEN: AtomicU64 = AtomicU64::new(0);
                 static HIT: AtomicU64 = AtomicU64::new(0);
-                return reuse_page(&mut pool.pages, base, open, [("pool_open", &OPEN), ("pool_hit", &HIT)], source, size);
+                return reuse_page(&mut pool.pages, base, memory, open, [("pool_open", &OPEN), ("pool_hit", &HIT)], source, size);
             }
             drop(pools);
             static OPEN: AtomicU64 = AtomicU64::new(0);
             static HIT: AtomicU64 = AtomicU64::new(0);
             let mut loose = self.loose.lock().unwrap_or_else(|e| e.into_inner());
-            return reuse_page(&mut loose, base, open, [("page_open", &OPEN), ("page_hit", &HIT)], source, size);
+            return reuse_page(&mut loose, base, memory, open, [("page_open", &OPEN), ("page_hit", &HIT)], source, size);
         }
         if let Some(key) = span_key(base, size) {
             use std::sync::atomic::AtomicU64;
             static OPEN: AtomicU64 = AtomicU64::new(0);
             static HIT: AtomicU64 = AtomicU64::new(0);
             let mut loose = self.loose.lock().unwrap_or_else(|e| e.into_inner());
-            return reuse_page(&mut loose, key, open, [("span_open", &OPEN), ("span_hit", &HIT)], source, size);
+            return reuse_page(&mut loose, key, memory, open, [("span_open", &OPEN), ("span_hit", &HIT)], source, size);
         }
         open()
     }
 }
 
 // Interleaved allocations can revisit a page whose heap is still owned by a
-// resource. Reuse only that exact live import, while its pages are unchanged.
+// resource. Reuse only that exact live import, while its pages are unchanged
+// and still backed by the same `memory`.
 pub(super) fn reuse_page(
-    pages: &mut PageCache<ImportedHeap>, base: u64,
+    pages: &mut PageCache<ImportedHeap>, base: u64, memory: u64,
     open: impl FnOnce() -> windows::core::Result<Arc<ImportedHeap>>,
     [(open_path, opens), (hit_path, hits)]: [(&'static str, &std::sync::atomic::AtomicU64); 2],
     source: &'static str, size: u64,
 ) -> windows::core::Result<Arc<ImportedHeap>> {
     let mut opened = false;
-    let result = pages.get_or_open(base, ImportedHeap::is_live, || {
+    let result = pages.get_or_open(base, |heap| heap.reusable_for(memory), || {
         opened = true;
         open()
     });

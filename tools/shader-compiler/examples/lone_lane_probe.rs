@@ -17,12 +17,26 @@ fn main() {
     let rhs = u32::from_str_radix(&args[6],16).unwrap();
     let fi = args.get(7).map(|s| s.parse::<u32>().unwrap()).unwrap_or(0);
     assert!(fi <= 1);
-    let (mut ex, _, _) = fixture::shader(width);
+    let (mut ex, _, _) = fixture::shader(if width == 32 { 32 } else { 64 });
+    let group: Vec<u32> = args.iter().skip(8).map(|s| s.parse().expect("group dimension")).collect();
+    let group: [u32; 3] = if group.is_empty() { [width, 1, 1] }
+        else { group.try_into().expect("three group dimensions") };
+    assert_eq!(group.into_iter().try_fold(1u32, u32::checked_mul), Some(width));
+    assert!(group.into_iter().all(u32::is_power_of_two));
+    assert!((32..=1024).contains(&width) && width % 32 == 0 && group[2] <= 64);
+    ex.psv_threads = Some(group);
     // s_load_dwordx4 s[16:19],s[4:5],0; XOR lane with bias;
     // materialize independent second operand; DPP8 v4,v2,v1.
-    let mut words = vec![0xf4080402,0xfa000000,0xbf8cc07f,
-                         0x3a0400ff,bias,0x7e0202ff,rhs,
-                         (op<<24)|(0x000802e9+fi),(selectors<<8)|2];
+    let mut words = vec![0xf4080402,0xfa000000,0xbf8cc07f];
+    if group != [width, 1, 1] {
+        // Compute the native linear thread index in v0 from x, y and z.
+        let shift = |dst: u32, src: u32, n: u32| 0x34000000 | (dst << 17) | (src << 9) | (128 + n);
+        let add = |dst: u32, a: u32, b: u32| 0x4a000000 | (dst << 17) | (b << 9) | (256 + a);
+        words.extend([shift(6, 2, group[1].trailing_zeros()), add(6, 6, 1),
+            shift(6, 6, group[0].trailing_zeros()), add(0, 6, 0)]);
+    }
+    words.extend([0x3a0400ff,bias,0x7e0202ff,rhs,
+        (op<<24)|(0x000802e9+fi),(selectors<<8)|2]);
     if lane >= 0 {
         // v_readlane s7,v4,lane; v_mov v4,s7.
         words.extend([0xd7600007,((128+lane as u32)<<9)|260,0x7e080207]);
@@ -42,6 +56,7 @@ fn main() {
     });
     let t = hlsl::translate(&ex).expect("translate native DPP8 and store");
     assert_eq!(t.required_wave_size,None);
-    assert!(t.hlsl.contains("tb_reduction_read(gtid.x"));
+    assert!(t.hlsl.contains("tb_reduction_read("));
+    assert_eq!(t.portable_compute_group, Some(group));
     print!("{}",t.hlsl);
 }

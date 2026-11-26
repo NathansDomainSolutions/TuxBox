@@ -60,10 +60,23 @@ def rank(lines, reasons):
         if count <= 0:
             continue
         outcomes[outcome] += count
-        items = [(name, digest) for name, sep, digest in
-                 (item.partition("=") for item in stages.split())
-                 if sep and name and digest]
+        # A refusal may contain spaces. The next name=value starts a new field.
+        items = [(name, value) for name, sep, value in
+                 (item.partition("=") for item in re.split(r"\s+(?=[\w.]+=)", stages.strip()))
+                 if sep and name and value]
         used = {(name[:-5], digest) for name, digest in items if name.endswith(".used")}
+        refusal = next(((name.removesuffix(".refused"), value) for name, value in items
+                        if name.endswith(".refused")), None)
+        if refusal and outcome != "not listed":
+            stage, reason = refusal
+            pipelines[reason] += count
+            keys = {key for name, key in used if name == stage}
+            if not keys:
+                keys = {digest for name, digest in items if name == stage and digest != "unknown"}
+            distinct = shaders.setdefault(reason, set())
+            if len(keys) == 1:
+                distinct.update(keys)
+            continue
         missing = [(name[:-8], digest) for name, digest in items if name.endswith(".missing")]
         used_stages = {stage for stage, _ in used}
         # A raw digest is not the rooted request key. In modern rows, attribute

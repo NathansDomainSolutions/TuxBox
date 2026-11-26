@@ -3,10 +3,16 @@ use super::*;
 
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_insn(&mut self, idx: usize, ins: &Insn, is_ps: bool, br: Option<usize>) -> Result<(), String> {
+        if self.paired {
+            return paired_wave64::emit(self, idx, ins, is_ps, br);
+        }
         if dpp16::marked(ins) {
             dpp16::emit(self, idx, ins, is_ps, br)?;
         } else {
             self.emit_insn_body(idx, ins, is_ps, br)?;
+        }
+        for line in mask_ballots::capture(self, idx) {
+            self.line(&line);
         }
         if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
@@ -60,8 +66,20 @@ impl<'a> Emitter<'a> {
             }
             "tb_first_exec_lane" => return self.ws(&d.ok_or("missing election result")?, &format!("election{idx}")),
             "tb_indexed_readlane" => {
-                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins)?; }
+                if self.hoisted_swizzle != Some(idx) { self.emit_indexed_read(idx, ins, &[])?; }
                 self.ws(&d.ok_or("missing lane-read destination")?, &format!("readlane{idx}"))?;
+                return Ok(());
+            }
+            indexed_lane::WAVE32_READ_LANE => {
+                if self.dispatched {
+                    return Err("wave32 lane read in a block-dispatched program".into());
+                }
+                let value = r(&s[0])?;
+                let lane = match s[1] {
+                    Opnd::ConstInt(k @ 0..=31) => format!("{k}u"),
+                    _ => format!("({} & 31u)", r(&s[1])?),
+                };
+                self.ws(&d.ok_or("missing lane-read destination")?, &format!("WaveReadLaneAt({value}, {lane})"))?;
                 return Ok(());
             }
             "tb_view_occluded" => {
@@ -76,7 +94,7 @@ impl<'a> Emitter<'a> {
             "s_ff1_i32_b64" | "s_ff1_i32_b32" | "tb_first_active_lane" if lone_lane::on() && ins.src == [Opnd::ExecLo] => {
                 return self.ws(&d.ok_or("missing elected lane register")?, "((exec_lo & 1u) ? 0u : 0xffffffffu)");
             }
-            "s_ff1_i32_b64" if ins.src == [Opnd::ExecLo] => {
+            "s_ff1_i32_b64" if ins.src == [Opnd::ExecLo] && !self.paired => {
                 // WaveActiveMin returns the same lane ID to all participating invocations.
                 let dst = d.ok_or("missing elected lane register")?;
                 return self.ws(&dst, "WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu)");

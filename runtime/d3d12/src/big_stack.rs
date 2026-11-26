@@ -33,6 +33,8 @@ unsafe impl<T> Send for AssertSend<T> {}
 /// because that call produces no other log line.
 pub(crate) fn run_logged<R, F: FnOnce() -> R>(label: &str, job: F) -> R {
     let _watch = PipelineWatch::start(label);
+    // The calling title thread waits here for the whole driver compile.
+    let _pause = crate::title_watchdog::pause();
     let mut slot = Some(job);
     let pointer = AssertSend(&mut slot as *mut Option<F>);
     let result = std::thread::scope(|scope| {
@@ -135,6 +137,8 @@ where
         note_deferred(label, None);
         return PipelineWait::Deferred;
     }
+    // The calling title thread waits here, up to the deadline.
+    let _pause = crate::title_watchdog::pause();
     let (tx, rx) = std::sync::mpsc::channel();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
     let for_thread = std::sync::Arc::clone(&shared);

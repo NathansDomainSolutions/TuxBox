@@ -318,6 +318,11 @@ impl<'a> Emitter<'a> {
                 };
                 (self.bind_heap(view, src), dim)
             }
+            // The root names a UAV at the table slot the program samples: that root
+            // does not describe the program's table (see `MeshLayout::from_pixel_shader`).
+            Some(Res::Uav(slot, _)) if ins.mnemonic.starts_with("image_sample") || ins.mnemonic.starts_with("image_gather") => {
+                return Err(format!("{} reads table UAV u{slot}: the root does not describe the program's table", ins.mnemonic));
+            }
             _ => return Err("unresolved image".into()),
         };
         if ins.mnemonic == "image_get_resinfo" {

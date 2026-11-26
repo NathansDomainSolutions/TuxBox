@@ -18,7 +18,7 @@ except ImportError:
 from project_tuxbox.backend_log import check_log_path
 from project_tuxbox.game_log import game_log
 from project_tuxbox.graphics_profile import PROFILES, graphics_profile
-from project_tuxbox.host import Host
+from project_tuxbox.host import Host, requires_offline
 from project_tuxbox.inspect import binary_file, image, launch_target, package, package_root
 from project_tuxbox.d3d12_status import d3d12_table
 from project_tuxbox.progress_map import library_table, shader_table, write_map
@@ -31,7 +31,11 @@ from project_tuxbox.verify import SUITES, verify, status
 def launch_game(args):
     exe = launch_target(args.target.expanduser(), args.app_id)
     package_dir = package_root(args.target.expanduser(), exe)
-    host = Host(args.backend, args.proton, args.prefix, offline=args.offline)
+    forced = requires_offline(exe)
+    if forced and (args.backend or ("native" if os.name == "nt" else "proton")) == "native":
+        raise ValueError(f"{exe.name} is only launched without network access, which TuxBox can "
+                         "arrange only with the Wine or Proton backend on Linux so far")
+    host = Host(args.backend, args.proton, args.prefix, offline=args.offline or forced)
     if not (args.graphics_menu or args.graphics_profile):
         return run_game(args, exe, host, package_dir)
     if args.prepare_only:
@@ -101,11 +105,11 @@ def main():
                          help="look up a PE-relative address in an Unreal Symbols .bin (repeatable)")
     run = subs.add_parser("run", help="launch a prepared x64 executable or manifest entry")
     run.add_argument("--app-id", help="select a manifest entry by its Id")
-    run.add_argument("--log-file", type=Path, metavar="PATH", help="append the live game log to this file")
+    run.add_argument("--log-file", type=Path, metavar="PATH", help="also append the game log to this file; none is saved otherwise")
     run.add_argument("--mangohud", action="store_true",
-                     help="show Vulkan performance metrics and record frame times beside the game log on Linux")
+                     help="show Vulkan performance metrics and record frame times beside the log file on Linux")
     run.add_argument("--profile-pipelines", action="store_true",
-                     help="record vkd3d-proton pipeline creation times and keys beside the game log")
+                     help="record vkd3d-proton pipeline creation times and keys beside the log file")
     graphics = run.add_mutually_exclusive_group()
     graphics.add_argument("--graphics-menu", action="store_true", help="choose a Project Scarlett graphics profile")
     graphics.add_argument("--graphics-profile", choices=PROFILES, help="select a Project Scarlett graphics profile")

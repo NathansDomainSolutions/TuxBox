@@ -5,6 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Vulkan headers older than VK_EXT_descriptor_heap do not name it.
+#ifndef VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME
+#define VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME "VK_EXT_descriptor_heap"
+#endif
+
 struct instance_dispatch {
     void *key;
     PFN_vkGetInstanceProcAddr get_proc;
@@ -130,8 +135,8 @@ static VKAPI_ATTR void VKAPI_CALL get_khr_features(VkPhysicalDevice device, VkPh
 }
 
 // vkd3d-proton binds constant buffers as storage buffers only on its
-// descriptor-set path, so hide descriptor buffers from the devices that need it.
-// Other devices keep the extension.
+// descriptor-set path, so hide descriptor buffers and descriptor heaps from the
+// devices that need it. Other devices keep both extensions.
 static VKAPI_ATTR VkResult VKAPI_CALL enumerate_extensions(VkPhysicalDevice device, const char *layer,
         uint32_t *count, VkExtensionProperties *properties) {
     const struct instance_dispatch *entry = lookup(device);
@@ -149,7 +154,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL enumerate_extensions(VkPhysicalDevice devi
     if (result == VK_SUCCESS) {
         uint32_t capacity = properties ? *count : 0, kept = 0;
         for (uint32_t i = 0; i < total; i++) {
-            if (!strcmp(all[i].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME))
+            if (!strcmp(all[i].extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)
+                    || !strcmp(all[i].extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME))
                 continue;
             if (properties) {
                 if (kept == capacity) {

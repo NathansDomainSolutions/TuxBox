@@ -151,8 +151,16 @@ unsafe fn copy_host_range(device: &Device, count: u32, dst: D3D12_CPU_DESCRIPTOR
         let source = std::iter::once((from.ptr, count));
         device.state.imported_views.copy(stride, to.clone(), source.clone());
         device.state.blas.views.copy(stride, to.clone(), source.clone());
+        device.state.view_strides.copy(stride, to.clone(), source.clone());
         crate::diagnostics::display::copy_texture_views(translated.ptr, from.ptr, count, stride);
         device.state.placements.views.copy(stride, to, source);
+        if let Some(arena) = &arena {
+            // A copied buffer view keeps its console stride at the destination slot.
+            let strides: Vec<u32> = (0..count as usize)
+                .map(|i| device.state.view_strides.lookup(translated.ptr + i * stride).unwrap_or(0))
+                .collect();
+            arena.set_strides(dst.ptr, &strides);
+        }
     }
     unsafe { device.native.CopyDescriptorsSimple(count, translated, from, kind) };
     if let Some(arena) = arena {

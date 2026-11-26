@@ -41,3 +41,23 @@ fn other_high_offset_bits_and_gds_stay_refused() {
         assert!(error.contains("unsupported compute DS swizzle encoding"), "{offset:#x}/{extra:#x}: {error}");
     }
 }
+
+#[test]
+fn paired_wave64_lowers_quad_and_bitmask_swizzles_without_shared_memory() {
+    use crate::hlsl::translate_paired_wave64;
+
+    let quad = translate_paired_wave64(&fixture::shader(0x801b, 0)).unwrap().hlsl;
+    assert!(quad.contains("(tb_pair + 0u) & ~3u"), "{quad}");
+    assert!(quad.contains("(tb_pair + 32u) & ~3u"), "{quad}");
+    assert!(!quad.contains("tb_swizzle"), "{quad}");
+    assert!(!quad.contains("GroupMemoryBarrierWithGroupSync"), "{quad}");
+
+    let bitmask = translate_paired_wave64(&fixture::shader(0x041f, 0)).unwrap().hlsl;
+    assert!(bitmask.contains("(((tb_pair + 0u) & 31u) | 0u) ^ 1u"), "{bitmask}");
+    assert!(bitmask.contains("(((tb_pair + 32u) & 31u) | 0u) ^ 1u"), "{bitmask}");
+
+    for (offset, extra) in [(0x8100, 0), (0xe000, 0), (0x801b, 1 << 16), (0x041f, 1 << 17)] {
+        let error = translate_paired_wave64(&fixture::shader(offset, extra)).map(|t| t.hlsl).unwrap_err();
+        assert!(error.contains("unsupported compute DS swizzle encoding"), "{offset:#x}/{extra:#x}: {error}");
+    }
+}

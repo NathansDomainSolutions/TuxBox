@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import PINNED_PROTON, Host, claim_package_drive, configure_nvidia_shader_cache, proton_installation, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, proton_installation, requires_offline, seed_shader_cache, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -197,6 +197,71 @@ class SelectProton(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
+class SeedShaderCache(unittest.TestCase):
+    def prefixes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def cache(self, prefix, name, stamp):
+        cache = prefix / SHADER_CACHE
+        (cache / "by_source").mkdir(parents=True)
+        (cache / "by_source" / name).write_text(name)
+        os.utime(cache, (stamp, stamp))
+
+    def test_a_new_prefix_reuses_the_most_recent_cache(self):
+        root = self.prefixes()
+        self.cache(root / "Proton - Experimental", "recent.cso", 2000)
+        self.cache(root / "GE-Proton11-12-x86_64", "older.cso", 1000)
+        lines = []
+        seed_shader_cache(root / "GE-Proton11-14-x86_64", lines.append)
+        seeded = root / "GE-Proton11-14-x86_64" / SHADER_CACHE / "by_source"
+        self.assertEqual([p.name for p in seeded.iterdir()], ["recent.cso"])
+        self.assertEqual(lines, ["Reusing the shader cache from the Proton - Experimental prefix"])
+        # The donor keeps its own cache.
+        self.assertTrue((root / "Proton - Experimental" / SHADER_CACHE / "by_source/recent.cso").is_file())
+
+    def test_an_existing_cache_and_a_lone_prefix_are_left_alone(self):
+        root = self.prefixes()
+        self.cache(root / "GE-Proton11-14-x86_64", "own.cso", 1000)
+        self.cache(root / "Proton - Experimental", "other.cso", 2000)
+        lines = []
+        seed_shader_cache(root / "GE-Proton11-14-x86_64", lines.append)
+        seeded = root / "GE-Proton11-14-x86_64" / SHADER_CACHE / "by_source"
+        self.assertEqual([p.name for p in seeded.iterdir()], ["own.cso"])
+        seed_shader_cache(root / "wine", lines.append)
+        alone = self.prefixes()
+        seed_shader_cache(alone / "wine", lines.append)
+        self.assertFalse((alone / "wine" / SHADER_CACHE).exists())
+        self.assertEqual(lines, ["Reusing the shader cache from the Proton - Experimental prefix"])
+
+    def test_a_failed_copy_leaves_no_partial_cache(self):
+        root = self.prefixes()
+        self.cache(root / "Proton - Experimental", "recent.cso", 2000)
+        failure = subprocess.CalledProcessError(1, ["cp"], stderr="No space left on device")
+        lines = []
+        with patch("project_tuxbox.host.subprocess.run", side_effect=failure):
+            seed_shader_cache(root / "GE-Proton11-14-x86_64", lines.append)
+        temp = root / "GE-Proton11-14-x86_64" / SHADER_CACHE.parent
+        self.assertEqual(list(temp.iterdir()), [])
+        self.assertTrue(lines[0].startswith("Could not reuse the shader cache from Proton - Experimental"))
+
+    def test_only_a_new_default_prefix_is_seeded(self):
+        root = self.prefixes()
+        explicit = root / "chosen"
+        with patch("project_tuxbox.host.shutil.which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+             patch("project_tuxbox.host.subprocess.check_output", return_value="wine-10.0\n"), \
+             patch("project_tuxbox.host.seed_shader_cache") as seed, \
+             patch.dict(os.environ, {"XDG_DATA_HOME": str(root)}):
+            Host("wine", None, explicit)
+            seed.assert_not_called()
+            Host("wine", None, None)
+            seed.assert_called_once()
+            self.assertEqual(seed.call_args.args[0], (root / "project-tuxbox/prefixes/wine").resolve())
+            Host("wine", None, None)
+            seed.assert_called_once()
+
+
 class OfflineLaunch(unittest.TestCase):
     def host(self, probe_code=0, stderr=""):
         tmp = tempfile.TemporaryDirectory()
@@ -220,6 +285,10 @@ class OfflineLaunch(unittest.TestCase):
     def test_refuses_to_launch_online_when_isolation_fails(self):
         with self.assertRaisesRegex(ValueError, "Operation not permitted"):
             self.host(1, "unshare: unshare failed: Operation not permitted\n")
+
+    def test_project_scarlett_is_recognised_in_any_case(self):
+        self.assertTrue(requires_offline(Path("stage/Game_Scarlett_Master.exe")))
+        self.assertFalse(requires_offline(Path("stage/Lanes.exe")))
 
     def test_native_backend_rejects_offline(self):
         with patch("project_tuxbox.host.platform.machine", return_value="x86_64"), \
@@ -263,7 +332,7 @@ class ConsoleConstantBuffers(unittest.TestCase):
             self.assertEqual(env["VK_ADD_LAYER_PATH"], "/user/extra")
             self.assertEqual(env["VK_INSTANCE_LAYERS"], "VK_LAYER_TUXBOX_console_cbv:overlay")
             self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;second")
-            self.assertEqual(env["VKD3D_CONFIG"], "force_static_cbv")
+            self.assertEqual(env["VKD3D_CONFIG"], "force_raw_va_cbv,force_static_cbv")
             self.assertEqual(env["PRESSURE_VESSEL_FILESYSTEMS_RO"], layer + ":/user/mount")
             before = env.copy()
             configure_console_cbv("proton", env, self.exe, self.log.status)
@@ -278,21 +347,23 @@ class ConsoleConstantBuffers(unittest.TestCase):
         sample.write_bytes(b"older sample")
         self.provider.write_bytes(sample.read_bytes())
         (self.root / "tuxbox-features").write_text("cbv_16_byte_alignment\n")
-        env = {"PROTONPATH": str(self.root), "VKD3D_DISABLE_EXTENSIONS": "first;VK_EXT_descriptor_buffer",
+        env = {"PROTONPATH": str(self.root),
+               "VKD3D_DISABLE_EXTENSIONS": "first;VK_EXT_descriptor_buffer;VK_EXT_descriptor_heap",
                "VKD3D_CONFIG": "other"}
         with patch("project_tuxbox.console_cbv.console_cbv_layer", return_value=self.layer) as layer:
             configure_console_cbv("proton", env, self.exe, self.log.status)
-            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,other")
-            self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;VK_EXT_descriptor_buffer")
+            self.assertEqual(env["VKD3D_CONFIG"], "cbv_16_byte_alignment,force_raw_va_cbv,other")
+            self.assertEqual(env["VKD3D_DISABLE_EXTENSIONS"], "first;VK_EXT_descriptor_buffer;VK_EXT_descriptor_heap")
             layer.assert_not_called()
             wine = {"PROTONPATH": str(self.root)}
             configure_console_cbv("wine", wine, self.exe, self.log.status)
             self.assertEqual(wine["VK_ADD_LAYER_PATH"], self.layer)
-            self.assertNotIn("VKD3D_CONFIG", wine)
+            # Without the raw address, NVIDIA rounds a root CBV down to 64 bytes.
+            self.assertEqual(wine["VKD3D_CONFIG"], "force_raw_va_cbv")
             self.assertNotIn("VKD3D_DISABLE_EXTENSIONS", wine)
             fork = {"PROTONPATH": str(self.root)}
             configure_console_cbv("proton", fork, self.exe, self.log.status)
-            self.assertEqual(fork["VKD3D_DISABLE_EXTENSIONS"], "VK_EXT_descriptor_buffer")
+            self.assertEqual(fork["VKD3D_DISABLE_EXTENSIONS"], "VK_EXT_descriptor_buffer,VK_EXT_descriptor_heap")
             self.assertNotIn("PRESSURE_VESSEL_FILESYSTEMS_RO", wine)
 
     def test_native_foreign_missing_and_explicit_comparison(self):
@@ -334,6 +405,21 @@ class ConsoleConstantBuffers(unittest.TestCase):
             build.assert_called_once_with([script, layer], env=env, check=True)
 
 
+class PipelineCache(unittest.TestCase):
+    def test_defaults_to_the_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {}
+            configure_pipeline_cache(env, Path(tmp))
+            self.assertEqual(env, {"VKD3D_SHADER_CACHE_PATH": str(Path(tmp) / "shadercache")})
+            self.assertTrue((Path(tmp) / "shadercache").is_dir())
+
+    def test_a_set_path_or_disabled_cache_stays(self):
+        for value in ("/games/vkd3d", "0"):
+            env = {"VKD3D_SHADER_CACHE_PATH": value}
+            configure_pipeline_cache(env, Path("/unused"))
+            self.assertEqual(env, {"VKD3D_SHADER_CACHE_PATH": value})
+
+
 class NvidiaShaderCache(unittest.TestCase):
     def test_prefix_gets_its_own_driver_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,7 +430,7 @@ class NvidiaShaderCache(unittest.TestCase):
             self.assertEqual(env["__GL_SHADER_DISK_CACHE"], "1")
             self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], str(cache))
             self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1")
-            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(8 << 30))
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(4 << 30))
             self.assertTrue(cache.is_dir())
 
     def test_explicit_path_and_disabled_cache_stay(self):
@@ -353,7 +439,7 @@ class NvidiaShaderCache(unittest.TestCase):
         configure_nvidia_shader_cache(env)
         self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], "/games/nv")
         self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "0")
-        self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(8 << 30))
+        self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(4 << 30))
         sized = {"WINEPREFIX": "/unused", "__GL_SHADER_DISK_CACHE_PATH": "/games/nv",
                  "__GL_SHADER_DISK_CACHE_SIZE": "1024"}
         reports = []

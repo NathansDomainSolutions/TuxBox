@@ -357,9 +357,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="lanes-input-") as work:
         on_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
         if on_wayland:
-            server = private_x_server(work, geometry="1280x800")
+            server = private_x_server(work, geometry="1280x800", adapter=args.adapter)
         elif os.environ.get("DISPLAY") and screen_capture_problem() is None:
-            server = nullcontext((os.environ["DISPLAY"], os.environ.get("XAUTHORITY")))
+            server = nullcontext((os.environ["DISPLAY"], os.environ.get("XAUTHORITY"), {}))
         else:
             server = nullcontext(None)
         with server as x:
@@ -367,9 +367,9 @@ def main():
                 if not x:
                     raise CheckFailed("no readable X display: start Xwayland, or run under xvfb-run")
                 record["display"] = "private rootful Xwayland" if on_wayland else "current X display"
-                display = Display(*x)
+                display = Display(x[0], x[1])
                 env = {k: v for k, v in os.environ.items() if k != "WAYLAND_DISPLAY"}
-                env.update(DISPLAY=x[0], UMU_RUNTIME_UPDATE="0")
+                env.update(DISPLAY=x[0], UMU_RUNTIME_UPDATE="0", **x[2])
                 if x[1]:
                     env["XAUTHORITY"] = x[1]
                 command = [sys.executable, str(ROOT / "tuxbox.py"), "run", "--backend", args.backend,

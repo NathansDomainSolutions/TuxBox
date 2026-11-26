@@ -212,6 +212,7 @@ pub(super) unsafe extern "system" fn create_heap(
         placed_views,
         _placed_targets: this.state.placements.targets.heap(&this.native, &native, &resident_desc, D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
         _imported_views: this.state.imported_views.heap(&this.native, &native, &resident_desc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+        _view_strides: this.state.view_strides.heap(&this.native, &native, &resident_desc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
         _scene_views: this.state.blas.views.heap(
             &this.native, &native, &resident_desc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
         ),

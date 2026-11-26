@@ -102,8 +102,27 @@ impl<'a> Emitter<'a> {
         if self.required_wave_size == Some(64) && self.packed.as_ref().is_some_and(|p| p.lane_masks.contains(&self.cur_idx)) {
             self.touch(&hi(&s[2]));
         }
+        if m == GROUP_GATHER {
+            let idx = self.cur_idx;
+            if !self.compute_swizzle { return Err("group gather outside a group exchange".into()); }
+            if self.hoisted_swizzle != Some(idx) { self.emit_compute_swizzle(idx, ins, &[])?; }
+            return self.wv(&d, &format!("swizzle{idx}"));
+        }
         if m == "tb_reflection_prefix32" {
             return self.wv(&d, &format!("WavePrefixSum({})", r(&s[0])?));
+        }
+        if m == "tb_row_scan_add32" {
+            // Every lane is active (see `wave_sum::lower_row_scan`).
+            let [Opnd::Vgpr(acc), Opnd::Vgpr(tmp)] = ins.dst[..] else { return Err("invalid row scan".into()) };
+            if self.pixel_wave || self.portable_wave64 {
+                return Err("row scan needs a native wave32".into());
+            }
+            self.touch(&Opnd::Vgpr(tmp));
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t}_scan = WavePrefixSum(v{acc}) + v{acc};"));
+            self.line(&format!("if (WaveGetLaneIndex() >= 16u) v{tmp} = WaveReadLaneAt(t{t}_scan, 15u);"));
+            return self.ws(&d, &format!("t{t}_scan"));
         }
         if m == "v_nop" {
             return Ok(());
@@ -129,7 +148,7 @@ impl<'a> Emitter<'a> {
             } else { lane };
             let value = r(&s[0])?;
             let read = if self.portable_wave64 {
-                format!("tb_reduction_read(gtid.x, {value}, {lane})")
+                format!("tb_reduction_read({}, {value}, {lane})", wave_sum::portable_lane_id(compute_group(self.ex)))
             } else { format!("WaveReadLaneAt({value}, {lane})") };
             return self.ws(&d, &read);
         }
@@ -658,9 +677,21 @@ impl<'a> Emitter<'a> {
                 if self.single_wave32 && m == "v_mbcnt_lo_u32_b32" && s[0] == Opnd::ConstInt(-1) {
                     return self.wv(&d, &format!("({b} + tb_lane)"));
                 }
-                if self.indexed_lane {
-                    let lane = if m == "v_mbcnt_lo_u32_b32" { "tb_lane & 63u" } else { "max(tb_lane & 63u, 32u) - 32u" };
+                if self.indexed_lane && s[0] == Opnd::ConstInt(-1) {
+                    let lane = if self.indexed_lane_wave32 {
+                        if m == "v_mbcnt_lo_u32_b32" { "tb_lane & 31u" } else { "0u" }
+                    } else if m == "v_mbcnt_lo_u32_b32" {
+                        "tb_lane & 63u"
+                    } else {
+                        "max(tb_lane & 63u, 32u) - 32u"
+                    };
                     return self.wv(&d, &format!("({b} + countbits({a} & {}))", low_mask(lane)));
+                }
+                if self.indexed_lane
+                    && (matches!(s[0], Opnd::VccLo | Opnd::VccHi)
+                        || (!self.indexed_lane_wave32 && matches!(s[0], Opnd::ExecLo | Opnd::ExecHi)))
+                {
+                    return Err("indexed-lane v_mbcnt with lane mask requires ballot lowering".into());
                 }
                 if self.ex.stage == Stage::Mesh {
                     // These forms count the low/high 32 lanes preceding this logical wave64 lane.
@@ -678,7 +709,7 @@ impl<'a> Emitter<'a> {
                 } else if matches!(s[0], Opnd::ExecLo | Opnd::ExecHi) && !self.resolve_wave32 {
                     // Each invocation holds only its own EXEC bit; the guest reads the wave mask.
                     format!("WaveActiveBallot((exec_lo & 1u) != 0u).{}", if s[0] == Opnd::ExecLo { "x" } else { "y" })
-                } else { a };
+                } else { mask_ballots::word(self, self.cur_idx, &s[0]).unwrap_or(a) };
                 self.line(&format!("uint t{t} = countbits({a} & {});", low_mask(lane)));
                 self.line("#else");
                 self.line(&format!("uint t{t} = 0u;"));

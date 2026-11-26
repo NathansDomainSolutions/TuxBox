@@ -30,8 +30,8 @@ GROUPS=16
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def assemble(lines,llvm):
-    result=subprocess.run([str(llvm),"-triple=amdgcn-amd-amdhsa","-mcpu=gfx1030","-show-encoding"],
+def assemble(lines,llvm,*options):
+    result=subprocess.run([str(llvm),"-triple=amdgcn-amd-amdhsa","-mcpu=gfx1030","-show-encoding",*options],
                           input="\n".join(lines)+"\n",text=True,capture_output=True,check=True,timeout=20)
     encoded=re.findall(r"encoding: \[([^\]]+)\]",result.stdout)
     if len(encoded)!=len(lines):

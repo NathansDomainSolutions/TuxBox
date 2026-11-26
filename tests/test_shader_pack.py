@@ -75,13 +75,15 @@ class ShaderPackRecords(unittest.TestCase):
 class ScarlettPreparationOptions(unittest.TestCase):
     def test_prep_jobs_defaults_and_bounds(self):
         with patch("os.sched_getaffinity", return_value=set(range(16))):
-            self.assertEqual(prep_jobs({}), 8)
+            self.assertEqual(prep_jobs({}), 16)
             self.assertEqual(prep_jobs({"TUXBOX_SHADER_PREP_JOBS": "24"}), 24)
             with redirect_stderr(io.StringIO()):
-                self.assertEqual(prep_jobs({"TUXBOX_SHADER_PREP_JOBS": "0"}), 8)
-                self.assertEqual(prep_jobs({"TUXBOX_SHADER_PREP_JOBS": "many"}), 8)
+                self.assertEqual(prep_jobs({"TUXBOX_SHADER_PREP_JOBS": "0"}), 16)
+                self.assertEqual(prep_jobs({"TUXBOX_SHADER_PREP_JOBS": "many"}), 16)
         with patch("os.sched_getaffinity", return_value={0, 1}):
             self.assertEqual(prep_jobs({}), 2)
+        with patch("os.sched_getaffinity", return_value=set(range(64))):
+            self.assertEqual(prep_jobs({}), 32)
 
     def _prepare(self, env):
         with TemporaryDirectory() as tmp:

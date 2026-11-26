@@ -103,6 +103,15 @@ fn cached_translation(cache: &Path, key: &str, stage: Stage) -> Option<Vec<u8>> 
     (source_digest(&bytes)?.as_bytes() == expected).then_some(bytes)
 }
 
+/// The translator's recorded reason for refusing `key`, when it refused it.
+pub(super) fn refusal_reason(key: &str) -> Option<String> {
+    let cache = compiler_cache(session()?)?;
+    if !CACHED.of(cache).contains(&format!("{key}.unsupported")) {
+        return None;
+    }
+    fs::read_to_string(cache.join(format!("{key}.reason"))).ok()
+}
+
 fn cached_refusal(cache: &Path, key: &str) -> bool {
     if !CACHED.of(cache).contains(&format!("{key}.unsupported")) {
         return false;
@@ -129,6 +138,16 @@ pub(super) fn on_demand(shader: &[u8], source: &str, stage: Stage) -> Option<Vec
     request(source, stage, "dxbc", |pending, requests| {
         fs::write(pending, shader)?;
         fs::rename(pending, requests.join(format!("{source}.dxbc")))
+    })
+}
+
+/// The translation of compute program `source` for hosts with 32-lane waves,
+/// which the compiler keeps beside the ordinary one.
+pub(super) fn narrow_wave(shader: &[u8], source: &str) -> Option<Vec<u8>> {
+    let key = format!("{source}_w32");
+    request(&key, Stage::Compute, "wave32", |pending, requests| {
+        fs::write(pending, shader)?;
+        fs::rename(pending, requests.join(format!("{key}.wave32")))
     })
 }
 
@@ -181,6 +200,9 @@ fn request(
         progress::record(key, Shader::Cached);
         return Some(bytes);
     }
+    // The title thread waits here for the translation (and for any request
+    // ahead of it on the same digest).
+    let _pause = crate::title_watchdog::pause();
     // Serialize the exact digest, not a hash bucket. Unrelated programs
     // must not wait behind a slow translation (or its 90-second timeout).
     static LOCKS: LazyLock<RequestLocks> = LazyLock::new(RequestLocks::default);
@@ -225,26 +247,58 @@ fn request(
     }
     // The title is now waiting on the host worker; the progress panel counts it.
     let _waiting = progress::waiting();
-    let start = Instant::now();
-    loop {
+    let reply = await_reply(Duration::from_secs(90), std::thread::sleep, || {
         if let Some(bytes) = read_portable_file(&result, stage) {
+            return Some(Some(bytes));
+        }
+        failed.exists().then_some(None)
+    });
+    match reply {
+        Some(Some(bytes)) => {
             REPLIES.of(dir).insert(name);
             progress::record(key, Shader::Translated);
-            return Some(bytes);
+            Some(bytes)
         }
-        if failed.exists() {
+        Some(None) => {
             // The host records a refusal in its cache before it reports the failure.
             if let Some(cache) = compiler_cache(dir) {
                 CACHED.of(cache).insert(format!("{key}.unsupported"));
             }
             progress::record(key, Shader::Unsupported);
-            return None;
+            None
         }
-        if start.elapsed() >= Duration::from_secs(90) {
+        None => {
             progress::record(key, Shader::TimedOut);
+            None
+        }
+    }
+}
+
+/// The longest pause between two looks for the host's reply.
+const SLOWEST_LOOK: Duration = Duration::from_millis(25);
+
+/// Look for the host's reply until it arrives or `limit` passes.
+///
+/// The host answers a shader it has compiled before in a few milliseconds, and
+/// a title that creates its shaders one at a time waits for each answer. A fixed
+/// 25 ms pause therefore held such a title at about 40 shaders a second. The
+/// pauses start at 1 ms and double, so a long compile still settles at 25 ms.
+fn await_reply<T>(
+    limit: Duration,
+    mut pause: impl FnMut(Duration),
+    mut look: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = Instant::now();
+    let mut next = Duration::from_millis(1);
+    loop {
+        if let Some(reply) = look() {
+            return Some(reply);
+        }
+        if start.elapsed() >= limit {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        pause(next);
+        next = (next * 2).min(SLOWEST_LOOK);
     }
 }
 

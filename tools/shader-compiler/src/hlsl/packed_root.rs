@@ -88,14 +88,30 @@ pub(super) fn matches_program(isa: &[u8], size: usize, fingerprint: u64) -> bool
     }) == fingerprint
 }
 
-type State = [Word; 106];
+// SGPRs 0..105, then the provenance of SCC.
+type State = [Word; 107];
+const SCC: usize = 106;
 
 fn value(state: &State, op: Opnd) -> Word {
     match op {
         Opnd::Sgpr(n) => state.get(n as usize).copied().unwrap_or(Word::Unavailable),
         Opnd::ConstInt(i) => Word::Immediate(i as u32),
         Opnd::Literal(w) => Word::Immediate(w),
+        Opnd::Scc => state[SCC],
         _ => Word::Data,
+    }
+}
+
+/// Whether a scalar instruction sets SCC (GFX10 SOP1, SOP2 and SOPC).
+fn writes_scc(ins: &Insn) -> bool {
+    let m = ins.mnemonic.as_str();
+    match ins.enc {
+        Enc::Sopc => true,
+        Enc::Sop2 => !(m.starts_with("s_cselect_") || m.starts_with("s_bfm_") || m.starts_with("s_pack_")
+            || matches!(m, "s_mul_i32" | "s_mul_hi_u32" | "s_mul_hi_i32")),
+        Enc::Sop1 => m.contains("saveexec") || m.contains("wrexec")
+            || ["s_not_", "s_wqm_", "s_bcnt0_", "s_bcnt1_", "s_quadmask_", "s_abs_"].iter().any(|p| m.starts_with(p)),
+        _ => false,
     }
 }
 
@@ -217,7 +233,7 @@ impl PackedRoot {
             scan_width,
             ..Self::default()
         };
-        let mut state = [Word::Unavailable; 106];
+        let mut state = [Word::Unavailable; 107];
         state[4] = Word::Data; // Group ID X in the observed one-dimensional dispatch layout.
         state[0] = Word::PointerLo;
         state[1] = Word::PointerHi;
@@ -439,6 +455,16 @@ impl PackedRoot {
             return Ok(());
         }
         let s = &ins.src;
+        // SCC can carry the true pointer high bits after masking. A consumer is
+        // admitted only when the last SCC writer on every path read plain data.
+        if matches!(m, "s_cselect_b32" | "s_addc_u32" | "s_subb_u32" | "s_cbranch_scc0" | "s_cbranch_scc1")
+            && state[SCC].opaque()
+        {
+            return Err("SCC may depend on a root address");
+        }
+        if writes_scc(ins) {
+            state[SCC] = if s.iter().any(|o| value(state, *o).opaque()) { Word::Unavailable } else { Word::Data };
+        }
         let dst = match ins.dst.first() {
             Some(Opnd::Sgpr(n)) => Some(*n as usize),
             _ => None,
@@ -570,15 +596,14 @@ impl PackedRoot {
             {
                 return Err("unsupported scalar operation on packed roots")
             }
-            Enc::Sop2 if matches!(m, "s_cselect_b32" | "s_addc_u32" | "s_subb_u32") => {
-                return Err("SCC may depend on a root address")
-            }
             Enc::Sopk => return Err("unsupported implicit scalar operand on packed roots"),
             Enc::Sopp
                 if !matches!(
                     m,
                     "s_barrier"
                         | "s_branch"
+                        | "s_cbranch_scc0"
+                        | "s_cbranch_scc1"
                         | "s_cbranch_execz"
                         | "s_cbranch_execnz"
                         | "s_endpgm"
@@ -787,3 +812,7 @@ impl Emitter<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/hlsl/packed_root/scc.rs"]
+mod scc_tests;

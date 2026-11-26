@@ -21,7 +21,7 @@ from .inspect import digest, export_table, image, launch_target
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
-BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-benchmark",
+BASE_SUITES = ("cpu", "xmem", "xapu", "xgameruntime", "xcrdapi", "graphics", "graphics-abi", "guest-frame", "present", "lanes", "lanes-selftest", "lanes-shader-cache", "lanes-raster-tables", "lanes-benchmark",
                "cpu-benchmark", "d3d12-exports", "d3d12-features", "d3d12-indirect", "d3d12-queries", "d3d12-queues", "d3d12-tables",
                "d3d12-heaps", "d3d12-placement", "d3d12-copy-resource", "d3d12-draw", "d3d12-stream", "d3d12-frame-events",
                "d3d12-guids", "d3d12-signatures", "xg-provider")
@@ -38,19 +38,22 @@ LANES_SCENARIOS = ("labels", "cross-queue", "compute-frame", "skipped-command", 
 class LanesShader:
     """The Lanes console shader in a prefix's translation cache."""
 
-    def __init__(self, host):
-        from examples.lanes.shader_fixture import shader
+    def __init__(self, host, data=None):
+        if data is None:
+            from examples.lanes.shader_fixture import shader
+            data = shader()
         from .shader_prep import SOURCE_CACHE
 
-        self.data = shader()
+        self.data = data
         self.key = hashlib.sha256(self.data).hexdigest()
         self.sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
         self.root = self.sources.parent
 
     def forget(self):
         # Only this synthetic shader's entries; a prefix may hold a title cache.
-        for path in [*self.sources.glob(f"{self.key}.*"), *self.root.glob(f"runtime/*/{self.key}.*")]:
-            path.unlink()
+        for key in (self.key, f"{self.key}_w32"):
+            for path in [*self.sources.glob(f"{key}.*"), *self.root.glob(f"runtime/*/{key}.*")]:
+                path.unlink()
 
     def prepare(self, work):
         """Translate it into the prepared cache, as shader preparation does."""
@@ -111,6 +114,90 @@ def lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work):
                 host.env[name] = value
 
 
+def lanes_wave_shader(host, check, gpu_args, pci, memory_symbols):
+    """Translate a console program that needs 64-lane waves while Lanes runs it.
+
+    The first launch reports a 32-lane host to the provider, so every card takes
+    the two-lanes-per-thread translation. The second leaves the card as it is.
+    Both must write the console's results.
+    """
+    from examples.lanes.shader_fixture import wave_shader
+    from .runtime_shaders import shader_session
+
+    lanes = LanesShader(host, wave_shader())
+    saved = {name: host.env.get(name) for name in
+             ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION", "TUXBOX_HOST_PROFILE")}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    narrow = f"narrow-wave compute shader loaded, source SHA-256 {lanes.key}"
+    try:
+        for name, profile in (("lanes-wave-shader-narrow", "wave=32"), ("lanes-wave-shader-host", None)):
+            lanes.forget()
+            if profile:
+                host.env["TUXBOX_HOST_PROFILE"] = profile
+            else:
+                host.env.pop("TUXBOX_HOST_PROFILE", None)
+            messages = []
+            with shader_session(lanes.root, host.env, messages.append):
+                check(name, "lanes/lanes.exe", ["--selftest", "wave64-shader", *gpu_args, "--report"],
+                      rf"lanes-selftest PASS pci={pci} scenario=wave64-shader passed=1",
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox",
+                      log_check=lambda output, forced=profile is not None, messages=messages:
+                          None if not forced or narrow in output
+                          else f"the provider did not load the 32-lane translation, worker said: {messages}")
+        lanes.forget()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
+def lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work):
+    """Translate the wave32 masked DPP shader and verify the provider loads it.
+
+    The wave-alloc scenario creates a pipeline from a console shader whose wave32
+    masked DPP exclusive prefix the translator must lower to `WavePrefixSum`.
+    Without the wave-alloc lowering the compiler rejects the shader, so the
+    provider never loads a translation and this gate fails.
+    """
+    from .runtime_shaders import shader_session
+    from examples.lanes.wave_alloc_fixture import shader as wave_alloc_shader
+
+    lanes = LanesShader(host, wave_alloc_shader())
+    key, root, forget = lanes.key, lanes.root, lanes.forget
+
+    saved = {name: host.env.get(name) for name in ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_SHADER_SESSION")}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr")
+    host.env.pop("TUXBOX_SHADER_SESSION", None)
+    loaded = f"prepared compute shader loaded, source SHA-256 {key}"
+
+    def expect_loaded(output):
+        return None if loaded in output else "the provider did not load the translated shader"
+
+    def launch(name, log_check):
+        return check(name, "lanes/lanes.exe", ["--selftest", "wave-alloc", *gpu_args, "--report"],
+                     rf"lanes-selftest PASS pci={pci} scenario=wave-alloc passed=1",
+                     providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                     config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=log_check)
+
+    try:
+        forget()
+        with shader_session(root, host.env, lambda line: None):
+            launch("lanes-shader-cache-wave-alloc", expect_loaded)
+        forget()
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
+
+
 def cpu_model():
     if sys.platform == "linux" and Path("/proc/cpuinfo").exists():
         for line in Path("/proc/cpuinfo").read_text().splitlines():
@@ -157,35 +244,46 @@ def _free_display_number(start=2, attempts=16):
     return None
 
 
+def _drm_pci_id(node):
+    """PCI vendor:device and kernel driver of a /dev/dri node, or (None, None)."""
+    device = Path("/sys/class/drm") / Path(node).name / "device"
+    try:
+        ids = [(device / key).read_text().strip().lower().removeprefix("0x") for key in ("vendor", "device")]
+        driver = Path(os.readlink(device / "driver")).name
+    except OSError:
+        return None, None
+    return ":".join(ids), driver
+
+
+def _adapter_driver(adapter):
+    """Kernel driver of the render node for a PCI vendor:device, or None."""
+    for node in sorted(Path("/dev/dri").glob("renderD*")):
+        pci, driver = _drm_pci_id(node)
+        if pci == adapter.lower():
+            return driver
+    return None
+
+
+def _server_render_device(pid):
+    """PCI vendor:device of the GPU an X server renders with, or None if it holds no DRM node."""
+    try:
+        nodes = [os.readlink(fd) for fd in Path(f"/proc/{pid}/fd").iterdir()]
+    except OSError:
+        return None
+    for node in sorted(nodes):
+        if node.startswith("/dev/dri/renderD"):
+            return _drm_pci_id(node)[0]
+    return None
+
+
 @contextmanager
-def private_x_server(directory, geometry="2560x1440", timeout=10):
-    """Yield (DISPLAY, XAUTHORITY) for a temporary rootful Xwayland, or None if one can't start.
-
-    The rootful server draws into its own Wayland window and keeps a readable root window, so
-    Wine's screen samples work on a Wayland desktop. It accepts only its own random cookie,
-    is started on a display number picked below the desktop's and is stopped when the block exits.
-
-    Xwayland takes its display number as the positional argument (":N"); "-displayfd" only
-    reports the number it took, so a free one is chosen here instead of trusting the default,
-    which is the inherited DISPLAY and collides with the desktop server.
-    """
-    xwayland = shutil.which("Xwayland")
-    if not sys.platform.startswith("linux") or not xwayland or not os.environ.get("WAYLAND_DISPLAY"):
-        yield None
-        return
-    display = _free_display_number()
-    if display is None:
-        yield None
-        return
-    auth = Path(directory) / "Xauthority"
-    descriptor = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(xauthority_entry(os.urandom(16)))
+def _xwayland(xwayland, display, auth, geometry, timeout, options=()):
+    """Yield (DISPLAY, pid) of a started rootful Xwayland, or None; stop it when the block exits."""
     read, write = os.pipe()
     try:
         server = subprocess.Popen([xwayland, f":{display}", "-displayfd", str(write), "-geometry", geometry,
-                                   "-noreset", "-auth", str(auth)], pass_fds=(write,), stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                   "-noreset", "-auth", str(auth), *options], pass_fds=(write,),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         os.close(read)
         os.close(write)
@@ -201,7 +299,7 @@ def private_x_server(directory, geometry="2560x1440", timeout=10):
             number += chunk
         # A server that exits before being ready is not a display we can use.
         if number.strip().isdigit() and server.poll() is None:
-            yield (f":{int(number)}", str(auth))
+            yield (f":{int(number)}", server.pid)
         else:
             yield None
     finally:
@@ -212,6 +310,46 @@ def private_x_server(directory, geometry="2560x1440", timeout=10):
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
+
+
+@contextmanager
+def private_x_server(directory, geometry="2560x1440", timeout=10, adapter=None):
+    """Yield (DISPLAY, XAUTHORITY, environment) for a temporary rootful Xwayland, or None.
+
+    The rootful server draws into its own Wayland window and keeps a readable root window, so
+    Wine's screen samples work on a Wayland desktop. It accepts only its own random cookie,
+    is started on a display number picked below the desktop's and is stopped when the block exits.
+
+    Xwayland takes its display number as the positional argument (":N"); "-displayfd" only
+    reports the number it took, so a free one is chosen here instead of trusting the default,
+    which is the inherited DISPLAY and collides with the desktop server.
+
+    Xwayland renders on the compositor's GPU. When `adapter` is another Mesa-driven GPU, Mesa's
+    X11 swapchain must cross GPUs over DRI3, which can fail outright (RADV against an NVIDIA
+    Xwayland returns VK_ERROR_INITIALIZATION_FAILED), leaving the window unpainted. The server
+    is then restarted without glamor, and `environment` asks Mesa to present through plain X
+    images, which every GPU can do.
+    """
+    xwayland = shutil.which("Xwayland")
+    if not sys.platform.startswith("linux") or not xwayland or not os.environ.get("WAYLAND_DISPLAY"):
+        yield None
+        return
+    display = _free_display_number()
+    if display is None:
+        yield None
+        return
+    auth = Path(directory) / "Xauthority"
+    descriptor = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(xauthority_entry(os.urandom(16)))
+    with _xwayland(xwayland, display, auth, geometry, timeout) as server:
+        foreign = (server and adapter and _adapter_driver(adapter) not in (None, "nvidia")
+                   and _server_render_device(server[1]) != adapter.lower())
+        if not foreign:
+            yield server and (server[0], str(auth), {})
+            return
+    with _xwayland(xwayland, display, auth, geometry, timeout, ("-glamor", "off")) as server:
+        yield server and (server[0], str(auth), {"MESA_VK_WSI_DEBUG": "sw"})
 
 
 def screen_capture_problem(display=None, library=None, xauthority=None):
@@ -279,6 +417,80 @@ def missing_provider_imports(modules, provider, expected):
         for ordinal in ordinals:
             found.update(slots.get(ordinal, ()))
     return sorted(set(expected) - found)
+
+
+# Table slots the reflected `raster-samplers` root holds (see `lanes_raster_tables`).
+RASTER_SAMPLER_SLOTS = 1
+
+
+def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
+    """Draw with the Lanes console raster programs under a root with two tables.
+
+    `raster-tables`: the pixel program reads a register the title's root does
+    not declare, so it draws only under the root the provider reflects from both
+    programs. `raster-samplers`: the pixel program builds a linear sampler from
+    literal words that the root's static sampler at its register does not have,
+    so it samples correctly only with the private static sampler the provider
+    adds to the reflected root. That root is serialized while the game runs, so
+    nothing is prepared before launch: the host worker translates both programs
+    against it.
+    """
+    from examples.lanes.raster_fixture import pixel, sampler_pixel, vertex
+    from .runtime_shaders import shader_session
+    from .shader_prep import SOURCE_CACHE
+
+    sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
+    rootless = {hashlib.sha256(data).hexdigest() for data in (vertex(), pixel(), sampler_pixel())}
+    messages = []
+
+    def compiled():
+        return {line.removeprefix("Compiled Xbox shader ") for line in messages
+                if line.startswith("Compiled Xbox shader ")}
+
+    def forget(keys):
+        # Only these programs' entries; a prefix may hold a title cache.
+        for key in keys:
+            for path in [*sources.glob(f"{key}.*"), *sources.parent.glob(f"runtime/*/{key}.*")]:
+                path.unlink()
+
+    def expect_reflected(slots):
+        def problem(output):
+            if "substituted null " in output:
+                return "the provider substituted a stand-in pipeline"
+            # +debugstr escapes the quotes of the logged map.
+            if not re.search(r'multi-table raster roots after 1 pipelines: \{\\?"reflected\\?": 1\}', output):
+                return "the provider did not reflect the two-table root"
+            if f"created raster pipeline with {slots} reflected FSSM descriptor slots" not in output:
+                return "the provider did not create the pipeline under the reflected root"
+            if compiled() & rootless:
+                return f"the worker translated a program without its root: {messages}"
+            return None
+        return problem
+
+    names = ("TUXBOX_LOG", "WINEDEBUG", "TUXBOX_TRACE_RASTER_ROOTS", "TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK")
+    saved = {name: host.env.get(name) for name in names}
+    host.env.update(TUXBOX_LOG="1", WINEDEBUG="-all,+debugstr", TUXBOX_TRACE_RASTER_ROOTS="1")
+    # The fallback translates against the title's root and would hide a missing reflection.
+    for name in ("TUXBOX_SHADER_SESSION", "TUXBOX_RASTER_ROOT_FALLBACK"):
+        host.env.pop(name, None)
+    try:
+        for scenario, slots in (("raster-tables", 3), ("raster-samplers", RASTER_SAMPLER_SLOTS)):
+            forget(rootless)
+            messages.clear()
+            with shader_session(sources.parent, host.env, messages.append):
+                check(f"lanes-{scenario}", "lanes/lanes.exe", ["--selftest", scenario, *gpu_args, "--report"],
+                      rf"lanes-selftest PASS pci={pci} scenario={scenario} passed=1",
+                      providers={"lanes/xmem.dll": memory_symbols, "lanes/GameInput.dll": ("#1",),
+                                 "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
+                      config="lanes/MicrosoftGame.config", device_factory="xbox", log_check=expect_reflected(slots))
+            forget(compiled())
+    finally:
+        forget(rootless | compiled())
+        for name, value in saved.items():
+            if value is None:
+                host.env.pop(name, None)
+            else:
+                host.env[name] = value
 
 
 def verify(host, output, adapter, selected=None, samples=1):
@@ -545,15 +757,17 @@ def verify(host, output, adapter, selected=None, samples=1):
             # The desktop's rootless XWayland can't be sampled; present into a private rootful
             # Xwayland instead, and fail fast with the cause if that isn't possible either.
             capture = screen_capture_problem()
-            server = private_x_server(work) if capture else nullcontext()
-            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY")}
+            server = private_x_server(work, adapter=adapter) if capture else nullcontext()
+            saved = {key: host.env.get(key) for key in ("DISPLAY", "XAUTHORITY", "MESA_VK_WSI_DEBUG")}
             with server as private:
                 if private:
                     capture = screen_capture_problem(display=private[0], xauthority=private[1])
                     if capture is None:
-                        host.env.update(DISPLAY=private[0], XAUTHORITY=private[1])
+                        host.env.update(DISPLAY=private[0], XAUTHORITY=private[1], **private[2])
                         present_display = "private rootful Xwayland"
-                        print(f"present: sampling a private rootful Xwayland on {private[0]}", flush=True)
+                        if private[2]:
+                            present_display += " without glamor"
+                        print(f"present: sampling a {present_display} on {private[0]}", flush=True)
                 try:
                     present = check if capture is None else (lambda name, *_args, **_kwargs: unsampled(name, capture))
                     present("guest-present", "d3d12-smoke/xbox-frame.exe", [*gpu_args, "--present", "--report"],
@@ -579,6 +793,11 @@ def verify(host, output, adapter, selected=None, samples=1):
                              "lanes/d3d12_xs.dll": (*graphics_symbols, "D3D12XboxCreateDevice")},
                   config="lanes/MicrosoftGame.config", device_factory="xbox")
         if "lanes-selftest" in selected:
+            # The descriptor-reclaim selftest asserts the console's 1,000,000-descriptor
+            # limit; force it so the OOM case is deterministic on GPUs that support larger
+            # shader-visible heaps (the provider otherwise caps at the GPU's maximum).
+            saved_limit = host.env.get("TUXBOX_DESCRIPTOR_HEAP_LIMIT")
+            host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = "1000000"
             for scenario in LANES_SCENARIOS:
                 check(f"lanes-selftest-{scenario}", "lanes/lanes.exe",
                       ["--selftest", scenario, *gpu_args, "--report"],
@@ -587,6 +806,10 @@ def verify(host, output, adapter, selected=None, samples=1):
                                  "lanes/d3d12_xs.dll": ("D3D12XboxCreateDevice",)},
                       config="lanes/MicrosoftGame.config", device_factory="xbox",
                       dependencies=("lanes/XboxBvhBuilder.dll",) if scenario == "ray-tracing-builder" else ())
+            if saved_limit is None:
+                host.env.pop("TUXBOX_DESCRIPTOR_HEAP_LIMIT", None)
+            else:
+                host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = saved_limit
         if "lanes-benchmark" in selected:
             # Console shaders are only translated on the Proton backend, so the
             # pipeline readings exist there alone.
@@ -606,6 +829,10 @@ def verify(host, output, adapter, selected=None, samples=1):
                     shader.forget()
         if "lanes-shader-cache" in selected and host.backend == "proton":
             lanes_shader_cache(host, check, gpu_args, pci, memory_symbols, work)
+            lanes_wave_shader(host, check, gpu_args, pci, memory_symbols)
+            lanes_wave_alloc(host, check, gpu_args, pci, memory_symbols, work)
+        if "lanes-raster-tables" in selected and host.backend == "proton":
+            lanes_raster_tables(host, check, gpu_args, pci, memory_symbols)
         if "cpu-benchmark" in selected:
             readings = []
             for _ in range(samples):
@@ -714,6 +941,11 @@ GATE_LABELS = {
     "lanes-shader-cache-prepared": "A console shader translated before launch, loaded from the prepared cache",
     "lanes-shader-cache-compiled": "A console shader translated by the host worker while the game runs",
     "lanes-shader-cache-reused": "The worker's translation reused on the next launch without compiling",
+    "lanes-wave-shader-narrow": "A 64-lane console shader translated for 32-lane waves while the game runs",
+    "lanes-wave-shader-host": "A 64-lane console shader with the translation this graphics card needs",
+    "lanes-raster-tables": "Console raster programs drawn under the root reflected from their two descriptor tables",
+    "lanes-shader-cache-wave-alloc": "A wave32 masked DPP exclusive prefix lowered to WavePrefixSum and loaded by the provider",
+    "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-package-replay": "Lanes gameplay replay (earlier guest with desktop graphics)", "cpu-replay": "8,388,608-move CPU replay",
 }
 

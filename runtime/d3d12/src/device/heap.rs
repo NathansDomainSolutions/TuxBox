@@ -1,5 +1,7 @@
 //! Device memory heaps and resources sharing their native GPU allocation.
+mod backing;
 mod import;
+mod shadow;
 mod virtual_place;
 mod pages;
 use import::trace_import_failure;
@@ -7,6 +9,7 @@ pub(super) use import::import_buffer_with_heap;
 use import::import_with_commit;
 use import::buffer_standin;
 pub(super) use import::ImportedHeap;
+pub(crate) use shadow::sync_shadow_imports;
 pub(super) use virtual_place::place_virtual;
 pub(super) use virtual_place::place_virtual_layout;
 pub(super) use pages::register_pages;

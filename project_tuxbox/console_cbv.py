@@ -35,16 +35,22 @@ def configure_console_cbv(backend, env, executable, report):
         if provider is None or not matching_tuxbox_provider(provider):
             return
 
+    # A root CBV is not a descriptor, so the settings below do not reach it. Bound
+    # as a uniform buffer it must start on the driver's alignment, 64 bytes on
+    # NVIDIA, which rounds the guest's 16-byte address down without an error.
+    # vkd3d-proton's raw address reads it from where the guest put it.
+    prepend(env, "VKD3D_CONFIG", "force_raw_va_cbv", ",")
     feature = "cbv_16_byte_alignment"
     installation = env.get("PROTONPATH") if backend == "proton" else None
     marker = Path(installation) / "tuxbox-features" if installation else None
     if marker and marker.is_file() and feature in marker.read_text().splitlines():
         prepend(env, "VKD3D_CONFIG", feature, ",")
         # The fork binds 16-byte offsets as storage buffers on its descriptor-set path.
-        prepend(env, "VKD3D_DISABLE_EXTENSIONS", "VK_EXT_descriptor_buffer", ",")
+        for extension in ("VK_EXT_descriptor_heap", "VK_EXT_descriptor_buffer"):
+            prepend(env, "VKD3D_DISABLE_EXTENSIONS", extension, ",")
         report("Constant-buffer alignment: selected Proton build feature")
     else:
-        # The layer hides VK_EXT_descriptor_buffer itself, only on GPUs that need it.
+        # The layer hides descriptor buffers and heaps itself, only on GPUs that need it.
         layer = console_cbv_layer(env)
         path_key = "VK_LAYER_PATH" if env.get("VK_LAYER_PATH") else "VK_ADD_LAYER_PATH"
         prepend(env, path_key, layer, ":")

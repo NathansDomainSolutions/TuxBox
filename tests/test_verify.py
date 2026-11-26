@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import unittest
 from unittest import mock
 
@@ -35,6 +36,46 @@ class PrivateXServerTests(unittest.TestCase):
                     self.assertIsNone(server)
             start.assert_not_called()
 
+
+    def test_glamor_is_dropped_only_for_another_mesa_gpu(self):
+        started = []
+
+        @contextmanager
+        def xwayland(_path, display, _auth, _geometry, _timeout, options=()):
+            started.append(options)
+            yield (f":{display}", 4242)
+
+        cases = (  # adapter driver, Xwayland's GPU -> environment, servers started
+            ("amdgpu", "10de:2b85", {"MESA_VK_WSI_DEBUG": "sw"}, [(), ("-glamor", "off")]),
+            ("amdgpu", "1002:13c0", {}, [()]),
+            ("nvidia", "1002:13c0", {}, [()]),
+            (None, "10de:2b85", {}, [()]),
+        )
+        for driver, device, environment, servers in cases:
+            started.clear()
+            with self.subTest(driver=driver, device=device), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+                 mock.patch.dict("project_tuxbox.verify.os.environ", {"WAYLAND_DISPLAY": "wayland-0"}), \
+                 mock.patch("project_tuxbox.verify.shutil.which", return_value="/usr/bin/Xwayland"), \
+                 mock.patch("project_tuxbox.verify._free_display_number", return_value=5), \
+                 mock.patch("project_tuxbox.verify._xwayland", xwayland), \
+                 mock.patch("project_tuxbox.verify._adapter_driver", return_value=driver), \
+                 mock.patch("project_tuxbox.verify._server_render_device", return_value=device):
+                with private_x_server(directory, adapter="1002:13C0") as server:
+                    self.assertEqual(server, (":5", str(Path(directory) / "Xauthority"), environment))
+                self.assertEqual(started, servers)
+        started.clear()
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("project_tuxbox.verify.sys.platform", "linux"), \
+             mock.patch.dict("project_tuxbox.verify.os.environ", {"WAYLAND_DISPLAY": "wayland-0"}), \
+             mock.patch("project_tuxbox.verify.shutil.which", return_value="/usr/bin/Xwayland"), \
+             mock.patch("project_tuxbox.verify._free_display_number", return_value=5), \
+             mock.patch("project_tuxbox.verify._xwayland", xwayland), \
+             mock.patch("project_tuxbox.verify._server_render_device") as probe:
+            with private_x_server(directory) as server:
+                self.assertEqual(server[2], {})
+            probe.assert_not_called()
+        self.assertEqual(started, [()])
 
 class ScreenCaptureTests(unittest.TestCase):
     def test_only_an_x_display_on_linux_is_probed(self):

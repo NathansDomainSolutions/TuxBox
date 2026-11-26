@@ -205,8 +205,8 @@ fn extrema_quad_can_start_a_saved_exec_reduction_or_stand_alone() {
         0xd760_0016, 0x0001_4104, 0x1e08_0816, 0xd760_0017, 0x0001_0104,
         0xbefe_0414, 0xbf81_0000]);
     let hlsl = super::super::translate(&compute_extract(&words)).unwrap().hlsl;
-    assert!(hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x20u & 63u)]"), "{hlsl}");
-    assert!(hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x0u & 63u)]"), "{hlsl}");
+    assert!(hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x20u & 63u))"), "{hlsl}");
+    assert!(hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x0u & 63u))"), "{hlsl}");
     assert!(!hlsl.contains("WaveActiveMin("), "{hlsl}");
     // Rotating right four lanes reads from the previous quartet.
     assert!(hlsl.contains("lane - 4u) & 15u)"), "{hlsl}");
@@ -221,7 +221,7 @@ fn extrema_quad_can_start_a_saved_exec_reduction_or_stand_alone() {
         0x1e08_08e9, 0xde54_c104, 0x1e08_08e9, 0xb3e2_1a04,
         0x1e08_08e9, 0x688f_ac04, 0x1e08_08fa, 0xff05_4004]);
     let hlsl = super::super::translate(&compute_extract(&words)).unwrap().hlsl;
-    assert!(hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x20u & 63u)]"), "{hlsl}");
+    assert!(hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x20u & 63u))"), "{hlsl}");
     assert!(!hlsl.contains("WaveActiveMin("), "{hlsl}");
     // A branch skipping NAND_SAVEEXEC could leave the DPP8 source inactive.
     words.insert(0, 0xbf85_0005);
@@ -307,8 +307,8 @@ fn signed_quad_extrema_preserve_both_lane_reads() {
         0x0001_0104, 0xbefe_0414, 0xbf81_0000,
     ]);
     let hlsl = super::super::translate(&shader).unwrap().hlsl;
-    assert!(hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x20u & 63u)]"), "{hlsl}");
-    assert!(hlsl.contains("tb_swizzle[(tb_lane & ~63u) | (0x0u & 63u)]"), "{hlsl}");
+    assert!(hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x20u & 63u))"), "{hlsl}");
+    assert!(hlsl.contains("tb_swizzle_read((tb_lane & ~63u) | (0x0u & 63u))"), "{hlsl}");
     assert!(!hlsl.contains("WaveActiveMax("), "{hlsl}");
 }
 
