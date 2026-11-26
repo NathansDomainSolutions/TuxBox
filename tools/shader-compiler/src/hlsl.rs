@@ -104,7 +104,12 @@ mod fspx_wave;
 mod singleton_wave;
 mod wave_sum;
 mod lockstep;
+mod mask_ballots;
 mod wave_loops;
+mod paired_wave64;
+pub use paired_wave64::translate_paired_wave64;
+/// Generated HLSL above this size would need more than about 9 GB of DXC memory.
+pub const MAX_HLSL_BYTES: usize = 8 << 20;
 mod raw_index;
 mod reflection_compact;
 pub(crate) mod radiance_probe;
@@ -268,6 +273,11 @@ struct Emitter<'a> {
     heap_load_ty: HashMap<usize, [bool; 3]>,
     /// The root carries TuxBox's guest-to-host heap index map (root SRV t0, space32766).
     heap_map: bool,
+    /// The root carries TuxBox's per-slot buffer stride table (root SRV t1, space32766),
+    /// one u32 per guest resource-heap slot: what the console keeps in word 1 of a V#.
+    heap_strides: bool,
+    /// A heap descriptor load filled word 1 from that table.
+    heap_strides_used: bool,
     /// Compute sampler heap base SGPR (FSSM user-data class 6).
     sampler_heap_base: Option<u8>,
     /// Sampler slots read from that heap: bound from SamplerDescriptorHeap in main.
@@ -332,15 +342,20 @@ struct Emitter<'a> {
     compute_swizzle: bool,
     vote_defs: BTreeSet<usize>,
     vote_uses: BTreeMap<usize, usize>,
+    /// Lane masks read as numbers.
+    mask_ballots: Option<mask_ballots::Ballots>,
     exec_snapshots: exec_snapshot::Snapshots,
     reflected_lds_words: Option<u32>,
     hoisted_swizzle: Option<usize>,
     /// Instructions whose DPP16 source lane was read outside the guards.
     dpp16_fetched: BTreeSet<usize>,
     indexed_lane: bool,
+    indexed_lane_wave32: bool,
     /// Complete 32-thread wave using independent one-word vector comparison masks.
     single_wave32: bool,
     resolve_wave32: bool,
+    /// Each host thread runs two lanes of a console wave64 (see `paired_wave64`).
+    paired: bool,
     wave32_compare_masks: bool,
     light_grid: bool,
     page_waves: bool,
@@ -363,6 +378,8 @@ struct Emitter<'a> {
     pulled_attrs: BTreeSet<usize>,
     /// Each pixel is a wave of its own.
     pixel_wave: bool,
+    /// Entry WQM proven to dominate converged nonheap pixel axis swaps.
+    straight_pixel_quad: Option<usize>,
     dispatched: bool,
     /// The reduction being emitted adds.
     pixel_sum: bool,
@@ -469,3 +486,7 @@ mod election_order_regression;
 #[cfg(test)]
 #[path = "tests/hlsl/reduction_execz_regression.rs"]
 mod reduction_execz_regression;
+
+#[cfg(test)]
+#[path = "tests/hlsl/host_profiles.rs"]
+mod host_profile_tests;

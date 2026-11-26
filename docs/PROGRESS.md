@@ -12,7 +12,7 @@ With the packaged Xbox graphics settings on stock Proton, Frosty rendered its ma
 | --- | --- | --- |
 | **Lanes** | Runs through TuxBox's Xbox graphics, memory and input providers. On an RTX 4070 Ti SUPER under stock Proton, all 66 guest checks (Lanes' replay, self-test, shader cache and benchmark checks among them) and the D3D12 regression controls pass. Every change must pass them before it is merged. | Add shader forms the translator often refuses, and run the checks on more systems. [Lanes](../examples/lanes/README.md) · [Guest check results](../evidence/lanes-checks-rtx4070tis.json) |
 | **The Matrix Awakens (Frosty)** | With the original Xbox graphics settings, a Linux run rendered the menu, played Wake Up and loaded the first street corner of the chase intro. Earlier reduced-settings runs reached the highway and city with missing and distorted surfaces. | Verify the shooting tutorial, image quality and frame times with the packaged settings. [Setup and results](MATRIX_AWAKENS.md) · [Recorded original-settings run](../evidence/matrix-awakens/packaged-settings-room.json) |
-| **ProjectScarlett (GTA VI 1.0.2.1)** | An offline Linux run got into the story intro: the game reported `Game Running` at frame 32,534 after 18 m 11 s. GPU queues stalled on fence waits there, and the run ended on a game assert after a command list ran out of descriptor memory. The prologue cutscene has not appeared. [Run record](../evidence/projectscarlett-gameplay.json) · [Startup record](../evidence/projectscarlett-startup.json) | Resolve the remaining fence stalls, reclaim descriptor memory, shorten large driver compiles, support the remaining shaders, then check images, input and frame times. [Setup guide](PROJECTSCARLETT.md#what-to-expect) |
+| **ProjectScarlett (GTA VI 1.0.2.1)** | An offline Linux run got into the story intro: the game reported `Game Running` at frame 32,534 after 18 m 11 s. GPU queues stalled on fence waits there, and the run ended on a game assert after a command list ran out of descriptor memory. The prologue cutscene has not appeared. [Run record](../evidence/projectscarlett-gameplay.json) · [Startup record](../evidence/projectscarlett-startup.json) | Resolve the remaining fence stalls and the NVIDIA GPU hangs, confirm descriptor reclamation in a long run, shorten large driver compiles, support the remaining shaders, then check images, input and frame times. [Setup guide](PROJECTSCARLETT.md#what-to-expect) |
 | **Fortnite** | One supplied build provided graphics API call-site evidence. | Test initialization and rendering in TuxBox for a specific build. [Device evidence](../evidence/fortnite-device.json) |
 
 No other retail title is currently claimed playable. Record the build, settings, host, provider and observed faults for each run, and distinguish starting, rendering, input and sustained gameplay.
@@ -22,9 +22,10 @@ No other retail title is currently claimed playable. Record the build, settings,
 ### ProjectScarlett
 
 1. Resolve the fence waits that still stall the GPU queues at the story intro. Reproduce each cause as a [Lanes self-test](../examples/lanes/README.md#self-test) scenario first.
-2. Reclaim shader-visible descriptor slots, which are never released and run out during long runs.
-3. Make large translated compute shaders compile quickly enough. Some now take the driver most of an hour and can hold up loading. [Shader coverage](SHADERS.md#projectscarlett-refusals)
-4. Support the remaining refused shader forms, ranked with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
+2. Find the dispatch behind the NVIDIA GPU hangs (Xid 109, `CTX SWITCH TIMEOUT`) reported on an RTX 3080 Ti and an RTX 5090. [#232](https://github.com/brcly/TuxBox/issues/232)
+3. Confirm in a long run that shader-visible descriptor slots are now reclaimed (#172); they used to run out.
+4. Make large translated compute shaders compile quickly enough. Some now take the driver most of an hour and can hold up loading. [Shader coverage](SHADERS.md#projectscarlett-refusals)
+5. Support the remaining refused shader forms, ranked with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
 
 ### The Matrix Awakens
 

@@ -171,8 +171,10 @@ pub(super) fn scalar_step(em: &Emitter<'_>, flow: &Flow, effects: &[Effect], i: 
                 && op.src.iter().all(|&src| scalar_value(src))
         }
         Enc::Smem => {
+            // VCC can hold a scalar offset; in this mode even its comparison
+            // masks are wave-uniform ballots (see the VALU arm below).
             let offset = op.raw[1] >> 25;
-            if !matches!(offset, 0..=105 | 0x7d) {
+            if !matches!(offset, 0..=107 | 0x7d) {
                 return false;
             }
             match em.res.get(&i).map(Vec::as_slice) {

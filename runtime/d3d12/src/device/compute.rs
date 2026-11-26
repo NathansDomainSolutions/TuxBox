@@ -27,6 +27,9 @@ pub(crate) struct PipelineData {
     pub(crate) raster_table: Option<std::sync::Arc<ComputeTable>>,
     pub(crate) null_usage: Option<std::sync::Arc<crate::diagnostics::null_usage::Tag>>,
     pub(crate) compute_threads: Option<[u32; 3]>,
+    /// The guest root with the literal samplers the program needs and the root
+    /// leaves out; set around each dispatch (see `compute_table::sampler_root`).
+    pub(crate) sampler_root: Option<ID3D12RootSignature>,
 }
 
 const _: () = assert!(
@@ -213,12 +216,28 @@ unsafe fn create_pipeline_x_inner(
         Err(error) => return error.code(),
     };
     let guest_threads = tuxbox_dxbc::shader_compute_threads(bytes);
+    let mut sampler_root = None;
     let (translation, reflected) = match layout {
         Some(TableLayout::Reflected(table)) => {
             // Embedded RTS0 cannot be replaced. The translator reads that original
             // root and fills only the slots the appended signature adds.
-            let code = super::shader_cache::compute_with_root(bytes, table.layout.payload())
+            let mut table = table;
+            let mut code = super::shader_cache::compute_with_root(bytes, table.layout.payload())
                 .or_else(|| super::shader_cache::prepared(bytes));
+            // A heap-indexed IDXEN access needs each slot's buffer stride: retry
+            // on the same root with the arena's stride table appended.
+            if code.is_none() && super::shader_cache::refused_for_heap_strides(bytes, table.layout.payload())
+                && let Some(root) = root
+                && let Ok(TableLayout::Reflected(strided)) = super::compute_table::reflected_with_strides(
+                    &this.native, &root.state, Program::Compute(bytes), desc.NodeMask)
+            {
+                code = super::shader_cache::compute_with_root(bytes, strided.layout.payload());
+                if code.is_some() {
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    crate::diagnostics::log_once(&FIRST, || "translated a compute shader with the heap stride table".to_string());
+                    table = strided;
+                }
+            }
             let Some(code) = code else {
                 super::compute_table::capture_stage_root(bytes, &table.original);
                 crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
@@ -226,15 +245,49 @@ unsafe fn create_pipeline_x_inner(
             };
             (Some(code), Some(table))
         }
-        Some(TableLayout::Original) => (root.and_then(|r| {
-            super::shader_cache::compute_for_original_root(bytes, r.state.payload())
-        }), None),
-        _ => (super::shader_cache::prepared(bytes).or_else(|| {
-            super::shader_cache::compute_with_root(bytes, root?.state.payload())
-        }), None),
+        Some(TableLayout::Original) => {
+            let code = root.and_then(|r| super::shader_cache::compute_for_original_root(bytes, r.state.payload()));
+            // The guest root fits, but a heap-indexed IDXEN access still needs
+            // each slot's stride: the same root with the stride table appended.
+            match (code, root) {
+                (Some(code), _) => (Some(code), None),
+                (None, Some(root)) if super::shader_cache::refused_for_heap_strides(bytes, root.state.payload()) => {
+                    match super::compute_table::reflected_with_strides(&this.native, &root.state, Program::Compute(bytes), desc.NodeMask) {
+                        Ok(TableLayout::Reflected(strided)) => {
+                            let code = super::shader_cache::compute_with_root(bytes, strided.layout.payload());
+                            let table = code.is_some().then_some(strided);
+                            (code, table)
+                        }
+                        _ => (None, None),
+                    }
+                }
+                (None, _) => (None, None),
+            }
+        }
+        _ => {
+            // A root the reflected tables cannot describe may still lack the
+            // samplers the program builds from constants. Translate against the
+            // root with them, which keeps every parameter of the guest's.
+            let extended = root.and_then(|r| super::compute_table::sampler_root(
+                &this.native, &r.state, bytes, desc.NodeMask).ok().flatten());
+            match extended.and_then(|(native, layout)| {
+                super::shader_cache::compute_with_root(bytes, layout.payload()).map(|code| (code, native))
+            }) {
+                Some((code, native)) => {
+                    sampler_root = Some(native);
+                    (Some(code), None)
+                }
+                None => (super::shader_cache::prepared(bytes).or_else(|| {
+                    super::shader_cache::compute_with_root(bytes, root?.state.payload())
+                }), None),
+            }
+        }
     };
     let compute_threads = guest_threads
         .or_else(|| translation.as_deref().and_then(tuxbox_dxbc::shader_compute_threads));
+    // The group size above is the console's. A narrow-wave translation runs the
+    // same group on half as many host threads, so it is chosen only now.
+    let translation = translation.map(|code| fitting_translation(this, code));
     let code = translation.as_deref().unwrap_or(bytes);
     if let Some(refusal) = unsupported_wave_size(this, code) {
         crate::diagnostics::compute_wave_failure(bytes, &refusal.detail);
@@ -265,6 +318,7 @@ unsafe fn create_pipeline_x_inner(
                 .as_ref()
                 .map(|s| &s.native)
                 .or_else(|| reflected.as_ref().map(|t| &t.native))
+                .or(sampler_root.as_ref())
                 .or(root.map(|p| &p.native))
                 .cloned(),
         ),
@@ -319,6 +373,7 @@ unsafe fn create_pipeline_x_inner(
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
                 // The original guest shader would be a second long driver compile.
+                crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
                 return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
             }
@@ -330,6 +385,7 @@ unsafe fn create_pipeline_x_inner(
         native = match compile(bytes) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
+                crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
                 return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
             }
@@ -339,6 +395,7 @@ unsafe fn create_pipeline_x_inner(
     if let Err(error) = &native {
         if let Some(root) = root { super::compute_table::capture_stage_root(bytes, &root.state); }
         crate::diagnostics::compute_failure(bytes, error.code().0);
+        crate::failures::refusal("CS", &format!("driver compile failed: {:#010x}", error.code().0));
         if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) } {
             return status;
         }
@@ -357,6 +414,7 @@ unsafe fn create_pipeline_x_inner(
                 scene_root,
                 reflected,
                 compute_threads,
+                sampler_root,
                 ..Default::default()
             },
             out,
@@ -475,11 +533,26 @@ pub(super) fn check_wave_range(required: (u32, u32), host: (u32, u32)) -> Option
     Some(WaveRefusal { detail, tag })
 }
 
+/// `translation`, or the narrow-wave translation of the same program when this
+/// host cannot run it and the compiler can produce one.
+pub(super) fn fitting_translation(device: &Device, translation: Vec<u8>) -> Vec<u8> {
+    let Some(host) = super::host_profile::wave_range(device) else { return translation };
+    if !needs_narrow_waves(super::shader_cache::portable_wave_range(&translation), host) {
+        return translation;
+    }
+    super::shader_cache::narrow_wave_variant(&translation).unwrap_or(translation)
+}
+
+/// Whether a program that needs exactly 64 lanes meets a host that has fewer.
+pub(super) fn needs_narrow_waves(required: Option<(u32, u32)>, (_, host_max): (u32, u32)) -> bool {
+    required == Some((64, 64)) && host_max == 32
+}
+
 /// Returns a refusal if `shader` is portable DXIL whose required wave size is
 /// unsupported by `device`'s `D3D12_FEATURE_D3D12_OPTIONS1` wave lane range.
 pub(super) fn unsupported_wave_size(device: &Device, shader: &[u8]) -> Option<WaveRefusal> {
     let required = super::shader_cache::portable_wave_range(shader)?;
-    let host = super::dxgi::wave_range(device)?;
+    let host = super::host_profile::wave_range(device)?;
     check_wave_range(required, host)
 }
 

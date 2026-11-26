@@ -17,6 +17,8 @@ mod private_driver;
 mod progress;
 mod proxy;
 mod survey;
+mod title_audio;
+mod title_watchdog;
 
 // Guest vtables mix signatures. Each entry is called by its x64 ABI slot.
 macro_rules! slot {

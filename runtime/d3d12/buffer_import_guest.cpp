@@ -274,10 +274,103 @@ std::string remap(const wchar_t* requested, bool) {
     return receipt;
 }
 
+// What happens to later submits when the memory under an imported buffer goes away.
+// "released" destroys the buffer before freeing its pages, and every later copy must
+// work. "alive" frees the pages while the buffer still exists: on a host whose driver
+// keeps the pages of a host-pointer import in every submit (amdgpu), all later
+// submits are rejected and the device is lost. The receipt reports which happened.
+std::string unmap_mode(const wchar_t* requested, bool release_first) {
+    DXGI_ADAPTER_DESC1 selected{};
+    auto device=create_device(requested,selected);
+    auto place=method<Place>(device.Get(),44);
+    auto reg=method<Register>(device.Get(),74);
+    auto unreg=method<Unregister>(device.Get(),75);
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(device->CreateCommandQueue(&queue_desc,IID_PPV_ARGS(&queue)),"unmap queue");
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"unmap fence");
+    UINT64 fence_value=0;
+    auto submit=[&](ID3D12Resource* to,ID3D12Resource* from,const char* what){
+        ComPtr<ID3D12CommandAllocator> allocator;
+        check(device->CreateCommandAllocator(queue_desc.Type,IID_PPV_ARGS(&allocator)),"unmap allocator");
+        ComPtr<ID3D12GraphicsCommandList> list;
+        const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT,0,1,0};
+        check(method<CreateList>(device.Get(),73)(device.Get(),list_desc,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"unmap list");
+        list->CopyBufferRegion(to,0,from,0,words*4);
+        check(list->Close(),"unmap close");
+        ID3D12CommandList* batch[]={list.Get()};
+        queue->ExecuteCommandLists(1,batch);
+        auto signalled=queue->Signal(fence.Get(),++fence_value);
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        auto armed=fence->SetEventOnCompletion(fence_value,event);
+        auto waited=SUCCEEDED(armed)?WaitForSingleObject(event,8000):WAIT_FAILED;
+        CloseHandle(event);
+        // The console device's vtable differs from the desktop one, so ask only the fence.
+        std::printf("unmap step=%s signal=%#lx fence=%s\n",what,signalled,waited==WAIT_OBJECT_0?"done":"NOT-DONE");
+        std::fflush(stdout);
+        return waited==WAIT_OBJECT_0;
+    };
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width=page;
+    desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;
+    desc.SampleDesc.Count=1;
+    desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    auto memory=static_cast<UINT*>(VirtualAlloc(nullptr,page,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+    if(!memory)throw std::runtime_error("unmap allocate");
+    for(UINT i=0;i<words;++i)memory[i]=0x44440000u+i;
+    SIZE_T token=0;
+    auto address=reinterpret_cast<UINT64>(memory);
+    check(reg(device.Get(),address,1,&token),"unmap register");
+    ComPtr<ID3D12Resource> imported;
+    check(place(device.Get(),address,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&imported)),"unmap place");
+    auto readback=compute_fixture::buffer(device.Get(),D3D12_HEAP_TYPE_READBACK,words*4,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto upload=compute_fixture::buffer(device.Get(),D3D12_HEAP_TYPE_UPLOAD,words*4,D3D12_RESOURCE_STATE_GENERIC_READ);
+    bool ok=submit(readback.Get(),imported.Get(),"copy-from-import");
+    if(release_first){
+        imported.Reset();
+        if(token){unreg(device.Get(),token);token=0;}
+    }
+    auto freed=VirtualFree(memory,0,MEM_RELEASE);
+    std::printf("unmap pages-freed=%d buffer=%s\n",freed,release_first?"released-first":"still-alive");
+    // Nothing below touches the imported buffer. Each step copies a fresh pattern
+    // and reads it back, because a lost device still lets the fence complete.
+    UINT step=0;
+    auto unrelated=[&](const char* what){
+        const UINT value=0x55550000u+0x100u*++step;
+        {D3D12_RANGE none{};void* ptr{};check(upload->Map(0,&none,&ptr),"unmap upload");
+         auto data=static_cast<UINT*>(ptr);for(UINT i=0;i<words;++i)data[i]=value+i;upload->Unmap(0,nullptr);}
+        submit(readback.Get(),upload.Get(),what);
+        D3D12_RANGE range{0,words*4},empty{};void* ptr{};
+        check(readback->Map(0,&range,&ptr),"unmap readback");
+        auto actual=static_cast<const UINT*>(ptr);
+        UINT good=0;for(UINT i=0;i<words;++i)good+=actual[i]==value+i;
+        readback->Unmap(0,&empty);
+        std::printf("unmap step=%s copied=%u/%u\n",what,good,words);std::fflush(stdout);
+        return good==words;
+    };
+    ok&=unrelated("unrelated-copy-1");
+    ok&=unrelated("unrelated-copy-2");
+    if(!release_first){
+        imported.Reset();
+        if(token)unreg(device.Get(),token);
+        ok&=unrelated("unrelated-copy-after-release");
+    }
+    char receipt[160];
+    std::snprintf(receipt,sizeof(receipt),"d3d12-buffer-unmap PASS pci=%04x:%04x mode=%s later-submits=%s",
+        selected.VendorId,selected.DeviceId,release_first?"released":"alive",ok?"ok":"lost");
+    return receipt;
+}
+
 }
 int wmain(int argc,wchar_t** argv){
     if(argc>1 && !std::wcscmp(argv[1],L"--remap"))
         return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-buffer-remap",false,remap);
+    if(argc>1 && !std::wcscmp(argv[1],L"--unmap-alive"))
+        return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-buffer-unmap",false,[](const wchar_t* a,bool){return unmap_mode(a,false);});
+    if(argc>1 && !std::wcscmp(argv[1],L"--unmap-released"))
+        return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-buffer-unmap",false,[](const wchar_t* a,bool){return unmap_mode(a,true);});
     if(argc>1 && !std::wcscmp(argv[1],L"--layout"))
         return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-buffer-layout",false,layout);
     return tuxbox_test::frame_main(argc,argv,"d3d12-buffer-import",true,run,L"--reject"," [--reject]");

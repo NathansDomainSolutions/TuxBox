@@ -41,6 +41,7 @@ pub(crate) mod depth;
 mod descriptor_copy;
 pub(crate) mod descriptor_paging;
 mod dxgi;
+mod host_profile;
 mod features;
 pub(crate) mod format;
 mod reserved;
@@ -62,6 +63,7 @@ pub(crate) mod stencil;
 mod stream;
 mod title_memory;
 mod views;
+pub(crate) use heap::sync_shadow_imports;
 pub(crate) use views::{clear_buffer_alias, command_buffer_address, is_constant_buffer, linear_resource, snapshot_cbv_mirrors, LinearResource};
 
 type Device = Proxy<ID3D12Device, dxgi::DxgiDevice>;
@@ -227,6 +229,7 @@ pub(crate) struct DescriptorHeapState {
     _placed_targets: Option<placement::HeapViews<placement::Texture>>,
     _imported_views: Option<placement::DescriptorRange<views::DescriptorBacking>>,
     _scene_views: Option<placement::DescriptorRange<blas::SceneView>>,
+    _view_strides: Option<placement::DescriptorRange<u32>>,
 }
 type DescriptorHeap = Proxy<ID3D12DescriptorHeap, DescriptorHeapState>;
 

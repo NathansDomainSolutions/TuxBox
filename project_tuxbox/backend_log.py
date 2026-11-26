@@ -160,6 +160,9 @@ def game_diagnostics(backend, env, cwd, write_bytes, *, log_path=None):
         channels = _WINE_CHANNELS + (",trace+console" if backend == "proton" else "")
         env.setdefault("DXVK_LOG_LEVEL", "warn")
         env.setdefault("VKD3D_DEBUG", "warn")
+        # DXIL conversion failures report only a result code on VKD3D_DEBUG;
+        # the shader compiler's own channel says which construct it rejected.
+        env.setdefault("VKD3D_SHADER_DEBUG", "err")
         if "WINEDEBUG" not in env:
             env["WINEDEBUG"] = channels
             messages = _WineMessages(write_bytes)

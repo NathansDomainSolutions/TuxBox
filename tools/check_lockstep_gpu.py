@@ -84,11 +84,11 @@ def program(body, resolve=False):
     ]
 
 
-def words_of(items, llvm_mc):
+def words_of(items, llvm_mc, *options):
     lines = [item for item in items if isinstance(item, str)]
     sizes, encoded = [], []
     for line in lines:
-        encoded.append(assemble([line], llvm_mc))
+        encoded.append(assemble([line], llvm_mc, *options))
     offsets, position, queue = {}, 0, iter(encoded)
     for item in items:
         if isinstance(item, str):

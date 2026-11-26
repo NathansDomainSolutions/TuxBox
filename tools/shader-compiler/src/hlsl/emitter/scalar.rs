@@ -48,10 +48,19 @@ impl<'a> Emitter<'a> {
                     _ => return Err("unsupported SOPP".into()),
                 };
                 if let (Some(c), Some(t)) = (cond, br) {
-                    let c = if self.resolve_wave32 || self.lockstep.is_some() {
+                    let c = if self.paired || self.resolve_wave32 || self.lockstep.is_some() {
                         wave_cull::branch_condition(self, ins, &c)
                     } else { c };
-                    self.line(&format!("if ({c}) j{t} = true;"));
+                    // The condition is evaluated either way. Or-ing it in keeps
+                    // the branch out of an unoptimised compute program's control
+                    // flow (see `flag_or`).
+                    if self.ex.stage != Stage::Compute {
+                        self.line(&format!("if ({c}) j{t} = true;"));
+                    } else if c == "true" {
+                        self.line(&format!("j{t} = true;"));
+                    } else {
+                        self.line(&format!("j{t} = j{t} | ({c});"));
+                    }
                 }
                 Ok(())
             }
@@ -252,9 +261,13 @@ impl<'a> Emitter<'a> {
                 self.tmp += 1;
                 let wide = m.ends_with("_b64");
                 let lane_mask = is_ps && pixel_quad::saved_exec(&self.insns, idx);
-                if s[0] == Opnd::ExecLo && lone_lane::on() {
+                let straight_entry = self.straight_pixel_quad == Some(idx) && !self.dispatched;
+                if straight_entry {
+                    // Entry WQM activates the complete quad, including helper lanes.
+                    self.line(&format!("uint t{t}l = 1u, t{t}h = 0u;"));
+                } else if s[0] == Opnd::ExecLo && lone_lane::on() {
                     self.line(&format!("uint t{t}l = exec_lo & 1u, t{t}h = 0u;"));
-                } else if s[0] == Opnd::ExecLo && !self.resolve_wave32 {
+                } else if s[0] == Opnd::ExecLo && !self.resolve_wave32 && !self.paired {
                     self.line("#if __SHADER_TARGET_MAJOR >= 6");
                     self.line(&format!("uint4 t{t}ballot = WaveActiveBallot((exec_lo & 1u) != 0u);"));
                     self.line(&format!("uint t{t}lane = WaveGetLaneIndex(); uint t{t}l = ((t{t}ballot[t{t}lane >> 5] >> (t{t}lane & 28u)) & 15u) != 0u;"));
@@ -279,7 +292,7 @@ impl<'a> Emitter<'a> {
                     } else { "0u".into() };
                     self.line(&format!("uint t{t}h = {upper};"));
                 }
-                if s[0] == Opnd::ExecLo && !self.resolve_wave32 && !lone_lane::on() {
+                if !straight_entry && s[0] == Opnd::ExecLo && !self.resolve_wave32 && !self.paired && !lone_lane::on() {
                     self.line(&format!("scc = any(t{t}ballot != 0u);"));
                 } else if !lane_mask {
                     self.line(&format!("scc = ((t{t}l | t{t}h) != 0u);"));
@@ -323,12 +336,14 @@ impl<'a> Emitter<'a> {
                 // Population count of a 64-bit value — typically the number of active
                 // lanes (wave-level allocation). One invocation = one lane, so a lane
                 // mask counts as 0 or 1.
-                let ah = r(&hi(&s[0]))?;
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
             }
             "s_bcnt1_i32_b32" => {
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
                 self.ws(&d, &format!("countbits({a})"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
@@ -345,12 +360,16 @@ impl<'a> Emitter<'a> {
                 let ah = r(&hi(&s[0]))?;
                 self.ws(&d, &ff0_b64_expr(&a, &ah))
             }
-            "s_ff1_i32_b32" => self.ws(&d, &format!("firstbitlow({a})")),
+            "s_ff1_i32_b32" => {
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                self.ws(&d, &format!("firstbitlow({a})"))
+            }
             // s_ff1_i32_b64 is firstbitlow over the 64-bit value: the low word
             // decides when it is nonzero, otherwise the high word.
             "s_ff1_i32_b64" => {
                 self.touch(&hi(&s[0]));
-                let ah = r(&hi(&s[0]))?;
+                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &ff1_b64_expr(&a, &ah))
             }
             "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),

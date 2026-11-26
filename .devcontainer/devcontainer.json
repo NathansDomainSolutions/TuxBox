@@ -1,0 +1,37 @@
+{
+  "name": "TuxBox",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.95.0",
+      "profile": "minimal",
+      "targets": "x86_64-pc-windows-msvc"
+    }
+  },
+  "remoteUser": "dev",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/tuxbox,type=bind",
+  "workspaceFolder": "/tuxbox",
+  "mounts": ["source=/dev/dri,target=/dev/dri,type=bind"],
+  "runArgs": ["--security-opt=label=disable"],
+  "containerEnv": {
+    "DISPLAY": ":99",
+    "XDG_RUNTIME_DIR": "/tmp/xdg-runtime"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/start-display.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "ms-python.python"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.target": "x86_64-pc-windows-msvc",
+        "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python"
+      }
+    }
+  }
+}

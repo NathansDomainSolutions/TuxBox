@@ -448,6 +448,71 @@ pub fn omitted(shader: &[u8], root: &crate::rootsig::RootSig) -> Option<Vec<[u32
     omitted_states(&fssm::decode(program).ok()?.isa, &declared, &recorded, &root.static_samplers)
 }
 
+/// Literal sampler states a pixel (`stage` 0) or compute (`stage` 5) program
+/// carries that no static sampler of `root` visible to it has. The console
+/// compiled these words into the program, so they decide how it samples even
+/// where the root it runs under names another state, or the program indexes a
+/// descriptor heap and `omitted` cannot rely on its declarations.
+///
+/// Each state takes a register of the private space 32765, in the order
+/// `literal_sites` lists them, so the returned descriptors can be appended to
+/// the root's own. The registers follow every sampler register the root uses in
+/// any space: a translation names a sampler by its register. It finds these by
+/// state in the root it reads.
+pub fn unmatched(shader: &[u8], stage: u32, root: &crate::rootsig::RootSig) -> Option<Vec<[u32; 13]>> {
+    let first = private_base(root)?;
+    let d = Dxbc::parse(shader).ok()?;
+    let c = d.chunk(b"DXIL")?;
+    let dxil = shader.get(c.offset..c.offset + c.size)?;
+    if !matches!(stage, 0 | 5) || word(dxil, 0)? >> 16 != stage {
+        return None;
+    }
+    let programs = xdat::programs(dxil.get(24..)?).ok()?;
+    let [program] = programs.as_slice() else {
+        return None;
+    };
+    let visibility = if stage == 0 { 5 } else { 0 };
+    unmatched_states(&fssm::decode(program).ok()?.isa, visibility, &root.static_samplers, first)
+}
+
+/// The register after every sampler register the root uses, static or in a table.
+fn private_base(root: &crate::rootsig::RootSig) -> Option<u32> {
+    use crate::rootsig::RootParamKind;
+    let mut first = 0u32;
+    for s in &root.static_samplers {
+        first = first.max(s[10].checked_add(1)?);
+    }
+    for param in &root.params {
+        if let RootParamKind::Table(ranges) = &param.kind {
+            for r in ranges.iter().filter(|r| r.range_type == 3) {
+                first = first.max(r.base_register.checked_add(r.num)?);
+            }
+        }
+    }
+    Some(first)
+}
+
+fn unmatched_states(isa: &[u8], visibility: u32, statics: &[[u32; 13]], first: u32) -> Option<Vec<[u32; 13]>> {
+    // A root with no static samplers is recovered whole by `pixel` and `private`,
+    // and one with private samplers was built here already.
+    // At most 128 distinct literal states each take a register from `first`.
+    if statics.is_empty() || statics.iter().any(|s| s[11] == 32765) || first.checked_add(128).is_none() {
+        return None;
+    }
+    let visible = |s: &&[u32; 13]| s[12] == 0 || s[12] == visibility;
+    let missing: Vec<_> = literal_sites(isa, visibility)?
+        .descriptors
+        .into_iter()
+        .filter(|state| !statics.iter().filter(visible).any(|s| s[..10] == state[..10]))
+        .zip(first..)
+        .map(|(mut state, register)| {
+            state[10] = register;
+            state
+        })
+        .collect();
+    (!missing.is_empty()).then_some(missing)
+}
+
 fn omitted_states(
     isa: &[u8],
     declared: &[(u32, u32)],

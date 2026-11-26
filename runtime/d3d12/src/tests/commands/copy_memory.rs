@@ -47,6 +47,18 @@ fn height_padded_single_subresource_uploads_its_footprint() {
 }
 
 #[test]
+fn tile_padded_single_subresource_uploads_its_footprint() {
+    // ProjectScarlett copies 0x4000 bytes for a 128x4 RGBA16 texture whose
+    // 0x1000-byte footprint is padded to a 16-row tile.
+    let regions = [region(0, 0, 0x1000, 1024)];
+    assert!(matches!(plan(0, 0x4000, 0x1000, &regions), Some(Plan::One(0))));
+    // Whole rows up to a 64-row tile, nothing past it and no partial row.
+    assert!(matches!(plan(0, 64 * 1024, 0x1000, &regions), Some(Plan::One(0))));
+    assert!(plan(0, 65 * 1024, 0x1000, &regions).is_none());
+    assert!(plan(0, 0x4001, 0x1000, &regions).is_none());
+}
+
+#[test]
 fn oversized_guest_buffer_is_rejected() {
     let regions = [region(0, 0, 1000, 256)];
     assert!(plan(0, 50_000, 1000, &regions).is_none());

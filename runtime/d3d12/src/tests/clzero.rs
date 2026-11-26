@@ -1,7 +1,10 @@
-use super::{Plan, Site, decode, handle_unchecked, plan_loop, plan_single};
+use super::{
+    Plan, SCARLETT_CLEAR, SCARLETT_CLEAR_AVX, SCARLETT_CLEAR_FAST_PATH, Site, decode,
+    handle_unchecked, patch_scarlett_clear, plan_loop, plan_single,
+};
 use windows::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_PROTECTION_FLAGS,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_PROTECTION_FLAGS,
     PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
 };
 
@@ -77,6 +80,79 @@ fn plans_match_the_instruction_sequence() {
         plan_single(rip, 0x1234),
         Plan { first: 0x1200, bytes: 64, rax: 0x1234, resume: rip + 3 }
     );
+}
+
+/// Offset of the routine's shared tail (`vxorps xmm0, xmm0, xmm0`).
+const SCARLETT_TAIL: usize = 0xEC;
+
+#[test]
+fn scarlett_routine_has_five_loops_and_the_replacement_joins_its_tail() {
+    for offset in [0x60, 0x80, 0xA0, 0xC0, 0xE0] {
+        assert!(
+            matches!(decode(&SCARLETT_CLEAR[offset..]), Some(Site::Loop { .. })),
+            "loop at {offset:#x}"
+        );
+    }
+    assert_eq!(SCARLETT_CLEAR[SCARLETT_TAIL..SCARLETT_TAIL + 4], [0xC5, 0xF8, 0x57, 0xC0]);
+    let jmp = SCARLETT_CLEAR_AVX.len() - 5;
+    assert_eq!(SCARLETT_CLEAR_AVX[jmp], 0xE9);
+    let rel = i32::from_le_bytes(SCARLETT_CLEAR_AVX[jmp + 1..].try_into().unwrap());
+    let after = SCARLETT_CLEAR_FAST_PATH + SCARLETT_CLEAR_AVX.len();
+    assert_eq!(after as i64 + i64::from(rel), SCARLETT_TAIL as i64);
+    // The replacement ends inside the second loop, whose code is then dead.
+    assert!(after <= 0xA0);
+}
+
+#[test]
+fn patched_routine_clears_what_the_clzero_loops_clear() {
+    if !std::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    let code = Pages::new(0x1000);
+    code.bytes()[..SCARLETT_CLEAR.len()].copy_from_slice(&SCARLETT_CLEAR);
+    code.bytes()[SCARLETT_CLEAR.len()] = 0xCC;
+    let mut old = PAGE_PROTECTION_FLAGS(0);
+    // SAFETY: the guard's own allocation, executed only below.
+    unsafe { VirtualProtect(code.0.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old) }.unwrap();
+    // SAFETY: mapped, and no thread executes it yet.
+    unsafe { patch_scarlett_clear(code.0 as usize) }.unwrap();
+    assert_eq!(
+        code.bytes()[SCARLETT_CLEAR_FAST_PATH..][..SCARLETT_CLEAR_AVX.len()],
+        SCARLETT_CLEAR_AVX
+    );
+    // A second attempt sees changed bytes and leaves them alone.
+    assert_eq!(unsafe { patch_scarlett_clear(code.0 as usize) }, Err("routine bytes differ"));
+
+    // SAFETY: the patched bytes form a complete win64 function of one
+    // pointer argument that returns with `ret`.
+    let routine: extern "C" fn(*mut u8) = unsafe { core::mem::transmute(code.0) };
+    // `rcx + 0xDA40` must be 32-byte aligned for the tail's vmovaps.
+    for object in [0x40usize, 0x60] {
+        let data = Pages::new(0x10000);
+        data.bytes().fill(0xAA);
+        routine(unsafe { data.0.add(object) });
+        // Model of the original: five clzero loops, then the tail.
+        let mut expected = vec![0xAAu8; 0x10000];
+        let mut rax = object + 0x40;
+        for end in [0x39C0, 0x5540, 0x6200, 0x70C0, 0x7440].map(|e| object + e) {
+            while {
+                let line = rax & !63;
+                expected[line..line + 64].fill(0);
+                rax += 64;
+                rax < end
+            } {}
+            rax = end;
+        }
+        expected[object + 0xDA40..][..32].fill(0);
+        expected[object + 0xDAC0..][..32].fill(0);
+        expected[object + 0x20..][..8].copy_from_slice(&0xFF_FFFF_FFFFu64.to_le_bytes());
+        let actual = data.bytes();
+        if let Some(at) = (0..expected.len()).find(|&i| actual[i] != expected[i]) {
+            panic!("object {object:#x}: byte {at:#x} is {:#x}, expected {:#x}", actual[at], expected[at]);
+        }
+    }
+    // SAFETY: restores the page so the guard can release it.
+    unsafe { VirtualProtect(code.0.cast(), 0x1000, old, &mut old) }.unwrap();
 }
 
 struct Pages(*mut u8, usize);

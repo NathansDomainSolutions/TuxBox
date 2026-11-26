@@ -5,9 +5,10 @@ using namespace shader_control;
 
 static void dispatch(Context &ctx, FILE *receipt, const std::string &name, UINT stride, const std::string &view, UINT groups) {
     ID3D12Device *device = ctx.device.Get();
-    constexpr UINT words = 384;
     constexpr UINT first_byte = 384;
-    constexpr UINT view_bytes = 768;
+    const UINT view_bytes = view == "raw-wide" ? 4096 : 768;
+    const UINT words = (2 * first_byte + view_bytes) / sizeof(UINT);
+    const UINT data_bytes = words * sizeof(UINT);
     D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
     D3D12_ROOT_PARAMETER table{};
     table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -29,18 +30,18 @@ static void dispatch(Context &ctx, FILE *receipt, const std::string &name, UINT 
     auto out = buffer(device, words * 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST,
                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     auto readback = buffer(device, words * 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    std::array<UINT, words> initial{};
+    std::vector<UINT> initial(words);
     for (UINT i = 0; i < words; ++i)
         initial[i] = 0x76540000u + i;
     // Optional per-case seed data is copied into the default heap on the GPU.
     // Existing controls without a seed retain the original guarded pattern.
     std::ifstream input(name + ".seed", std::ios::binary);
     if (input) {
-        input.read(reinterpret_cast<char *>(initial.data()), sizeof(initial));
-        if (input.gcount() != sizeof(initial) || input.peek() != std::char_traits<char>::eof())
+        input.read(reinterpret_cast<char *>(initial.data()), data_bytes);
+        if (input.gcount() != data_bytes || input.peek() != std::char_traits<char>::eof())
             throw std::runtime_error("invalid compute seed " + name);
     }
-    upload(seed.Get(), initial.data(), sizeof(initial));
+    upload(seed.Get(), initial.data(), data_bytes);
     D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
                                   D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -53,17 +54,17 @@ static void dispatch(Context &ctx, FILE *receipt, const std::string &name, UINT 
     if (view == "structured" && stride) uav.Format = DXGI_FORMAT_UNKNOWN;
     else if (view == "uint" && !stride) uav.Format = DXGI_FORMAT_R32_UINT;
     else if (view == "float" && !stride) uav.Format = DXGI_FORMAT_R32_FLOAT;
-    else if (view == "raw" && !stride) uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    else if ((view == "raw" || view == "raw-wide") && !stride) uav.Format = DXGI_FORMAT_R32_TYPELESS;
     else throw std::runtime_error("invalid UAV format");
     uav.Buffer = {first_byte / element_size, view_bytes / element_size, stride, 0,
-                  view == "raw" ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE};
+                  (view == "raw" || view == "raw-wide") ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE};
     device->CreateUnorderedAccessView(out.Get(), nullptr, &uav, heap->GetCPUDescriptorHandleForHeapStart());
     D3D12_COMMAND_QUEUE_DESC qd{};
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     check(device->CreateCommandAllocator(qd.Type, IID_PPV_ARGS(&allocator)), "allocator");
     check(device->CreateCommandList(0, qd.Type, allocator.Get(), pipeline.Get(), IID_PPV_ARGS(&list)), "list");
-    list->CopyBufferRegion(out.Get(), 0, seed.Get(), 0, sizeof(initial));
+    list->CopyBufferRegion(out.Get(), 0, seed.Get(), 0, data_bytes);
     transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ID3D12DescriptorHeap *heaps[] = {heap.Get()};
     list->SetDescriptorHeaps(1, heaps);
@@ -71,9 +72,9 @@ static void dispatch(Context &ctx, FILE *receipt, const std::string &name, UINT 
     list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
     list->Dispatch(groups, 1, 1);
     transition(list.Get(), out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(readback.Get(), 0, out.Get(), 0, sizeof(initial));
+    list->CopyBufferRegion(readback.Get(), 0, out.Get(), 0, data_bytes);
     submit_and_wait(device, ctx.queue.Get(), list.Get());
-    write_buffer(readback.Get(), name, sizeof(initial));
+    write_buffer(readback.Get(), name, data_bytes);
     std::fprintf(receipt, "%s_words=%u\n", name.c_str(), words);
 }
 

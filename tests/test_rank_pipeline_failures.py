@@ -44,6 +44,22 @@ class RankPipelineFailures(unittest.TestCase):
         self.assertEqual(rank(rows, {"raw": "obsolete"})[0],
                          {HOST_REJECTED: 5, NO_ANSWER: 3})
 
+    def test_recorded_wave_refusal_ranks_errors_and_stand_ins_together(self):
+        rows = ["4\tstand-in\tslot62\tCS=raw CS.used=rooted CS.refused=host-lacks-wave64",
+                "2\t0x80070057\tslot86\tCS=raw CS.refused=host-lacks-wave64",
+                "1\t0x80070057\tslot86\tCS.refused=host-lacks-wave64"]
+        counts, shaders, outcomes = rank(rows, {"raw": "stale cached reason"})
+        self.assertEqual(counts, {"host-lacks-wave64": 7})
+        self.assertEqual(shaders, {"host-lacks-wave64": 2})
+        self.assertEqual(outcomes, {"stand-in": 4, "0x80070057": 3})
+
+    def test_driver_refusal_preserves_detail_and_precedes_lookup_guesses(self):
+        rows = ["3\tstand-in\tslot62\tCS.used=good CS.refused=driver compile failed: 0x80004005",
+                "2\tstand-in\tslot62\tCS.refused=driver compile deadline CS.missing=retry"]
+        counts, _, _ = rank(rows, {"retry": "stale refusal"})
+        self.assertEqual(counts, {"driver compile failed: 0x80004005": 3,
+                                  "driver compile deadline": 2})
+
     def test_mixed_attempt_and_independent_missing_stage(self):
         rows = ["2\t0x80004001\tslot86\tMS.missing=raw MS.used=rooted",
                 "3\t0x80004001\tslot86\tMS.missing=raw MS.used=rooted PS.missing=pixel",

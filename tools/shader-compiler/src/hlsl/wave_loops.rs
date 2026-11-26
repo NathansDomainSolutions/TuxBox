@@ -288,17 +288,18 @@ fn full_mask_program(em: &Emitter<'_>) -> bool {
         })
 }
 
-/// Interleaved loops go through the block dispatcher, where no loop needs a
-/// bound of its own: it is enough that every scalar write keeps the entry
-/// scalars wave-uniform, so each branch is a decision of the whole wave and the
-/// lanes follow the same blocks.
+/// It is enough that every scalar write keeps the entry scalars wave-uniform:
+/// each branch is then a decision of the whole wave and the lanes follow the
+/// same blocks. Interleaved loops go through the block dispatcher and need no
+/// bound of their own; structured loops keep the emitter's watchdog, which
+/// every lane counts alike, so the wave still leaves a loop together.
 pub(super) fn uniform_dispatch(em: &Emitter<'_>) -> bool {
     let code = &em.insns;
     if !full_mask_program(em) {
         return false;
     }
     let Some(flow) = Flow::graph(code) else { return false };
-    if flow.structured() || wave_sum::reduction_regions(code, 32).any(|(_, region)| !region_is_intact(&flow, &region)) {
+    if wave_sum::reduction_regions(code, 32).any(|(_, region)| !region_is_intact(&flow, &region)) {
         return false;
     }
     let effects: Vec<_> = code.iter().map(Effect::new).collect();

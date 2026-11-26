@@ -30,7 +30,7 @@ fn copy_loop_rejects_unbound_descriptors_and_external_entries() {
             .flat_map(u32::to_le_bytes)
             .collect::<Vec<_>>(),
     );
-    let mut state = [Word::Data; 106];
+    let mut state = [Word::Data; 107];
     for (base, uav) in [(0, true), (12, false)] {
         let b = Binding { slot: 0, uav };
         state[base..base + 4].copy_from_slice(&[

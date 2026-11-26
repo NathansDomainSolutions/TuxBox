@@ -7,6 +7,7 @@ Lanes is an original, turn-based homebrew game for Project TuxBox. Collect as ma
 Use an x86-64 PC with Python 3.10 or newer, Rust 1.95 or newer with Cargo, and the DirectX Shader Compiler (`dxc`) on your PATH. Add the Windows build target once with `rustup target add x86_64-pc-windows-msvc`. [DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
 
 - **Linux** needs `clang-cl`, `lld-link` and the Windows SDK and C runtime staged with xwin. To stage them in the cargo-xwin cache that `build.py` reads, run `cargo install cargo-xwin` and then `cargo xwin cache xwin --xwin-arch x86_64` once. If the SDK is outside the cargo-xwin cache, set `XWIN_SDK_ROOT` to the directory containing `sdk/` and `crt/`. The launcher builds a small Vulkan layer on first run, so also install the Vulkan headers (`vulkan-headers` on Arch). Use Microsoft's Linux DXC release: Arch's `directx-shader-compiler` 1.10.2605.37 aborts on every shader, and `build.py` reports this before building. Install UMU (`umu-run`, the `umu-launcher` package in the AUR on Arch) and [GE-Proton11-14](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/GE-Proton11-14), extracted into Steam's `compatibilitytools.d`, to play. From the project folder, run `python3 -m venv .venv` and `source .venv/bin/activate` before installing the Python dependencies.
+- **Nix** users can run `nix develop` (or `direnv allow`) for a shell with these Linux tools. The Windows SDK still needs `cargo xwin cache xwin --xwin-arch x86_64` once. The shell also provides GE-Proton11-14 and sets `PROTONPATH` to it, so the launcher uses it without a Steam install; pass `--proton "$PROTONPATH"` to `tuxbox.py check` for the GPU checks. On NixOS, prefix the GPU checks with `tuxbox-fhs` (`tuxbox-fhs python tuxbox.py check ...`), which supplies the system libraries that Proton's Wine expects.
 - **Windows** needs Visual Studio Build Tools with the C++ tools and Windows SDK. Run the commands in an **x64 Native Tools Command Prompt**.
 
 ## Build and play
@@ -52,6 +53,9 @@ The game also imports Windows core API sets for services such as files, timing a
 | `thread-dimensions` | Slot 80 `USE_THREAD_DIMENSIONS` (`0x20`) converts thread counts using the bound PSO's `[numthreads]` and fails closed without one |
 | `descriptor-reclaim` | Shader-visible descriptor heap reclamation across completed batches, overlapping in-flight `Reset()`, `ClearState`, evicted-slot rebinding, and unsubmitted pin exhaustion |
 | `xbox-shader` | A console shader's pipeline and dispatch ([shader cache](#shader-cache)) |
+| `wave64-shader` | A console shader that sums across 64-lane waves, translated while the game runs; not part of `all` |
+| `raster-tables` | A console vertex and pixel pair drawn under a root with two descriptor tables, reading through the second ([raster tables](#raster-tables)) |
+| `raster-samplers` | A console pixel program's literal linear sampler, under a root whose static sampler at that register is point-filtered ([raster tables](#raster-tables)) |
 
 ```sh
 python tuxbox.py verify --only lanes-selftest --output build/lanes-selftest.json
@@ -99,7 +103,28 @@ python tuxbox.py verify --only lanes-shader-cache --output build/lanes-cache.jso
 | Compiled | An uncached shader is translated by the host worker while the game runs |
 | Reused | The next launch uses that translation without compiling it again |
 
-These checks run on the Proton backend. They remove only this shader's cache entries from the prefix.
+Lanes also carries a console program that sums across 64-lane waves. The `wave64-shader` scenario runs it and compares every thread's word, twice: once with the provider told the host has 32-lane waves ([host profile](../../docs/USAGE.md#host-profile)), so any card takes the [32-lane translation](../../docs/SHADERS.md#64-lane-programs-on-32-lane-hosts), and once with the card as it is.
+
+| Check | What it proves |
+| --- | --- |
+| Wave, narrow | The provider asks for the 32-lane translation while the game runs, loads it, and the results are the console's |
+| Wave, host | The results are the console's with whatever translation this card needs |
+
+These checks run on the Proton backend. They remove only these shaders' cache entries from the prefix.
+
+## Raster tables
+
+The `raster-tables` scenario draws a fullscreen triangle with two hand-written console programs (`raster_fixture.py`; not taken from any game). The pixel program reads one dword through slot 2 of the root's second descriptor table and writes it to a uint target. Its FSSM records and PSV binding name that descriptor `t3, space2`, while the root declares `t0` to `t3` in space 1 there. The provider has to build the root the program was compiled against, with the register at that slot, and translate both programs for it. Under the title's root the pipeline becomes a stand-in and the target keeps its clear value. A wrong table or slot reads a decoy that names its view.
+
+The `raster-samplers` scenario draws with the same vertex program and a third hand-written pixel program. It samples a 2x1 texture of 1.0 and 3.0, at table 1 slot 0, with a linear clamped sampler it builds from literal words, as the console compiles a static sampler into a program. It declares that sampler as `s0`, where the title's root has a point-filtered static sampler. The provider has to give the literal state a static sampler of its own in the reflected root, so every texel reads 1.5. Bound to the root's `s0`, the texels read the point-filtered 1.0.
+
+That root is made while the game runs, so nothing can be prepared before launch. `verify` runs both scenarios with the host worker, requires the provider to report the reflected root and pipeline, and fails if either program was translated without a root.
+
+```sh
+python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-tables.json
+```
+
+The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
 ## Deterministic replay
 

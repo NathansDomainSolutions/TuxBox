@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from project_tuxbox.runtime_shaders import COMPUTE_TIMEOUT, O0_TIMEOUT, ShaderRefused, archive_request, compile_dxil, compile_request, serve, snapshot_compiler_cache
+from project_tuxbox.runtime_shaders import COMPUTE_TIMEOUT, O0_TIMEOUT, O0_TIMEOUT_MAX, ShaderRefused, archive_request, compile_dxil, compile_request, o0_timeout, serve, snapshot_compiler_cache
 from project_tuxbox.scarlett_prep import scarlett_requests
 from project_tuxbox.shader_prep import SOURCE_CACHE, ToolFailure, prepare_for_launch
 
@@ -35,6 +35,12 @@ class RuntimeShaderLinks(unittest.TestCase):
         self.cache = directory / "cache"
         self.cache.mkdir()
         self.tools = ("xshader", "dxc", "dxv")
+
+    def test_unoptimised_cap_grows_with_generated_program_size(self):
+        hlsl = self.cache / "program.hlsl"
+        for size, expected in [(0, O0_TIMEOUT), (1 << 20, O0_TIMEOUT), (5 << 19, 225), (64 << 20, O0_TIMEOUT_MAX)]:
+            hlsl.write_bytes(b" " * size)
+            self.assertEqual(o0_timeout(hlsl), expected, size)
 
     def test_invalid_persistent_dxil_falls_back_to_cli_before_publication(self):
         data = b"synthetic compute shader"
@@ -470,6 +476,34 @@ class RuntimeShaderLinks(unittest.TestCase):
                     self.assertEqual(compile_dxil("dxc", "dxv", target, hlsl, output, None, "request", stage), dxil)
                 self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["dxc", "dxv"])
 
+    def test_dispatched_programs_use_the_candidate_at_any_size(self):
+        """A block dispatcher takes the candidate flag, and -O0 when that fails."""
+        hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
+        hlsl.write_bytes(b"uint tb_pc = 0u; [loop] while (tb_pc != 7u) {}")
+        for target, stage in (("ps_6_6", 0), ("ps_6_0", 0), ("vs_6_6", 1), ("cs_6_0", 5)):
+            for failure in (None, "flag", "timeout"):
+                with self.subTest(target=target, failure=failure):
+                    output.unlink(missing_ok=True)
+                    store = Mock()
+                    dxil = portable_program(stage, b"dispatched")
+                    def run(args, *, timeout):
+                        if args[0] != "dxc":
+                            return
+                        candidate = "-disable-lifetime-markers" in args
+                        self.assertNotEqual(candidate, "-O0" in args)
+                        self.assertEqual(timeout, 15 if candidate else O0_TIMEOUT)
+                        output.write_bytes(dxil)
+                        if candidate and failure == "flag":
+                            raise ToolFailure("dxc", 1, "unknown argument")
+                        if candidate and failure == "timeout":
+                            raise subprocess.TimeoutExpired("dxc", timeout)
+                    with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
+                        self.assertEqual(compile_dxil("dxc", "dxv", target, hlsl, output, store, "request", stage), dxil)
+                    tools = ["dxc", "dxv"] if failure is None else ["dxc", "dxc", "dxv"]
+                    self.assertEqual([call.args[0][0] for call in compiler.call_args_list], tools)
+                    store.is_slow.assert_not_called()
+                    store.mark_slow.assert_not_called()
+
     def test_cs_6_6_optimises_without_lifetime_markers(self):
         program = b"Xbox compute shader"
         key = hashlib.sha256(program).hexdigest()
@@ -492,6 +526,34 @@ class RuntimeShaderLinks(unittest.TestCase):
         with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run) as compiler:
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
         self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxv"])
+
+    def test_wave32_request_has_its_own_translation_and_cache_entry(self):
+        """The narrow-wave variant never replaces the ordinary translation."""
+        program = b"Xbox wave64 compute shader"
+        source_hash = hashlib.sha256(program).hexdigest()
+        flags = []
+
+        def run(args, *, timeout):
+            if args[0] == "xshader":
+                flags.append("--wave32-host" in args)
+                self.assertEqual(args[1].read_bytes(), program)
+                args[args.index("--hlsl-out") + 1].write_text("narrow" if flags[-1] else "ordinary")
+                args[args.index("--profile-out") + 1].write_text("cs_6_6")
+            elif args[0] == "dxc":
+                args[args.index("-Fo") + 1].write_bytes(portable_program(5, args[-1].read_bytes()))
+
+        for key, suffix in ((source_hash, ".dxbc"), (source_hash + "_w32", ".wave32")):
+            source = self.requests / (key + suffix)
+            source.write_bytes(program)
+            with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run):
+                self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
+        self.assertEqual(flags, [False, True])
+        self.assertEqual((self.cache / (source_hash + ".cso")).read_bytes(), portable_program(5, b"ordinary"))
+        self.assertEqual((self.session / (source_hash + "_w32.cso")).read_bytes(), portable_program(5, b"narrow"))
+        changed = self.requests / (source_hash + "_w32.wave32")
+        changed.write_bytes(program + b"changed")
+        with self.assertRaisesRegex(ValueError, "digest"):
+            compile_request(changed, source_hash + "_w32", self.tools, self.cache, self.session)
 
     def test_cs_6_6_falls_back_to_no_optimisation(self):
         hlsl, output = self.cache / "shader.hlsl", self.cache / "out.cso"
@@ -548,6 +610,7 @@ class RuntimeShaderLinks(unittest.TestCase):
                     raise ToolFailure("xshader", 65, "unsupported")
                 self.assertEqual(program, b"Xbox geometry shader")
                 self.assertEqual(args[args.index("--pixel-order") + 1].read_bytes(), portable_program(0, b"r0.z"))
+                args[args.index("--hlsl-out") + 1].touch()
                 args[args.index("--profile-out") + 1].write_text("gs_6_0")
             if args[0] == "dxc":
                 args[args.index("-Fo") + 1].write_bytes(portable_program(2, b"gs"))

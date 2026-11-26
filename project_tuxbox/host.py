@@ -14,11 +14,27 @@ from .console_cbv import configure_console_cbv
 from .mangohud import performance_capture
 from .pipeline_profile import pipeline_capture
 from .runtime_shaders import runtime_shader_compiler
+from .shader_prep import SOURCE_CACHE
 
 
 # The Proton distribution used when none is selected. Its dxil-spirv converts
 # large translated shaders in seconds, where older releases take minutes.
 PINNED_PROTON = "GE-Proton11-14"
+
+
+# Titles that are only ever launched without network access. ProjectScarlett's
+# crash handler uploads minidumps to an online service.
+OFFLINE_EXECUTABLES = ("game_scarlett_master.exe",)
+
+# Room for a title's compiled GPU pipelines. With 32 GiB, ProjectScarlett's
+# cache file reached 13.7 GB and the driver stopped updating its index after
+# about 5 GB, so nothing written later was found again. Keep each file small
+# enough to stay indexed.
+NVIDIA_CACHE_BYTES = 4 << 30
+
+
+def requires_offline(executable):
+    return executable.name.casefold() in OFFLINE_EXECUTABLES
 
 
 def _descendant_pids(pid):
@@ -76,6 +92,45 @@ def proton_installation(selection):
     raise ValueError(f"Install {PINNED_PROTON} in {steam / 'compatibilitytools.d'} from "
                      f"https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/{PINNED_PROTON}, "
                      "or select another distribution with --proton or PROTONPATH")
+
+
+# Translated shaders, compiled DXIL and recorded requests, inside the prefix. Every
+# entry is keyed by the content that produced it, so a prefix for another Proton
+# can reuse them as they are.
+SHADER_CACHE = SOURCE_CACHE.parent
+
+
+def seed_shader_cache(prefix, report):
+    """Give a new default prefix the shader cache of the most recent other one.
+
+    A new Proton release gets a new prefix, and without this the first launch
+    translates and compiles every shader again, which takes hours for a large
+    title. Copies share disk blocks where the file system allows it.
+    """
+    target = prefix / SHADER_CACHE
+    if target.exists():
+        return
+    others = [p for p in prefix.parent.iterdir()
+              if p != prefix and p.is_dir() and (p / SHADER_CACHE).is_dir()]
+    if not others:
+        return
+    donor = max(others, key=lambda other: (other / SHADER_CACHE).stat().st_mtime)
+    source = donor / SHADER_CACHE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pending = target.with_name(target.name + ".seeding")
+    shutil.rmtree(pending, ignore_errors=True)
+    try:
+        if shutil.which("cp") and sys.platform == "linux":
+            subprocess.run(["cp", "-a", "--reflink=auto", str(source), str(pending)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        else:
+            shutil.copytree(source, pending, symlinks=True)
+        pending.rename(target)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        shutil.rmtree(pending, ignore_errors=True)
+        report(f"Could not reuse the shader cache from {donor.name}: {exc}")
+        return
+    report(f"Reusing the shader cache from the {donor.name} prefix")
 
 
 def warn_scarlett_dxc(executable, report):
@@ -224,7 +279,7 @@ def configure_nvidia_shader_cache(env, report=None):
     explicit = env.get("__GL_SHADER_DISK_CACHE_PATH")
     if explicit:
         env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
-        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(8 << 30))
+        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
         if report:
             report(f"NVIDIA shader cache: {explicit} (path set by the environment)")
         return
@@ -242,11 +297,27 @@ def configure_nvidia_shader_cache(env, report=None):
     env["__GL_SHADER_DISK_CACHE"] = "1"
     env["__GL_SHADER_DISK_CACHE_PATH"] = str(cache)
     env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
-    # The default cap is about 128MB for the whole shared bucket. One Scarlett
-    # boot writes more than that, so give this directory room of its own.
-    env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(8 << 30))
+    # The driver's default cap is far smaller than what one Scarlett boot
+    # writes, so give this directory room of its own.
+    env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
     if report:
         report(f"NVIDIA shader cache: {cache}")
+
+
+def configure_pipeline_cache(env, prefix):
+    """Keep vkd3d-proton's pipeline cache in the prefix, beside the driver's.
+
+    Without a path it is written into the game's folder. A path already set,
+    including 0 to disable the cache, is kept.
+    """
+    if "VKD3D_SHADER_CACHE_PATH" in env:
+        return
+    cache = prefix / "shadercache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    env["VKD3D_SHADER_CACHE_PATH"] = str(cache)
 
 
 class Host:
@@ -286,9 +357,14 @@ class Host:
         if self.backend == "wine":
             self.version = subprocess.check_output([executable, "--version"], text=True).strip()
         data_home = Path(os.getenv("XDG_DATA_HOME") or Path.home() / ".local/share")
+        default = prefix is None
         prefix = (prefix or data_home / "project-tuxbox/prefixes" / prefix_name).expanduser().resolve()
+        fresh = not prefix.exists()
         prefix.mkdir(parents=True, exist_ok=True)
+        if default and fresh:
+            seed_shader_cache(prefix, lambda line: print(f"tuxbox: {line}", file=sys.stderr))
         self.env["WINEPREFIX"] = str(prefix)
+        configure_pipeline_cache(self.env, prefix)
         self.command = [executable]
         if offline:
             self.isolate_network()
@@ -298,7 +374,7 @@ class Host:
         # game and its crash handler cannot upload minidumps or reach any server.
         unshare = shutil.which("unshare")
         if not unshare:
-            raise ValueError("Install util-linux unshare to launch with --offline")
+            raise ValueError("Install util-linux unshare to launch without network access")
         wrapper = [unshare, "--user", "--map-current-user", "--net", "--"]
         probe = subprocess.run([*wrapper, "true"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if probe.returncode:

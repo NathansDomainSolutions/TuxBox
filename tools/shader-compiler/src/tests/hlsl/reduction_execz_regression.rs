@@ -23,7 +23,7 @@ fn reduction_execz_votes_only_at_proven_guards() {
         let translated = translate(&guarded_shader(width, &[])).expect("guarded reduction");
         assert_eq!(translated.required_wave_size, Some(width));
         assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
-        assert!(translated.hlsl.contains("if ((exec_lo & 1u) == 0u)"));
+        assert!(translated.hlsl.contains(" | ((exec_lo & 1u) == 0u);"));
     }
 }
 
@@ -75,13 +75,42 @@ fn dispatched_lanes_wait_for_their_wave_at_a_barrier() {
     };
     let body = emit(true);
     assert!(body.contains("bool tb_wait = tb_pc == 2u;"), "{body}");
-    let block = body.find("if (tb_sel == 2u) {").expect("the barrier starts a block");
+    let block = body.find("if (tb_pc == 2u && tb_sel == 2u) {").expect("the barrier starts a block");
     let wait = body.find("WaveActiveAnyTrue(!tb_wait)").expect("waits for its wave");
     let sync = body.find("GroupMemoryBarrierWithGroupSync();").unwrap();
     assert!(wait < block && block < sync, "{body}");
-    assert!(body.contains("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc;"), "{body}");
+    assert!(body.contains("uint tb_sel = tb_wait ? 0xfffffffeu : tb_pc;\n"), "{body}");
     let body = emit(false);
-    assert!(!body.contains("tb_wait") && body.contains("uint tb_sel = tb_pc;"), "{body}");
+    assert!(!body.contains("tb_wait") && !body.contains("tb_sel"), "{body}");
+}
+
+#[test]
+fn dispatched_blocks_run_in_program_order_within_ranges() {
+    let op = |offset, op, mnemonic: &str, imm| Insn {
+        offset, dwords: 1, enc: Enc::Sopp, op, raw: vec![0xbf80_0000 | op << 16], mnemonic: mnemonic.into(),
+        dst: Vec::new(), src: Vec::new(), aux: tuxbox_dxbc::rdna2::InsnAux { imm, ..Default::default() },
+    };
+    // Each branch skips the next one, so every instruction starts a block.
+    let emit = |branches: usize| {
+        let shader = guarded_shader(32, &[]);
+        let mut insns: Vec<_> = (0..branches).map(|i| op(4 * i, 8, "s_cbranch_execz", 1)).collect();
+        insns.extend((0..2).map(|i| op(4 * (branches + i), 0, "s_nop", 0)));
+        insns.push(op(4 * (branches + 2), 1, "s_endpgm", 0));
+        let mut emitter = Emitter::new(&shader, insns);
+        emitter.emit_body_dispatch(false, 0).unwrap();
+        emitter.body
+    };
+    for (branches, ranges) in [(10, 0), (40, 2), (600, 2 + 26)] {
+        let body = emit(branches);
+        let blocks: Vec<_> = (0..branches + 2).map(|k| body.find(&format!("if (tb_pc == {k}u) {{")).expect("block")).collect();
+        // A forward jump lands in a block that is still to come in the same pass.
+        assert!(blocks.is_sorted(), "{branches}");
+        assert_eq!(body.matches("if (tb_pc - ").count(), ranges, "{branches}");
+        assert_eq!(body.matches('{').count(), body.matches('}').count(), "{branches}");
+        assert!(!body.contains("0xffffffffu"), "{branches}");
+        // project_tuxbox/runtime_shaders.py picks its DXC options by this text.
+        assert!(body.contains("while (tb_pc != "), "{branches}");
+    }
 }
 
 #[test]

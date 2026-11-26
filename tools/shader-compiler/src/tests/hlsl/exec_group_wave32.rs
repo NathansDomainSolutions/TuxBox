@@ -486,3 +486,14 @@ fn real_translate_coalesces_wave32_and_wave64_intrinsics_and_temps() {
     );
     assert_eq!(t64.hlsl.matches("if (exec_lo & 1u)").count(), 1);
 }
+
+#[test]
+fn resolve_counts_its_whole_masks() {
+    // s_mov_b32 s12, exec_lo; v_cmp_lt_u32 s21, 1000, v0; s_bcnt1_i32_b32 s20, s21; v_mov_b32 v10, s20
+    let words = [0xbe8c_037e, 0xd4c1_0015, 0x0002_00ff, 1000, 0xbe94_0f15, 0x7e14_0214, 0xbf81_0000];
+    let shader = translate(&synthetic_resolve_wave32(&words)).expect("translate wave32");
+    assert!(shader.hlsl.contains("uint tb_lane_bit"), "{}", shader.hlsl);
+    // Its masks hold every lane already. A ballot of one lane's bit would not.
+    assert!(shader.hlsl.contains("s20 = countbits(s21);"), "{}", shader.hlsl);
+    assert!(!shader.hlsl.contains("tb_bal"), "{}", shader.hlsl);
+}

@@ -93,7 +93,7 @@ pub(crate) struct RootSource {
 }
 
 impl RootSource {
-    pub(super) fn new(bytes: &[u8]) -> Self {
+    pub(crate) fn new(bytes: &[u8]) -> Self {
         let payload = tuxbox_dxbc::Dxbc::parse(bytes)
             .ok()
             .and_then(|dxbc| {

@@ -178,7 +178,8 @@ fn scalar_op(i: &Insn, r: &mut Registers) -> Result<(), String> {
         (
             "s_add_u32" | "s_and_b32" | "s_and_saveexec_b32" | "s_andn2_b32" | "s_bfe_u32"
             | "s_bfm_b32" | "s_bitset1_b32" | "s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cselect_b32"
-            | "s_lshl_b32" | "s_max_u32" | "s_mul_i32" | "s_nor_b32" | "s_or_b32",
+            | "s_lshl_b32" | "s_max_u32" | "s_mul_i32" | "s_nor_b32" | "s_or_b32"
+            | "tb_indexed_readlane" | "tb_wave32_readlane",
             _,
         ) if args.iter().all(|v| v.data()) => Data,
         _ => return Err("opaque scalar used as arithmetic data".into()),

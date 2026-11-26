@@ -13,6 +13,7 @@ pub(crate) use addressed::command_buffer_address;
 pub(crate) use addressed::LinearResource;
 pub(crate) use addressed::linear_resource;
 use addressed::rebase_view;
+use addressed::{buffer_stride, element_stride};
 use addressed::PlacedView;
 use addressed::placed_view;
 pub(super) use addressed::address_srv;

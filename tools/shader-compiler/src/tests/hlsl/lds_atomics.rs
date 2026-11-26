@@ -194,15 +194,15 @@ fn global_data_share_is_refused_by_the_native_forms_too() {
 fn byte_loads_fill_one_half_of_the_destination() {
     let cases: [([u8; 8], &str); 4] = [
         // LLVM gfx1030: ds_read_u8_d16 v5, v1 offset:3
-        ([0x03, 0x00, 0x88, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffff0000u) | ((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu));"),
+        ([0x03, 0x00, 0x88, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffff0000u) | ((tb_lds_load(t0a) >> t0s) & 0xffu));"),
         // LLVM gfx1030: ds_read_u8_d16_hi v5, v1
-        ([0x00, 0x00, 0x8c, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffffu) | (((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 16));"),
+        ([0x00, 0x00, 0x8c, 0xda, 0x01, 0x00, 0x00, 0x05], "v5 = ((v5 & 0xffffu) | (((tb_lds_load(t0a) >> t0s) & 0xffu) << 16));"),
         // LLVM gfx1030: ds_read_i8_d16 v5, v1 offset:1
         ([0x01, 0x00, 0x90, 0xda, 0x01, 0x00, 0x00, 0x05],
-         "v5 = ((v5 & 0xffff0000u) | (asuint(asint(((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 24) >> 24) & 0xffffu));"),
+         "v5 = ((v5 & 0xffff0000u) | (asuint(asint(((tb_lds_load(t0a) >> t0s) & 0xffu) << 24) >> 24) & 0xffffu));"),
         // LLVM gfx1030: ds_read_i8_d16_hi v5, v1 offset:2
         ([0x02, 0x00, 0x94, 0xda, 0x01, 0x00, 0x00, 0x05],
-         "v5 = ((v5 & 0xffffu) | (asuint(asint(((tb_lds[(t0a >> 2) & 8191u] >> t0s) & 0xffu) << 24) >> 24) << 16));"),
+         "v5 = ((v5 & 0xffffu) | (asuint(asint(((tb_lds_load(t0a) >> t0s) & 0xffu) << 24) >> 24) << 16));"),
     ];
     for (bytes, expect) in cases {
         let hlsl = renumber_at(&compute(bytes).unwrap(), &format!("(v1) + {:#x}u; uint t", bytes[0]));

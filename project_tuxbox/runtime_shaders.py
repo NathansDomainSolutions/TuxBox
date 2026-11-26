@@ -28,7 +28,10 @@ REASON_BYTES = 512
 SOURCE_KEY = r"[a-f0-9]{64}"
 STENCIL_KEY = SOURCE_KEY + r"_rt[0-7]"
 LINK_KEY = "_".join([SOURCE_KEY] * 3)
-REQUEST_PATTERNS = {".link": LINK_KEY, ".stencil": STENCIL_KEY, ".dxbc": SOURCE_KEY}
+# A compute shader again, for a host whose waves are too narrow for its ordinary
+# translation. It has its own cache entry, so other hosts keep theirs.
+WAVE32_KEY = SOURCE_KEY + r"_w32"
+REQUEST_PATTERNS = {".link": LINK_KEY, ".stencil": STENCIL_KEY, ".wave32": WAVE32_KEY, ".dxbc": SOURCE_KEY}
 
 
 class ShaderRefused(ValueError):
@@ -211,9 +214,22 @@ def archive_request(archive, source, inputs):
 # compute program (CS_Emit_Dynamic_Model_Edge, 7,813 instructions) needs
 # about 18 s at -O0, so a 15 s cap refused it on every boot.
 O0_TIMEOUT = 90
+# The raytracing resolve kernels translate to about 2.5 MB of HLSL each. One
+# needs about 77 s at -O0 while the title runs, with up to four compiling at
+# once, so a fixed 90 s cap refused them on every boot.
+O0_SECONDS_PER_MB = 90
+O0_TIMEOUT_MAX = 600
+
+
+def o0_timeout(hlsl):
+    """Seconds allowed for an unoptimised compile of `hlsl`."""
+    megabytes = hlsl.stat().st_size / (1 << 20)
+    return min(O0_TIMEOUT_MAX, max(O0_TIMEOUT, round(O0_SECONDS_PER_MB * megabytes)))
 # The longest optimised cs_6_6 compile in a ProjectScarlett sample took 40 s
 # with twelve compiles sharing the processor.
 COMPUTE_TIMEOUT = 60
+# The loop the shader compiler puts a program's blocks in when its loops cannot be nested.
+DISPATCHER = b"while (tb_pc != "
 
 
 def validated_dxil(dxv, output, stage):
@@ -232,7 +248,11 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
     # Large generated pixel programs can spend the cap in Jump Threading.
     # Try this validated variant before consulting the baseline slow marker;
     # an older DXC's flag rejection falls back just like a candidate timeout.
-    if target == "ps_6_6" and hlsl.stat().st_size >= (256 << 10):
+    # Programs of the shader compiler's block dispatcher take it at any size: at
+    # default optimisation with lifetime markers some cost RADV minutes and more
+    # than 20 GB, so without this variant they are compiled at -O0.
+    dispatched = target != "cs_6_6" and DISPATCHER in hlsl.read_bytes()
+    if dispatched or target == "ps_6_6" and hlsl.stat().st_size >= (256 << 10):
         try:
             run_tool([dxc, "-T", target, *entry, "-disable-lifetime-markers",
                       "-Fo", output, hlsl], timeout=15)
@@ -241,10 +261,10 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
             return validated_dxil(dxv, output, stage)
         except (subprocess.TimeoutExpired, ValueError):
             output.unlink(missing_ok=True)
-    # A request that timed out before goes straight to -O0 rather than spending
-    # the cap again.
-    if store and store.is_slow(request, target):
-        run_tool(unoptimised, timeout=O0_TIMEOUT)
+    # A dispatched program whose candidate failed, or a request that timed out
+    # before, goes straight to -O0 rather than spending the cap again.
+    if dispatched or (store and store.is_slow(request, target)):
+        run_tool(unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     # See `COMPUTE_FLAGS`. -O0 remains the fallback: the largest programs still
     # compile that way when the optimiser fails or runs out of time.
@@ -260,7 +280,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         except ValueError:
             pass
         output.unlink(missing_ok=True)
-        run_tool(unoptimised, timeout=O0_TIMEOUT)
+        run_tool(unoptimised, timeout=o0_timeout(hlsl))
         return validated_dxil(dxv, output, stage)
     try:
         run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
@@ -268,7 +288,7 @@ def compile_dxil(dxc, dxv, target, hlsl, output, store, request, stage):
         if store:
             store.mark_slow(request, target)
         output.unlink(missing_ok=True)
-        run_tool(unoptimised, timeout=O0_TIMEOUT)
+        run_tool(unoptimised, timeout=o0_timeout(hlsl))
     return validated_dxil(dxv, output, stage)
 
 
@@ -299,6 +319,9 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
             if source.suffix == ".stencil":
                 source_hash, slot = key.split("_rt")
                 flags = ["--stencil-target", slot]
+            elif source.suffix == ".wave32":
+                source_hash = key.removesuffix("_w32")
+                flags = ["--wave32-host"]
             else:
                 source_hash = key
             source_data = verified_input(source, source_hash)
@@ -312,7 +335,8 @@ def compile_request(source, key, tools, cache, session, *, remember=None, persis
         checksum = dest.with_suffix(".sha256")
         refusal = dest.with_suffix(".unsupported")
         reply = work / "reply"
-        stages = {1, 2, 13} if linked else {0} if source.suffix == ".stencil" else set(STAGE_IDS.values())
+        stages = ({1, 2, 13} if linked else {0} if source.suffix == ".stencil"
+                  else {STAGE_IDS["cs"]} if source.suffix == ".wave32" else set(STAGE_IDS.values()))
         expected_stage = container_stage(source_data, portable=False)
         if expected_stage is not None:
             stages &= {expected_stage}
@@ -471,20 +495,27 @@ def snapshot_compiler_cache(xshader, cache_root, *, dxc_helper=None):
     return tools, cache
 
 
+RUNTIME_JOBS_LIMIT = 32
+
+
 def runtime_jobs(env, report):
-    """Bound live compiler subprocesses; honor the launcher's CPU affinity."""
+    """Bound live compiler subprocesses; honor the launcher's CPU affinity.
+
+    The game runs at the same time, so by default half the available cores
+    compile, and at least two where there are two.
+    """
     try:
         cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         cpus = os.cpu_count() or 1
-    cap = max(1, min(8, cpus))
-    default = min(4, cap)
+    cap = max(1, min(RUNTIME_JOBS_LIMIT, cpus))
+    default = min(cap, max(2, cpus // 2))
     value = env.get("TUXBOX_RUNTIME_SHADER_JOBS")
     if value is None:
         return default
     try:
         jobs = int(value)
-        if not 1 <= jobs <= 8:
+        if not 1 <= jobs <= RUNTIME_JOBS_LIMIT:
             raise ValueError
     except ValueError:
         report(f"Invalid TUXBOX_RUNTIME_SHADER_JOBS={value!r}; using {default}")

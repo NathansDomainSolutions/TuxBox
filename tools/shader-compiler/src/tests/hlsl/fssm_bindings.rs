@@ -109,3 +109,59 @@ fn vertex_and_mesh_views_keep_the_complete_record() {
         assert_eq!(stride_words(&table, &resource, other, 3, false), None);
     }
 }
+
+/// A root whose third table holds one structured buffer, and a program that loads its
+/// descriptor through that table's pointer and reads the record's first word.
+fn third_table(stage: Stage, uav: bool, locations: &[u32]) -> ShaderExtract {
+    use crate::meta::{RootParam, RootParamKind, RootRange};
+    let pointer = if stage == Stage::Compute { 6 } else { 10 };
+    let words = [
+        0xf408_0400 | pointer / 2, 0xfa00_0000, // s_load_dwordx4 s[16:19], s[pointer:pointer+1], 0
+        0xe030_2000, 0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+        0xbf81_0000, // s_endpgm
+    ];
+    let isa: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let mut ex = crate::hlsl::mesh::heap_extract(&[], 0, &isa);
+    ex.stage = stage;
+    ex.psv_threads = (stage == Stage::Compute).then_some([64, 1, 1]);
+    ex.required_features = None;
+    let class = if uav { 0x303 } else { 0x300 };
+    // Only the first row is about the buffer the program reads.
+    let rows: Vec<_> = locations.iter().enumerate().map(|(i, &l)| [class, 8 * i as u32, 128 + i as u32, 136, l]).collect();
+    ex.fssm = fixture(&rows);
+    ex.resources.push(PsvResource { res_type: if uav { 8 } else { 5 }, space: 1, lower: 128, upper: 128 });
+    let root = ex.root_sig.as_mut().unwrap();
+    root.version = 2;
+    root.params = [(0, 0), (64, 0), (128, 1)]
+        .map(|(base_register, space)| RootParam {
+            visibility: 0,
+            kind: RootParamKind::Table(vec![RootRange { range_type: uav.into(), num: 1, base_register, space, offset_in_table: 0 }]),
+        })
+        .into();
+    ex
+}
+
+#[test]
+fn a_record_behind_any_table_keeps_its_stride() {
+    for (stage, location) in [(Stage::Compute, 0x20604), (Stage::Pixel, 0x20a04), (Stage::Vertex, 0x20a04)] {
+        for uav in [false, true] {
+            let element = |locations: &[u32]| {
+                let hlsl = crate::hlsl::translate(&third_table(stage, uav, locations)).unwrap().hlsl;
+                let start = hlsl.find("struct TbElem_").unwrap();
+                let line = hlsl[start..].lines().next().unwrap();
+                line[line.find('{').unwrap()..].to_owned()
+            };
+            assert_eq!(element(&[location]), "{ uint w[34]; };", "{stage:?} {uav}");
+            // An image descriptor, another table's pointer, and parameters that do not
+            // belong to the pointer do not describe this buffer. The guess is the one
+            // word read. A vertex record may name any parameter for its register.
+            let others = [location + 4, location - 0x100, location - 0x10000, location + 0x10000];
+            for &other in if stage == Stage::Vertex { &others[..1] } else { &others } {
+                assert_eq!(element(&[other]), "{ uint w[1]; };", "{stage:?} {uav} {other:#x}");
+            }
+        }
+    }
+    // Two parameters for one vertex register leave it without a known one.
+    let hlsl = crate::hlsl::translate(&third_table(Stage::Vertex, false, &[0x20a04, 0x10a04])).unwrap().hlsl;
+    assert!(hlsl.contains("{ uint w[1]; };"), "{hlsl}");
+}

@@ -140,13 +140,37 @@ On November 25, 2026, preparation compiled 20,583 of 25,079 recorded requests an
 
 The counts are per recorded request, so they overstate what a live run loses: a request recorded without its root signature can't be translated offline. Rank failures by the pipelines a run lost with the [pipeline failure record](PROJECTSCARLETT.md#finding-why-pipelines-fail).
 
+### Block dispatcher
+
+When a program's loops can't be nested, the translator puts its basic blocks into one loop in which each thread runs the block it is at. The blocks are tested in program order on the thread's current block, so one pass follows every forward jump and only a jump back needs another. One test skips 24 blocks.
+
+Such programs are compiled without DXC's lifetime markers, or at `-O0` when that fails or the target is `cs_6_6`. At the default level with the markers, RADV (Mesa 26.1.8) spent 130 seconds and 20 GB on one ProjectScarlett pixel program. Without them it took 0.1 seconds.
+
 ### Whole-wave branches
 
 The console branches once per wave, but the translator normally branches once per thread. Where its targeted checks can't show that this is safe around a wave operation, it now branches with the whole wave: branches on EXEC and VCC vote across the wave, as do the condition codes set by mask operations ([analysis](../tools/shader-compiler/src/hlsl/lockstep.rs)). It refuses programs that use a lane mask as a number, or a number as a lane mask. Ray tracing resolve programs, which already keep whole masks, also translate now when their loops go through the block dispatcher.
 
 A [GPU check](../tools/check_lockstep_gpu.py) compares both paths with a model of the console on an RTX 4070 Ti SUPER: 245 cases match. Programs that translate through the targeted checks still branch once per thread. With the final branch that routes them to whole-wave translation removed, 160 of 210 cases of the same programs give wrong results, so some shaders that translate today are likely to compute wrong values. This hasn't been traced to anything visible in a game.
 
+### Lane masks read as numbers
+
+Each thread of a translated program holds only its own bit of a lane mask. Counting a mask's lanes, finding its first one or counting those before a lane reads the other bits too, and gave 0 or 1 for a whole wave. Compute programs now take the wave's ballot where such a mask is computed and read that ([analysis](../tools/shader-compiler/src/hlsl/mask_ballots.rs)). Both words of a wave64 mask have to come from the same lane masks on every path to the read, and the ballot is only taken where every lane that can be in the mask runs together: not in code that a branch on another mask skips or repeats, nor after some lanes have left. The program then runs in complete waves of the guest's width, so a wave64 one needs an adapter with wave64. Ray tracing resolve programs keep whole masks already and are left alone. Otherwise the old translation stays.
+
+A [GPU check](../tools/check_mask_ballots_gpu.py) compares both widths with a model of the console on an RX 9060 XT: 300 cases match, and 200 of them don't without the ballots. In ProjectScarlett this affects the passes that hand out shadow mask tiles, where most lit tiles shared a few slots and shadows showed as 16-pixel blocks.
+
 Most wave reduction refusals come from programs over 6,000 instructions, where the translator doesn't try its one-lane-per-wave form. In a trial on an earlier set of 1,442 such compute shaders, removing that limit translated 1,211. Six sampled outputs compiled in 2 to 12 seconds with DXC optimization off, and mostly produced 1 to 2 MB of DXIL. Large compiles in a recorded run took the driver 6 minutes or more, so the limit stays until the generated code compiles faster. The outputs weren't tested in a game.
+
+### 64-lane programs on 32-lane hosts
+
+Many console compute programs need all 64 lanes of a wave, and a host such as an NVIDIA card runs at most 32. When the [host profile](USAGE.md#host-profile) shows that, the provider asks the compiler for a second translation of the program (`--wave32-host`), cached beside the ordinary one as `<hash>_w32`. A 64-lane host never asks, so it keeps the ordinary translation.
+
+In that [translation](../tools/shader-compiler/src/hlsl/paired_wave64.rs) each host thread runs two console lanes, `n` and `n + 32`. Scalar registers and lane masks hold their full console values, identical across the wave, so branches and scalar instructions need no special cases. Vector registers are stored once per lane, each vector instruction runs once for each, and the masks it produces are rebuilt from all 64 results. An instruction that crosses lanes in a way the translation doesn't know is refused.
+
+A [GPU check](../tools/check_paired_wave64.py) compares 18 synthetic programs with a model of the console, 256 waves each. All match on an RTX 4070 Ti SUPER and on a Radeon 610M forced to 32 lanes. The check covers lane masks and branches, lane reads and counts, DPP and row exchanges, shared memory with barriers, interleaved loops and groups of four waves. It doesn't cover buffers or textures, and it can't detect a missing memory ordering. Console code may also rely on a wave running in step without a barrier, which neither translation guarantees.
+
+On 39,999 recorded ProjectScarlett requests the second translation differs for 133 compute programs: 111 compile with DXC and DXV, and 22 are refused for lane swizzles, relative vector registers, implicit derivatives or one unhandled buffer write. This hasn't been tested in the game.
+
+A change to either translation shows in a [recorded set of outputs](../tools/shader-compiler/src/tests/hlsl/host_profiles.txt) that names the host profile affected. When the change is intended, update the record with `TUXBOX_BLESS_PROFILES=1` and `cargo test ... host_profiles`.
 
 ### Earlier survey
 
@@ -323,3 +347,9 @@ python tools/map_frosty_shaders.py /path/to/Mount \
 The CSV contains one row for every shipped entry. It records the Unreal shader ID, native DXBC SHA-256 when present, map memberships, preparation status and trace labels. To repeat the frontend survey, replace `--reuse-survey` with `--compiler build/shader-compiler/x86_64-unknown-linux-gnu/release/xshader` after building the Linux compiler. This also fills in the per-entry `hlsl_emitted` CSV column. Add `--dxc /path/to/dxc` to compile the distinct observed programs and check their output with the adjacent `dxv` executable. The CSV records those results under `standalone_dxil_validated`. Add `--independent-compiler build/independent-compiler/x86_64-unknown-linux-gnu/release/xshader` to compare both compilers on every distinct program and fill the `independent_hlsl` column. With DXC enabled, this also validates all independently emitted programs, including ones that have yet to appear in a trace. Reusing a survey carries forward the aggregate results for matching archive hashes and the measured results for known requests.
 
 To publish updated counts, run the mapper with all the trace labels you want to cover, use `evidence/matrix-awakens/shader-inventory.json` as the output, then regenerate the SVG with `python tuxbox.py status --svg docs/progress.svg`.
+
+### Portable single-wave multidimensional groups
+
+The verified portable reduction path accepts a single logical wave64 in any valid workgroup shape with 64 invocations. Straight-line DPP8 exchanges likewise accept 32- or 64-invocation groups, with the constant lane-read restriction unchanged. Group-shared exchange addresses use the x-fast flattened local ID rather than x alone. Existing convergence checks still apply; multi-wave and unproved divergent reductions retain their previous handling. On an RTX 4080, 594 synthetic GPU cases matched 228,096 words, including 8 x 8 x 1 and 4 x 4 x 4 guarded reductions and two- and three-dimensional DPP8 fixtures. These controls do not measure retail shader coverage. [GPU receipts](../evidence/scarlett-wave-multidimensional-control.json). Reproduce using the existing check tools with `check_wave_guard.py --width 64 --group 8 8 1` or `--group 4 4 4`, and `check_dpp8_exchange.py --layout 2d` or `--layout 3d`, plus their usual emitter, compiler, provider and Proton arguments.
+
+Straight-line DPP8 exchanges with only within-octet sources also support multiple waves, in complete 32-thread blocks up to 1,024 total invocations. The shared array is sized for the whole workgroup. No control flow or EXEC modification is accepted, and constant lane reads remain restricted to a single 32-thread group; guarded wave64 reductions still require exactly 64 invocations. On the same RTX 4080, 576 new multi-wave cases and 192 small-group regression cases matched 614,400 words, including guard words. [GPU receipts](../evidence/scarlett-dpp8-multiwave-control.json). Reproduce with `check_dpp8_exchange.py --multiwave --layout linear` (or `2d` or `3d`) plus the usual tool arguments.

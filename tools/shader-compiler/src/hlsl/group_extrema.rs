@@ -32,7 +32,7 @@ pub(super) fn row_index_mask(em: &Emitter<'_>, rows: u8, banks: u8) -> Result<u3
     match em.fspx_wave.or(register_width) {
         Some(32) => Ok(1),
         Some(64) => Ok(3),
-        _ if threads <= 32 || em.resolve_wave32 || em.single_wave32 => Ok(1),
+        _ if threads <= 32 || em.resolve_wave32 || em.single_wave32 || em.indexed_lane_wave32 => Ok(1),
         _ if em.indexed_lane => Ok(3),
         _ => Err("asymmetric DPP16 row mask requires a known guest wave width".into()),
     }

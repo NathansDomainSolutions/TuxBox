@@ -30,10 +30,12 @@ CASES = {
     "buffer-layout": ("d3d12-buffer-import", ("--layout",), "d3d12-buffer-layout", ("slot=133", "words=512/512", "VA-offsets=0,4")),
     "buffer-import": ("d3d12-buffer-import", (), "d3d12-buffer-import", ("pages=2", "words=1536/1536", "passes=2", "aliases=2")),
     "buffer-import-reject": ("d3d12-buffer-import", ("--reject",), "d3d12-buffer-import-reject", ("rejected=1",)),
+    "buffer-unmap-alive": ("d3d12-buffer-import", ("--unmap-alive",), "d3d12-buffer-unmap", ("mode=alive",)),
+    "buffer-unmap-released": ("d3d12-buffer-import", ("--unmap-released",), "d3d12-buffer-unmap", ("mode=released", "later-submits=ok")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
 }
-DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap"))
+DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
 DIGEST = hashlib.sha256(bytes.fromhex("78563412efcdab90")).hexdigest()
 
 
@@ -83,6 +85,11 @@ def validate(case, adapter, status, output):
         records = re.findall(r"(?m)^(?:TuxBox d3d12_xs: )?buffer backing path=([a-z_]+) count=([0-9]+) source=place_virtual_layout bytes=65536$", output)
         expected = [("pool_open","1"),("pool_open","2"),("pool_hit","1"),("imported","1"),("imported","2"),("imported","3")]
         if sorted(records)!=sorted(expected) or output.count("retired stale GPU import")!=1:
+            return False, passes[0]
+    if case == "buffer-unmap-alive":
+        # Whether later submits survive is a property of the host driver, so
+        # either answer passes. It must be one of the two, and stated.
+        if not {"later-submits=ok", "later-submits=lost"} & set(fields):
             return False, passes[0]
     if case == "buffer-layout":
         records = re.findall(r"(?m)^(?:TuxBox d3d12_xs: )?buffer backing path="

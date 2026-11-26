@@ -2,6 +2,7 @@
 #include "frame_abi.h"
 #include "frame_cli.h"
 #include <algorithm>
+#include <vector>
 
 namespace {
 using namespace frame_abi;
@@ -77,6 +78,73 @@ void allocation_info(ID3D12Device* guest, ID3D12Device* host) {
     compare(0, UINT(resources.size()), resources.data(), true);
     texture.Dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
     compare(0, 1, &texture, false);
+
+    // Narrow textures keep whole 4 KiB tiles, which a host driver may not give them.
+    // Slot 108 passes its result pointer the same way and reports each placement.
+    using Allocation2 = D3D12_RESOURCE_ALLOCATION_INFO* (WINAPI*)(
+        D3D12_RESOURCE_ALLOCATION_INFO*, ID3D12Device*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
+        D3D12_RESOURCE_ALLOCATION_INFO1*);
+    auto query_allocation2 = method<Allocation2>(guest, 108);
+    struct Case { DXGI_FORMAT format; UINT width, height, mips; D3D12_RESOURCE_FLAGS flags; UINT64 bytes; };
+    constexpr Case cases[] = {
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, 256, 2, 1, D3D12_RESOURCE_FLAG_NONE, 0x8000},
+        {DXGI_FORMAT_BC6H_UF16, 1024, 4, 1, D3D12_RESOURCE_FLAG_NONE, 0x10000},
+        {DXGI_FORMAT_BC7_UNORM_SRGB, 128, 16, 3, D3D12_RESOURCE_FLAG_NONE, 0x4000},
+        {DXGI_FORMAT_BC1_UNORM, 32, 128, 4, D3D12_RESOURCE_FLAG_NONE, 0x3000},
+        {DXGI_FORMAT_R16G16B16A16_FLOAT, 256, 2, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 0x8000},
+        {DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 256, 4, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 0x8000},
+    };
+    std::vector<D3D12_RESOURCE_DESC> narrow;
+    std::vector<D3D12_RESOURCE_DESC1> narrow2;
+    UINT64 total = 0;
+    for (const auto& item : cases) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+        desc.Format = item.format;
+        desc.Width = item.width;
+        desc.Height = item.height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = UINT16(item.mips);
+        desc.SampleDesc.Count = 1;
+        desc.Flags = item.flags;
+        D3D12_RESOURCE_DESC1 desc1{};
+        desc1.Dimension = desc.Dimension;
+        desc1.Alignment = desc.Alignment;
+        desc1.Format = desc.Format;
+        desc1.Width = desc.Width;
+        desc1.Height = desc.Height;
+        desc1.DepthOrArraySize = desc.DepthOrArraySize;
+        desc1.MipLevels = desc.MipLevels;
+        desc1.SampleDesc = desc.SampleDesc;
+        desc1.Flags = desc.Flags;
+        D3D12_RESOURCE_ALLOCATION_INFO info{}, info2{};
+        query_allocation(&info, guest, 0, 1, &desc);
+        query_allocation2(&info2, guest, 0, 1, &desc1, nullptr);
+        // A host that cannot place this texture at 4 KiB keeps its own answer, and a packed
+        // format may need a cast the desktop query knows nothing about.
+        const bool packed = item.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        const auto reference = host->GetResourceAllocationInfo(0, 1, &desc);
+        if (reference.Alignment != desc.Alignment || info.Alignment != desc.Alignment) {
+            if (!packed) compare(0, 1, &desc, reference.SizeInBytes != UINT64_MAX);
+            continue;
+        }
+        require(packed ? info.SizeInBytes >= item.bytes
+                       : info.SizeInBytes == std::max(reference.SizeInBytes, item.bytes), "narrow texture size");
+        require(info2.SizeInBytes == info.SizeInBytes && info2.Alignment == info.Alignment, "narrow texture size, slot 108");
+        total += info.SizeInBytes;
+        narrow.push_back(desc);
+        narrow2.push_back(desc1);
+    }
+    if (!narrow.empty()) {
+        D3D12_RESOURCE_ALLOCATION_INFO info{};
+        query_allocation(&info, guest, 0, UINT(narrow.size()), narrow.data());
+        require(info.SizeInBytes == total && info.Alignment == narrow[0].Alignment, "narrow texture batch");
+        std::vector<D3D12_RESOURCE_ALLOCATION_INFO1> placements(narrow2.size());
+        query_allocation2(&info, guest, 0, UINT(narrow2.size()), narrow2.data(), placements.data());
+        require(info.SizeInBytes == total && info.Alignment == narrow[0].Alignment &&
+                placements.back().Offset + placements.back().SizeInBytes == total, "narrow texture batch, slot 108");
+    }
 }
 
 template<class T, size_t N>

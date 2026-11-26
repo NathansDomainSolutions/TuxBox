@@ -52,7 +52,9 @@ class BackendDiagnostics(unittest.TestCase):
                     self.assertIn("warn+seh", env["WINEDEBUG"])
                     self.assertIn("warn+debugstr", env["WINEDEBUG"])
                     self.assertEqual("trace+console" in env["WINEDEBUG"], backend == "proton")
-                overrides = {"WINEDEBUG": "-all", "VKD3D_DEBUG": "none", "DXVK_LOG_LEVEL": "debug"}
+                    self.assertEqual(env["VKD3D_SHADER_DEBUG"], "err")
+                overrides = {"WINEDEBUG": "-all", "VKD3D_DEBUG": "none", "VKD3D_SHADER_DEBUG": "none",
+                             "DXVK_LOG_LEVEL": "debug"}
                 env = overrides.copy()
                 with game_diagnostics(backend, env, ".", self.fail):
                     self.assertEqual(env, overrides)

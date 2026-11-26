@@ -65,3 +65,20 @@ fn wave_refusal_records_stage_reason() {
         "{rendered}"
     );
 }
+
+#[test]
+fn driver_failure_records_the_stand_in_reason() {
+    let code = *b"shader";
+    begin();
+    stage("CS", code.as_ptr(), code.len());
+    lookup("CS", "key", true);
+    refusal("CS", "driver compile failed: 0x80004005");
+    stand_in();
+    // SAFETY: `code` stays live across `finish`.
+    let _ = unsafe { finish("slot63", 0, |bytes| Some(format!("len{}", bytes.len()))) };
+    let rendered = RECORD.lock().unwrap_or_else(|e| e.into_inner()).render();
+    assert!(
+        rendered.contains("stand-in\tslot63\tCS=len6 CS.used=key CS.refused=driver compile failed: 0x80004005\n"),
+        "{rendered}"
+    );
+}

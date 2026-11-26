@@ -57,16 +57,23 @@ sys.exit(17)
                 pass
             self.assertTrue(path.read_bytes().startswith(saved + b"\n"))
 
-    def test_default_logs_are_unique_and_reported(self):
+    def test_nothing_is_saved_without_a_log_file(self):
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as terminal, \
-             patch("project_tuxbox.game_log.log_directory", return_value=Path(tmp)):
-            paths = []
-            for _ in range(2):
-                with game_log(Path("Lanes.exe")) as log:
-                    paths.append(log.path)
-                    self.assertIn(str(log.path), terminal.getvalue())
-            self.assertNotEqual(*paths)
-            self.assertTrue(all(p.name.startswith("Lanes-") and p.is_file() for p in paths))
+             patch("project_tuxbox.game_log.capture_directory", return_value=Path(tmp) / "captures"):
+            with game_log(Path("Lanes.exe")) as log:
+                log.status("Starting game")
+                self.assertIsNone(log.path)
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+                self.assertEqual(log.capture_parent(), Path(tmp) / "captures")
+                self.assertTrue(log.capture_parent().is_dir())
+            self.assertIn("Starting game", terminal.getvalue())
+            self.assertNotIn("Game log:", terminal.getvalue())
+
+    def test_captures_go_beside_a_log_file(self):
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            path = Path(tmp).resolve() / "game.log"
+            with game_log(Path(sys.executable), path) as log:
+                self.assertEqual(log.capture_parent(), path.parent)
 
     def test_helper_holding_pipes_does_not_delay_exit(self):
         with TemporaryDirectory() as tmp:
@@ -109,21 +116,3 @@ while not pathlib.Path(sys.argv[1]).exists() and time.monotonic() < end:
                     run.result(timeout=4)
             finally:
                 gate.touch()
-
-    def test_game_log_closes_fd_and_unlinks_on_fdopen_error(self):
-        closed = []
-        real_close = os.close
-
-        def track_close(fd):
-            closed.append(fd)
-            real_close(fd)
-
-        with TemporaryDirectory() as tmp, \
-             patch("project_tuxbox.game_log.log_directory", return_value=Path(tmp)), \
-             patch("os.fdopen", side_effect=OSError("fdopen failed")), \
-             patch("os.close", side_effect=track_close):
-            with self.assertRaises(OSError):
-                with game_log(Path("game.exe")):
-                    pass
-        self.assertTrue(len(closed) > 0)
-        self.assertEqual(list(Path(tmp).glob("*.log")), [])

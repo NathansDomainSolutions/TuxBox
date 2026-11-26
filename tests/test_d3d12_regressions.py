@@ -69,6 +69,17 @@ class D3D12RegressionTests(unittest.TestCase):
         self.assertFalse(validate("buffer-remap","10de:2704",0,output.replace("pool_open count=2","pool_hit count=2"))[0])
         self.assertFalse(validate("buffer-remap","10de:2704",0,output+"\n"+logs[-1])[0])
 
+    def test_unmap_released_must_keep_later_submits(self):
+        line="d3d12-buffer-unmap PASS pci=1002:73df mode={} later-submits={}"
+        self.assertTrue(validate("buffer-unmap-released","1002:73df",0,line.format("released","ok"))[0])
+        self.assertFalse(validate("buffer-unmap-released","1002:73df",0,line.format("released","lost"))[0])
+        self.assertFalse(validate("buffer-unmap-released","1002:73df",0,line.format("alive","ok"))[0])
+        # Losing the device with the buffer alive is the host's behaviour, and is reported, not failed.
+        self.assertTrue(validate("buffer-unmap-alive","1002:73df",0,line.format("alive","ok"))[0])
+        self.assertTrue(validate("buffer-unmap-alive","1002:73df",0,line.format("alive","lost"))[0])
+        self.assertFalse(validate("buffer-unmap-alive","1002:73df",0,line.format("released","ok"))[0])
+        self.assertFalse(validate("buffer-unmap-alive","1002:73df",0,"d3d12-buffer-unmap PASS pci=1002:73df mode=alive")[0])
+
     def test_deferred_alias_refresh_requires_both_overlaps(self):
         receipt="d3d12-alias-deferred PASS pci=10de:2704 overlaps=2 old=verified refreshed=verified no_cpu_wait=1"
         line="placed texture refresh deferred until an overlapping write is published"

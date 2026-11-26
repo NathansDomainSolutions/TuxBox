@@ -81,3 +81,41 @@ fn offset_only_raw_load_keeps_the_byte_formula() {
         "{body}"
     );
 }
+
+// A v_nop between the shift and the corroborating load must not be mistaken for
+// a write to the shifted address; it is a no-op in this translator.
+fn stride_fixture_words() -> Vec<u32> {
+    [
+        0xd746_0002u32, 0x0401_0901u32, // v_lshl_add_u32 v2, v1, 4, v0
+        0x7e00_0000u32,                  // v_nop
+        0xe030_1000u32, 0x8002_0302u32,  // buffer_load_dword v3, v2, s[8:11], 0 offen
+        0xe030_2000u32, 0x8002_0401u32,  // buffer_load_dword v4, v1, s[8:11], 0 idxen
+        0xbf81_0000u32,                  // s_endpgm
+    ]
+    .to_vec()
+}
+
+#[test]
+fn nop_between_shift_and_load_does_not_block_stride_inference() {
+    let words = stride_fixture_words();
+    let ex = compute_extract(&words);
+    let insns = disassemble(&ex.isa);
+    assert!(insns.iter().any(|i| i.mnemonic == "v_nop"), "{insns:?}");
+    let em = Emitter::new(&ex, insns.clone());
+    let load = insns.iter().find(|i| i.aux.mask & 2 != 0).expect("IDXEN load");
+    let stride = em.sibling_stride(load);
+    assert_eq!(stride, Some(16), "{insns:?}");
+}
+
+#[test]
+fn stride_inference_still_rejects_a_clobbered_index_or_address() {
+    // Replace the v_nop with a real write to the index (v_mov_b32 v1, v1).
+    let mut words = stride_fixture_words();
+    words[2] = 0x7e02_0301u32;
+    let ex = compute_extract(&words);
+    let insns = disassemble(&ex.isa);
+    assert!(insns.iter().any(|i| i.mnemonic == "v_mov_b32"), "{insns:?}");
+    let em = Emitter::new(&ex, insns.clone());
+    let load = insns.iter().find(|i| i.aux.mask & 2 != 0).expect("IDXEN load");
+    assert_eq!(em.sibling_stride(load), None);
+}

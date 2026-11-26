@@ -37,6 +37,15 @@ class RepositoryHygieneTests(unittest.TestCase):
                 if len(text.splitlines()) > RUST_LINE_LIMIT}
         self.assertEqual(long, {}, "Split these by subject. See docs/SOURCE_LAYOUT.md")
 
+    def test_paths_are_chosen_by_host_capability_not_vendor(self):
+        vendor = re.compile(r"\b0x(?:10de|1002|8086)\b|\.VendorId\b|\bvendor_id\b", re.I)
+        # Where the adapter is identified so the host profile can report it.
+        reporting = ("runtime/d3d12/src/device/dxgi.rs", "runtime/d3d12/src/device/host_profile")
+        found = sorted(name for name, text in rust_sources().items()
+                       if name.startswith(("runtime/", "tools/shader-compiler/src/"))
+                       and "/src/tests/" not in name and not name.startswith(reporting) and vendor.search(text))
+        self.assertEqual(found, [], "Choose from the host profile instead. See docs/USAGE.md")
+
     def test_rust_tests_live_in_the_tests_folder(self):
         inline = re.compile(r"^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))? )?mod \w+\s*\{", re.M)
         # The reference controls are single files compiled on their own.

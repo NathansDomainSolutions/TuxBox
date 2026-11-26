@@ -65,7 +65,7 @@ def summarize(trace):
 def pipeline_capture(backend, env, log):
     if backend not in ("wine", "proton"):
         raise ValueError("--profile-pipelines requires a Linux Wine or Proton backend with vkd3d-proton")
-    directory = Path(mkdtemp(prefix="pipelines-", dir=log.path.parent)).resolve()
+    directory = Path(mkdtemp(prefix="pipelines-", dir=log.capture_parent())).resolve()
     trace = directory / "timeline.json"
     env.update(VKD3D_QUEUE_PROFILE=winpath(trace), VKD3D_QUEUE_PROFILE_ABSOLUTE="1")
     log.status(f"Pipeline timing capture: {trace}")

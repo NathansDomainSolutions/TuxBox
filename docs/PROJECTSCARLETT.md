@@ -63,20 +63,19 @@ compiler. The runtime reports an actual compiler load failure separately
 from other pipeline errors. This is not a confirmed fix for the black-screen
 report in #39.
 
-Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`.
+Copy the providers again after each rebuild. The launcher enables the constant-buffer layer only when the staged `d3d12_xs.dll` is byte-identical to `build/d3d12-smoke/d3d12_xs.dll`. With it, the launcher also adds `force_raw_va_cbv` to `VKD3D_CONFIG`, so constant buffers bound by address are read from the guest's 16-byte offsets.
 
-## Launch offline
-
-The game installs a Breakpad crash handler that uploads minidumps to an online crash service. Run it without network access so that crashes during testing are not uploaded. On Linux, start the launcher in a new network namespace:
+## Launch
 
 ```sh
-UMU_RUNTIME_UPDATE=0 unshare --user --map-current-user --net -- \
-    python tuxbox.py run --log-file build/scarlett.log /path/to/scarlett-run
+python tuxbox.py run /path/to/scarlett-run
 ```
 
-Inside the namespace the only network device is a loopback interface that is down. `UMU_RUNTIME_UPDATE=0` stops umu-run from trying to update the Steam Runtime. Offline launches need unprivileged user namespaces.
+The game installs a Breakpad crash handler that uploads minidumps to an online crash service. TuxBox therefore always launches `game_scarlett_master.exe` without network access, with or without `--offline`, and there is no option to turn this off. The game runs in a new network namespace whose only device is a loopback interface that is down. This needs unprivileged user namespaces; the launch stops if they aren't available. On Windows, TuxBox can't isolate the network yet, so it refuses to launch the game.
 
-Add `--mangohud` before the package path to record frame times. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
+An offline launch also stops umu-run from updating the Steam Runtime. If the runtime isn't installed yet, run another program through TuxBox once first, such as `python tuxbox.py check`.
+
+The game log goes to the terminal only. Add `--log-file build/scarlett.log` to keep it, and `--mangohud` to record frame times, both before the package path. The prefix defaults to `~/.local/share/project-tuxbox/prefixes/GE-Proton11-14-x86_64`. Pass `--prefix` to use another one.
 
 ## Shader preparation
 
@@ -158,7 +157,7 @@ Linux. It never modifies the game's own image.
 
 ### Preparation speed and coverage
 
-Launch-time preparation runs one compiler job per available core, up to 8. Set
+Launch-time preparation runs one compiler job per available core, up to 32. Set
 `TUXBOX_SHADER_PREP_JOBS` to a value from 1 to 32 to change it; more jobs use
 more memory.
 
@@ -183,10 +182,10 @@ the game recorded at run time.
 ### Live compilation workload
 
 During gameplay, unrelated shader requests can compile concurrently rather
-than waiting for one another. The launcher defaults to at most four jobs
-(and no more than its available CPU cores); set
-`TUXBOX_RUNTIME_SHADER_JOBS=1` for the old serial behavior or a value from 1
-to 8 to tune the CPU/memory cost. Identical shader requests within the game process still share one
+than waiting for one another. The game runs at the same time, so the launcher
+defaults to one job for every two available CPU cores, at least two where
+there are two, and at most 32. Set `TUXBOX_RUNTIME_SHADER_JOBS` to a value
+from 1 to 32 to tune the CPU and memory cost; `1` compiles one at a time. Identical shader requests within the game process still share one
 translation, including retries while the previous request remains published. Persistent refusal markers are only written for deterministic
 emitter refusals, not transient tool errors. This reduces queueing delays but
 does not make unsupported shader instructions compatible.
@@ -250,6 +249,22 @@ python tuxbox.py run --prepare-only --backend proton --prefix PREFIX /path/to/sc
 
 ## What to expect
 
+The two shader and memory paths added on November 26, 2026 have passed TuxBox's
+checks. The [memory copy](USAGE.md#memory-copy) on AMD's Linux driver hasn't
+been tried in this game yet; please report how far it gets. The [32-lane
+translation](SHADERS.md#64-lane-programs-on-32-lane-hosts) has had two NVIDIA
+reports, both ending in the same GPU hang ([#232](https://github.com/brcly/TuxBox/issues/232)):
+
+- An RTX 3080 Ti (driver 620.70.06, GE-Proton11-14, main at c6ce497) loaded for
+  about 2 h 40 min on a cold shader cache and reached the world's setup behind
+  the loading art. The kernel then logged Xid 109 (`CTX SWITCH TIMEOUT`) and
+  vkd3d-proton reported the device lost.
+- An RTX 5090 hit the same Xid 109 about 19 minutes in; an earlier run on it
+  ended with Xid 13.
+
+Xid 109 means a GPU context could not be switched out in time, which usually
+means one dispatch ran far too long.
+
 On November 25, 2026, an offline run on a GeForce RTX 4070 Ti SUPER got into the
 story intro. The game's own crash report records the state `Game Running`, frame
 32,534 and the story intro script after 18 minutes 11 seconds. GPU queues stalled
@@ -263,8 +278,14 @@ list ran out of descriptor memory. The prologue cutscene did not appear.
   [Lanes self-test](../examples/lanes/README.md#self-test). Stalls still occur at
   the intro. A wait that never completes is released after five seconds, and the
   log reports which lists write the label and where each queue stopped.
-- **Descriptor memory.** Shader-visible descriptor slots are not reclaimed and can
-  run out.
+- **Descriptor memory.** Since #172, shader-visible descriptor slots are reused
+  once the GPU has finished the work that referenced them, and the oldest are
+  evicted when the heap fills. The [Lanes self-test](../examples/lanes/README.md#self-test)
+  checks this, but no long game run has confirmed it yet. Compute dispatches
+  whose root has no descriptor tables and indexes the resource heap directly
+  are still skipped on paged layouts
+  ([#232](https://github.com/brcly/TuxBox/issues/232); draft fix in
+  [#235](https://github.com/brcly/TuxBox/pull/235)).
 - **Missing effects.** Many shaders are still unsupported, and large compute
   pipelines can receive empty stand-ins. Expect missing or wrong rendering.
   Image correctness hasn't been checked. [Shader coverage](SHADERS.md#projectscarlett-refusals)

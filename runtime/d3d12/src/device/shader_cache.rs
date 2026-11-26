@@ -3,6 +3,8 @@
 //! in the original guest shader. Portable input never opens the cache.
 use std::collections::HashSet;
 mod compile;
+mod narrow_waves;
+pub(super) use narrow_waves::narrow_wave_variant;
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -311,12 +313,23 @@ pub(super) fn compute_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     translate(&with_root(shader, root)?, Stage::Compute)
 }
 
-/// The original table layout has already been verified. An embedded root
-/// needs the ordinary prepared translation; a rootless program must use
-/// the actual pipeline root (never silently fall back to a rootless variant).
+/// Whether the translator refused this program on this root only for want of
+/// each heap slot's buffer stride (a heap-indexed IDXEN access). The root with
+/// the stride table appended can then express it (see `compute_table`).
+pub(super) fn refused_for_heap_strides(shader: &[u8], root: &[u8]) -> bool {
+    let variant = with_root(shader, root);
+    let Some(key) = source_digest(variant.as_deref().unwrap_or(shader)) else { return false };
+    compile::refusal_reason(&key).is_some_and(|reason| reason.contains("IDXEN needs the console descriptor stride"))
+}
+
+/// The original table layout has already been verified. A program whose
+/// embedded root is the pipeline root needs the ordinary prepared translation;
+/// any other program must use the actual pipeline root (never silently fall
+/// back to a rootless variant or to a different embedded root).
 pub(super) fn compute_for_original_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     let dxbc = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
-    if dxbc.chunk(b"RTS0").is_some() {
+    let embedded = dxbc.chunk(b"RTS0").and_then(|c| shader.get(c.offset..c.offset + c.size));
+    if embedded == Some(root) {
         prepared(shader)
     } else {
         compute_with_root(shader, root)
@@ -328,10 +341,18 @@ pub(super) fn raster_with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     with_root(shader, root)
 }
 
+/// The shader with `root` as its root signature, or `None` when it already has
+/// that root. A pipeline root overrides an embedded one, as for mesh stages:
+/// the console binds by table slot, and a title can pair a program with a root
+/// other than the one it was compiled with.
 fn with_root(shader: &[u8], root: &[u8]) -> Option<Vec<u8>> {
     use tuxbox_dxbc::Dxbc;
     let dxbc = Dxbc::parse(shader).ok()?;
-    if dxbc.chunk(b"RTS0").is_some() || root.is_empty() { return None; }
+    if root.is_empty() { return None; }
+    if let Some(embedded) = dxbc.chunk(b"RTS0") {
+        if shader.get(embedded.offset..embedded.offset + embedded.size)? == root { return None; }
+        return replace_mesh_root(shader, root, &dxbc, embedded);
+    }
     let count = dxbc.chunks.len();
     let end = 32 + count * 4;
     let root_offset = (shader.len() + 4).next_multiple_of(4);
@@ -509,5 +530,8 @@ fn translate(shader: &[u8], stage: Stage) -> Option<Vec<u8>> {
         .or_else(|| compile::on_demand(shader, &source, stage));
     stage.report(&source, translation.is_some());
     crate::failures::lookup(stage.short(), &source, translation.is_some());
+    if stage == Stage::Compute && let Some(code) = translation.as_deref() {
+        narrow_waves::remember(code, shader);
+    }
     translation
 }

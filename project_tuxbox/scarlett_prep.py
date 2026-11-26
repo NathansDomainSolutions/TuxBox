@@ -33,14 +33,14 @@ def prep_jobs(env, report=report_progress):
     """Compiler jobs for launch-time preparation.
 
     Preparation runs before the game starts, so it can use more of the CPU
-    than live compilation (TUXBOX_RUNTIME_SHADER_JOBS). Default to the
-    available cores, at most 8; TUXBOX_SHADER_PREP_JOBS chooses 1 to 32.
+    than live compilation (TUXBOX_RUNTIME_SHADER_JOBS). Default to one job
+    per available core, at most 32; TUXBOX_SHADER_PREP_JOBS chooses 1 to 32.
     """
     try:
         cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
         cpus = os.cpu_count() or 1
-    default = max(1, min(8, cpus))
+    default = max(1, min(PREP_JOBS_LIMIT, cpus))
     value = env.get("TUXBOX_SHADER_PREP_JOBS")
     if value is None:
         return default

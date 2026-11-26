@@ -19,6 +19,9 @@ pub(crate) struct ComputeTable {
     /// The root a mesh pipeline's pixel program is translated against when
     /// that program reads a table at other slots than the title declares.
     pub(crate) pixel_root: Option<RootSource>,
+    /// The appended root SRV that receives the resource heap's buffer stride
+    /// table (t1, space32766; see `descriptor_paging::strides`).
+    pub(crate) heap_strides: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -39,11 +42,138 @@ pub(super) enum TableLayout {
     Reflected(Arc<ComputeTable>),
 }
 
+/// The program with an embedded root signature hidden from the binding reader.
+/// FSSM records describe the table layout a program was compiled for,
+/// whatever root it embeds, and a pipeline root overrides that root when the
+/// stage is translated (see `shader_cache::with_root`). Renaming the part keeps
+/// every other offset valid.
+pub(super) fn layout_view(shader: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let tag = tuxbox_dxbc::Dxbc::parse(shader).ok()
+        .and_then(|dxbc| dxbc.chunk(b"RTS0").map(|root| root.offset))
+        .and_then(|offset| offset.checked_sub(8))
+        .filter(|&tag| shader.get(tag..tag + 4) == Some(b"RTS0"));
+    match tag {
+        Some(tag) => {
+            let mut copy = shader.to_vec();
+            copy[tag..tag + 4].copy_from_slice(b"RTSX");
+            copy.into()
+        }
+        None => shader.into(),
+    }
+}
+
+/// Private static samplers (space 32765) for a program whose literal sampler
+/// states are not all among the guest root's static samplers. The console builds
+/// a sampler from constant words, so a title can pair a program with a root that
+/// lacks its state. The translator binds any static sampler whose state equals
+/// the words (`inline_sampler::matches_static`), the guest's own first.
+fn missing_literal_samplers(shader: &[u8], stage: u32, existing: &[[u32; 13]]) -> Vec<[u32; 13]> {
+    let Some(private) = tuxbox_dxbc::inline_sampler::private(shader, stage) else { return Vec::new() };
+    let covered = |p: &[u32; 13]| existing.iter().any(|s| s[..10] == p[..10] && (s[12] == 0 || s[12] == p[12]));
+    if private.iter().all(covered) { Vec::new() } else { private }
+}
+
+/// Private static samplers for each literal state no static sampler of the root
+/// visible to the stage has (`inline_sampler::unmatched`). They take registers
+/// after every sampler register the root uses: the translator names a sampler by
+/// its register, so `missing_literal_samplers`' registers from 0 can overlap the
+/// root's own in another space. That also covers a root that indexes the heap
+/// (flag 0x800) and a program `inline_sampler::private` cannot vouch for.
+/// `missing_literal_samplers` remains for the rest.
+fn literal_samplers(shader: &[u8], stage: u32, signature: &tuxbox_dxbc::rootsig::RootSig) -> Vec<[u32; 13]> {
+    if let Some(unmatched) = tuxbox_dxbc::inline_sampler::unmatched(shader, stage, signature) {
+        return unmatched;
+    }
+    if signature.flags & 0x800 == 0 {
+        missing_literal_samplers(shader, stage, &signature.static_samplers)
+    } else {
+        Vec::new()
+    }
+}
+
+fn static_sampler(s: [u32; 13]) -> D3D12_STATIC_SAMPLER_DESC {
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER(s[0] as i32),
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE(s[2] as i32),
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE(s[3] as i32),
+        MipLODBias: f32::from_bits(s[4]), MaxAnisotropy: s[5],
+        ComparisonFunc: D3D12_COMPARISON_FUNC(s[6] as i32), BorderColor: D3D12_STATIC_BORDER_COLOR(s[7] as i32),
+        MinLOD: f32::from_bits(s[8]), MaxLOD: f32::from_bits(s[9]), ShaderRegister: s[10], RegisterSpace: s[11],
+        ShaderVisibility: D3D12_SHADER_VISIBILITY(s[12] as i32),
+    }
+}
+
+/// The guest root with the private literal samplers a compute program builds
+/// from constant words and the root leaves out. Its parameters are the guest's,
+/// so the title's arguments bind unchanged; only the static samplers grow.
+/// For roots a reflected table cannot describe (more than two tables).
+pub(super) fn sampler_root(
+    device: &ID3D12Device,
+    original: &RootSource,
+    shader: &[u8],
+    node: u32,
+) -> Result<Option<(ID3D12RootSignature, RootSource)>> {
+    let Ok(signature) = parse_rts0(original.payload()) else { return Ok(None) };
+    let recovered = literal_samplers(shader, 5, &signature);
+    if recovered.is_empty() {
+        return Ok(None);
+    }
+    let bytes = original.serialized();
+    unsafe {
+        let mut reader = None::<ID3D12VersionedRootSignatureDeserializer>;
+        D3D12CreateVersionedRootSignatureDeserializer(
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            &ID3D12VersionedRootSignatureDeserializer::IID,
+            (&raw mut reader).cast(),
+        )?;
+        let reader = reader.ok_or(E_POINTER)?;
+        let mut desc = *reader.GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1)?;
+        let source = desc.Anonymous.Desc_1_1;
+        let mut samplers = if source.NumStaticSamplers == 0 {
+            Vec::new()
+        } else {
+            if source.pStaticSamplers.is_null() { return Err(E_INVALIDARG.into()); }
+            std::slice::from_raw_parts(source.pStaticSamplers, source.NumStaticSamplers as usize).to_vec()
+        };
+        samplers.extend(recovered.into_iter().map(static_sampler));
+        desc.Anonymous.Desc_1_1.pStaticSamplers = samplers.as_ptr();
+        desc.Anonymous.Desc_1_1.NumStaticSamplers = samplers.len() as u32;
+        let mut blob = None;
+        D3D12SerializeVersionedRootSignature(&desc, &mut blob, None)?;
+        let blob = blob.ok_or(E_POINTER)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize());
+        Ok(Some((device.CreateRootSignature(node, bytes)?, RootSource::new(bytes))))
+    }
+}
+
 pub(super) fn reflected(
     device: &ID3D12Device,
     original: &RootSource,
     program: Program<'_>,
     node: u32,
+) -> Result<TableLayout> {
+    reflected_root(device, original, program, node, false)
+}
+
+/// The reflected root with the resource heap's buffer stride table appended,
+/// for a program the translator could only express with each slot's stride.
+pub(super) fn reflected_with_strides(
+    device: &ID3D12Device,
+    original: &RootSource,
+    program: Program<'_>,
+    node: u32,
+) -> Result<TableLayout> {
+    reflected_root(device, original, program, node, true)
+}
+
+fn reflected_root(
+    device: &ID3D12Device,
+    original: &RootSource,
+    program: Program<'_>,
+    node: u32,
+    strides: bool,
 ) -> Result<TableLayout> {
     let Ok(signature) = parse_rts0(original.payload()) else {
         return Ok(TableLayout::Unsupported);
@@ -51,6 +181,8 @@ pub(super) fn reflected(
     let mut scalar_index = None;
     let mut resolve_constants = None;
     let mut corroborated_raster = false;
+    // The user-data layout confirmed every compute binding against this root.
+    let mut verified_compute = false;
     let mut recovered_samplers = Vec::new();
     let bindings = match (&program, signature.params.as_slice()) {
         (Program::Compute(shader), params) => {
@@ -58,21 +190,34 @@ pub(super) fn reflected(
                 [tables @ .., last] if matches!(last.kind, RootParamKind::Constants { num32: 1..=4, .. }) => tables,
                 _ => params,
             };
-            if !(1..=2).contains(&tables.len()) || tables.iter().any(|p| !matches!(p.kind, RootParamKind::Table(_))) {
+            // Leading tables, then root descriptors and constants that pass
+            // through unchanged. Beyond one or two tables with trailing
+            // constants, every descriptor must be confirmed by the user data.
+            let leading = params.iter().take_while(|p| matches!(p.kind, RootParamKind::Table(_))).count();
+            let simple = (1..=2).contains(&tables.len()) && tables.iter().all(|p| matches!(p.kind, RootParamKind::Table(_)));
+            let extended = !simple && leading >= 1 && params[leading..].iter()
+                .all(|p| matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. }));
+            if !simple && !extended {
                 return Ok(TableLayout::Unsupported);
             }
             if signature.static_samplers.is_empty() && signature.flags & 0x800 == 0 {
                 recovered_samplers = tuxbox_dxbc::inline_sampler::private(shader, 5).unwrap_or_default();
-            }
-            if tables.len() == 2 {
-                tuxbox_dxbc::compute_table::compute_root_bindings(shader, &signature).map(
-                    |(bindings, constants)| {
-                        resolve_constants = constants;
-                        bindings
-                    },
-                )
             } else {
-                tuxbox_dxbc::compute_table::bindings(shader, 5)
+                recovered_samplers = literal_samplers(shader, 5, &signature);
+            }
+            let checked = tuxbox_dxbc::compute_table::compute_root_bindings(&layout_view(shader), &signature).map(
+                |(bindings, constants)| {
+                    resolve_constants = constants;
+                    verified_compute = true;
+                    bindings
+                },
+            );
+            if tables.len() == 2 || extended {
+                checked
+            } else {
+                // One table: bindings the user-data layout cannot confirm keep
+                // the program's own reflection, as before.
+                checked.or_else(|| tuxbox_dxbc::compute_table::bindings(&layout_view(shader), 5))
             }
         }
         // Several leading tables (each read from s8 + N), then any root descriptors and
@@ -84,7 +229,7 @@ pub(super) fn reflected(
                     matches!(p.kind, RootParamKind::Constants { .. } | RootParamKind::Descriptor { .. })
                 }) =>
         {
-            let get = |shader: &[u8], stage| tuxbox_dxbc::compute_table::root_bindings(shader, stage, &signature);
+            let get = |shader: &[u8], stage| tuxbox_dxbc::compute_table::root_bindings(&layout_view(shader), stage, &signature);
             // These roots took the guest root before. Anything the stages disagree
             // on keeps that.
             let Some(bindings) = get(vertex, 1).zip(get(pixel, 0))
@@ -95,7 +240,11 @@ pub(super) fn reflected(
             corroborated_raster = true;
             // A static sampler the title compiled into the pixel shader and left out
             // of this root. The translation reads the root built here, so it finds it.
-            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature).unwrap_or_default();
+            // Otherwise (a heap-indexing program, or a state the root names another
+            // way), each literal state the root lacks takes a private register.
+            recovered_samplers = tuxbox_dxbc::inline_sampler::omitted(pixel, &signature)
+                .or_else(|| tuxbox_dxbc::inline_sampler::unmatched(pixel, 0, &signature))
+                .unwrap_or_default();
             Some(bindings)
         }
         (Program::Raster { vertex, pixel }, [table, rest @ ..])
@@ -117,9 +266,9 @@ pub(super) fn reflected(
             let both_stages = |check_user_layout| {
                 let get = |shader: &[u8], stage| {
                     if check_user_layout {
-                        tuxbox_dxbc::compute_table::root_bindings(shader, stage, &signature)
+                        tuxbox_dxbc::compute_table::root_bindings(&layout_view(shader), stage, &signature)
                     } else {
-                        tuxbox_dxbc::compute_table::bindings(shader, stage)
+                        tuxbox_dxbc::compute_table::bindings(&layout_view(shader), stage)
                     }
                 };
                 Some((get(vertex, 1)?, get(pixel, 0)?))
@@ -134,6 +283,9 @@ pub(super) fn reflected(
                     .map(|s| vec![s])
                     .or_else(|| tuxbox_dxbc::inline_sampler::private(pixel, 0))
                     .unwrap_or_default();
+            }
+            else if !signature.static_samplers.is_empty() {
+                recovered_samplers = literal_samplers(pixel, 0, &signature);
             }
             for b in pixel_bindings {
                 if let Some(existing) = bindings.iter().find(|r| r.slot == b.slot) {
@@ -205,11 +357,11 @@ pub(super) fn reflected(
         rewrite[index] |= !covered;
     }
     let rewrite_constants = resolve_constants.filter(|c| {
-        !matches!(signature.params[2].kind, RootParamKind::Constants { register, space, .. }
-            if (register, space) == (c.register, c.space))
+        !matches!(signature.params.get(c.param as usize).map(|p| &p.kind),
+            Some(RootParamKind::Constants { register, space, .. }) if (*register, *space) == (c.register, c.space))
     });
     if !rewrite.contains(&true) && srv_registers.is_empty() && scalar_index.is_none()
-        && rewrite_constants.is_none() && recovered_samplers.is_empty() {
+        && rewrite_constants.is_none() && recovered_samplers.is_empty() && !strides {
         return Ok(TableLayout::Original);
     }
 
@@ -243,7 +395,7 @@ pub(super) fn reflected(
                 let flags = if let Some(first) = matched.next() {
                     if matched.any(|r| r.Flags != first.Flags) { return Ok(TableLayout::Unsupported); }
                     first.Flags
-                } else if corroborated_raster || resolve_constants.is_some() || !recovered_samplers.is_empty() {
+                } else if corroborated_raster || verified_compute || resolve_constants.is_some() || !recovered_samplers.is_empty() {
                     // This table ABI omits some native resource classes in the stream root.
                     D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
                 } else { return Ok(TableLayout::Unsupported); };
@@ -269,11 +421,14 @@ pub(super) fn reflected(
             parameter.Anonymous.Descriptor.RegisterSpace = space;
         }
         if let Some(constants) = rewrite_constants {
-            parameters[2].Anonymous.Constants = D3D12_ROOT_CONSTANTS {
-                ShaderRegister: constants.register,
-                RegisterSpace: constants.space,
-                Num32BitValues: 4,
+            // The user-data record matched this parameter's size; only its
+            // register and space move.
+            let Some(parameter) = parameters.get_mut(constants.param as usize)
+                .filter(|p| p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) else {
+                return Ok(TableLayout::Unsupported);
             };
+            parameter.Anonymous.Constants.ShaderRegister = constants.register;
+            parameter.Anonymous.Constants.RegisterSpace = constants.space;
         }
         let index_map = scalar_index.map(|(scalar_word, scalar_mask)| IndexMapBinding {
             slot: source.NumParameters, scalar_word, scalar_mask,
@@ -295,18 +450,26 @@ pub(super) fn reflected(
             });
             desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
         }
-        let samplers: Vec<_> = recovered_samplers.into_iter().map(|s| D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER(s[0] as i32),
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE(s[1] as i32),
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE(s[2] as i32),
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE(s[3] as i32),
-            MipLODBias: f32::from_bits(s[4]), MaxAnisotropy: s[5],
-            ComparisonFunc: D3D12_COMPARISON_FUNC(s[6] as i32), BorderColor: D3D12_STATIC_BORDER_COLOR(s[7] as i32),
-            MinLOD: f32::from_bits(s[8]), MaxLOD: f32::from_bits(s[9]), ShaderRegister: s[10], RegisterSpace: s[11],
-            ShaderVisibility: D3D12_SHADER_VISIBILITY(s[12] as i32),
-        }).collect();
-        // Recovered samplers join the root's own: `omitted` gives them registers the
-        // root does not use, and the other recoveries apply only to a root with none.
+        let heap_strides = strides.then_some(parameters.len() as u32);
+        if strides {
+            // Like the index map: a root SRV, never a guest-addressable descriptor.
+            parameters.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 1,
+                        RegisterSpace: 32766,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+            });
+            desc.Anonymous.Desc_1_1.NumParameters = parameters.len() as u32;
+        }
+        let samplers: Vec<_> = recovered_samplers.into_iter().map(static_sampler).collect();
+        // Recovered samplers join the root's own: `omitted` and `unmatched` give them
+        // registers the root does not use, `missing_literal_samplers` the private
+        // space, and the other recoveries apply only to a root with none.
         let samplers: Vec<_> = if samplers.is_empty() || source.NumStaticSamplers == 0 {
             samplers
         } else {
@@ -335,6 +498,7 @@ pub(super) fn reflected(
             index_map,
             mirrors: Vec::new(),
             pixel_root: None,
+            heap_strides,
         })))
     }
 }
@@ -437,6 +601,7 @@ fn append_corroborated_ranges(
             index_map: None,
             mirrors: Vec::new(),
             pixel_root: None,
+            heap_strides: None,
         })))
     }
 }

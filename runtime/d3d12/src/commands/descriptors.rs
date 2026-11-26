@@ -61,6 +61,24 @@ impl ResourceHeap {
         Ok(address)
     }
 
+    /// The GPU address of the arena's buffer stride table, kept alive with
+    /// this list's other resources like the index map.
+    pub(super) fn stride_table(
+        &self, arena: &device::descriptor_paging::Arena, resources: &device::MediaResources,
+    ) -> windows::core::Result<u64> {
+        let table = arena.stride_table()?;
+        let address = unsafe { table.GetGPUVirtualAddress() };
+        if address == 0 { return Err(E_INVALIDARG.into()); }
+        let mut held = resources.lock().unwrap_or_else(|e| e.into_inner());
+        for object in [&self.guest, &ID3D12Pageable::from(table)] {
+            if !held.contains(object) {
+                held.try_reserve(1).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
+                held.push(object.clone());
+            }
+        }
+        Ok(address)
+    }
+
     pub(super) fn table_stride(&self) -> usize { self.stride }
 
     pub(super) fn table(&self, base: u64, slots: &Range<u32>) -> Option<Range<usize>> {

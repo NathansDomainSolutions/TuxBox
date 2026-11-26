@@ -24,7 +24,14 @@ from project_tuxbox.dxil_store import COMPUTE_FLAGS
 from project_tuxbox.inspect import digest
 
 
-def instrument(hlsl, width=32, mode='all', variant='original'):
+def instrument(hlsl, width=32, mode='all', variant='original', group=None):
+    group = group or (width, 1, 1)
+    x, y, z = group
+    if x * y * z != width or min(group) < 1 or (width == 32 and group != (32, 1, 1)):
+        raise ValueError("unsupported fixture group")
+    index = "gtid.x" if y == z == 1 else "tb_fixture_lane"
+    index_decl = "" if index == "gtid.x" else (
+        f"    uint tb_fixture_lane = gtid.x + {x}u * gtid.y + {x*y}u * gtid.z;\n")
     if width == 64:
         if mode not in ("values", "state") or "[WaveSize(" in hlsl or "tb_reduction_read(" not in hlsl:
             raise ValueError("fixture must use portable wave64")
@@ -32,8 +39,8 @@ def instrument(hlsl, width=32, mode='all', variant='original'):
         if variant != "original":
             end, label = "0x00b4", "j29"
         outputs = ("first", "s7") if mode == "values" else (f"uint({label})", "exec_lo & 1u")
-        stores = (f"    output[64u + gtid.x] = {outputs[0]};\n"
-                  f"    output[128u + gtid.x] = {outputs[1]};\n")
+        stores = (f"    output[64u + {index}] = {outputs[0]};\n"
+                  f"    output[128u + {index}] = {outputs[1]};\n")
     else:
         if width != 32 or mode != "all" or "[WaveSize(32)]" not in hlsl:
             raise ValueError("fixture must require wave32")
@@ -49,7 +56,7 @@ def instrument(hlsl, width=32, mode='all', variant='original'):
         )
     replacements = {
         "    v0 = gtid.x; v1 = gtid.y; v2 = gtid.z;": (
-            "    uint input = output[gtid.x];\n"
+            index_decl + f"    uint input = output[{index}];\n"
             "    exec_lo = input >> 31;\n"
             "    v0 = input & 0x7fffffffu; v1 = gtid.y; v2 = gtid.z;"
         ),
@@ -112,18 +119,23 @@ def main():
     parser.add_argument("--adapter", required=True)
     parser.add_argument("--width", type=int, choices=(32, 64), default=32)
     parser.add_argument("--variant", choices=("original", "chain", "chain-zero"), default="original")
+    parser.add_argument("--group", nargs=3, type=int, metavar=("X", "Y", "Z"),
+                        help="64-thread workgroup shape for portable wave64")
     args = parser.parse_args()
+    group = tuple(args.group or (args.width, 1, 1))
+    if min(group) < 1 or group[0] * group[1] * group[2] != args.width or (args.width == 32 and group != (32, 1, 1)):
+        parser.error("group must contain exactly the requested width; native wave32 uses 32x1x1")
     work = args.work.resolve()
     work.mkdir(parents=True, exist_ok=True)
     dxc = Path(find_dxc(None)).resolve()
-    emitted = subprocess.check_output([args.emitter.resolve(), str(args.width), args.variant], text=True, timeout=30)
+    emitted = subprocess.check_output([args.emitter.resolve(), str(args.width), args.variant, *map(str, group)], text=True, timeout=30)
     with TemporaryDirectory(dir=work) as tmp:
         trial = Path(tmp)
         expected = {}
         shaders = {}
         for mode in (("all",) if args.width == 32 else ("values", "state")):
             source = trial / f"{mode}.hlsl"
-            source.write_text(instrument(emitted, args.width, mode, args.variant))
+            source.write_text(instrument(emitted, args.width, mode, args.variant, group))
             blob = trial / f"{mode}.cso"
             profile = "cs_6_6" if args.width == 32 else "cs_6_0"
             subprocess.run([dxc, "-T", profile, "-E", "main", *(COMPUTE_FLAGS if profile == "cs_6_6" else ()),
@@ -139,6 +151,7 @@ def main():
         exe, status, fields = run_gpu_guest(
             ROOT / "tools/reference/independent-shaders/compute.cpp", "wave-guard.exe",
             trial, work, args.proton.resolve(), args.prefix, args.provider, args.compiler_dir,
+            extra_env={"TUXBOX_NULL_PIPELINES": "0"},
         )
         rows = []
         for name, reference in expected.items():
@@ -149,7 +162,7 @@ def main():
         passed = status == 0 and fields.get("adapter") == args.adapter and all(row["matched"] for row in rows)
         report = dict(
             passed=passed, scope=f"Synthetic native wave{args.width} guarded reductions, instrumented inputs and outputs only",
-            guest_wave_width=args.width, variant=args.variant,
+            guest_wave_width=args.width, variant=args.variant, group=group,
             adapter=fields.get("adapter"), proton=(args.proton / "version").read_text().strip(),
             guest_exit=status, cases=len(rows), compared_words=len(rows)*384,
             result_words=len(rows)*128, input_and_guard_words=len(rows)*256,

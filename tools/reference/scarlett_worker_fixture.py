@@ -28,9 +28,9 @@ def container(code,width=64,resources=()):
  chunks=[b"DXIL"+pack([len(body)])+body,b"PSV0"+pack([len(psv)])+psv]
  return b"DXBC"+bytes(16)+pack([1,40+sum(map(len,chunks)),2,40,40+len(chunks[0])])+b"".join(chunks)
 
-def uav_shader(code):
+def uav_shader(code, width=64):
     """Package synthetic ISA and optional trailing table data with a root table for u0."""
-    shader = container(code, resources=[(7, 0, 0, 0)])
+    shader = container(code, width=width, resources=[(7, 0, 0, 0)])
     # Extend the fixture's two-chunk directory with a root table for UAV u0.
     root = b"RTS0" + pack([64, 1, 1, 24, 0, 0, 0, 0, 0, 36, 1, 44, 1, 1, 0, 0, 0])
     first, second = struct.unpack_from("<II", shader, 32)

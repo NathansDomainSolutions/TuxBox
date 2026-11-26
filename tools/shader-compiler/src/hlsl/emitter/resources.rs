@@ -233,9 +233,9 @@ impl<'a> Emitter<'a> {
             return None;
         }
         let mut rows = tuxbox_dxbc::compute_table::records(&self.ex.fssm)?
-            .filter(|&[c, _, r, _, loc]| c == class && r == native && self.table_locations().iter().any(|&(_, l)| l == loc));
+            .filter(|&[c, _, r, _, loc]| c == class && r == native && self.table_sgpr(loc).is_some());
         let [_, offset, _, stride, location] = rows.next()?;
-        let &(sgpr, _) = self.table_locations().iter().find(|&&(_, l)| l == location)?;
+        let sgpr = self.table_sgpr(location)?;
         if rows.next().is_some() || offset % 8 != 0 || !(4..=2048).contains(&stride) || stride % 4 != 0 {
             return None;
         }
@@ -243,13 +243,20 @@ impl<'a> Emitter<'a> {
         (binding == (Some(u32::from(uav)), slot, space)).then_some(stride / 4)
     }
 
-    /// User SGPR and used-resource location of each descriptor table.
-    pub(in crate::hlsl) fn table_locations(&self) -> &'static [(u8, u32)] {
-        match self.ex.stage {
-            Stage::Compute => &[(4, 0x404), (5, 0x10504)],
-            Stage::Vertex | Stage::Pixel => &[(8, 0x804)],
-            _ => &[],
-        }
+    /// User SGPR of the descriptor table a used-resource location names. A location holds
+    /// the root parameter, its first user SGPR and the descriptor's length in dwords, four
+    /// for a buffer. The table can be any parameter: RAGE binds its per-draw buffers
+    /// through the second one. The register has to select that same parameter.
+    pub(in crate::hlsl) fn table_sgpr(&self, location: u32) -> Option<u8> {
+        let (parameter, sgpr) = (location >> 16, (location >> 8) & 0xff);
+        let selected = match self.ex.stage {
+            Stage::Compute => sgpr.checked_sub(4),
+            Stage::Pixel => sgpr.checked_sub(8),
+            // A vertex shader's own records name the parameter behind a register.
+            Stage::Vertex => sampler_heap::vertex_table_parameter(self.ex, sgpr as u8).map(|p| p as u32),
+            _ => None,
+        };
+        (location & 0xff == 4 && selected == Some(parameter)).then_some(sgpr as u8)
     }
 
     /// The register and space the shader's own metadata gives a resource bound at `slot`.
@@ -261,7 +268,7 @@ impl<'a> Emitter<'a> {
         if self.mesh_bindings.is_some() || self.ex.root_sig.is_none() { return (slot, space); }
         let Some(rows) = tuxbox_dxbc::compute_table::records(&self.ex.fssm) else { return (slot, space) };
         let mut found = rows.filter(|&[c, _, _, _, _]| c == class).filter_map(|[_, offset, register, _, location]| {
-            let &(sgpr, _) = self.table_locations().iter().find(|&&(_, l)| l == location)?;
+            let sgpr = self.table_sgpr(location)?;
             let bound = self.table_binding_space(sgpr, offset.checked_mul(4)?, 32).ok()?;
             (bound == (Some(u32::from(uav)), slot, space)).then_some(register)
         });

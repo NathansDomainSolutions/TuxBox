@@ -9,6 +9,13 @@ fn main() {
     let width: u32 = std::env::args().nth(1).expect("wave width").parse().expect("integer");
     assert!(matches!(width, 32 | 64));
     let (mut shader, mut words, cmp) = fixture::shader(width);
+    let group: Vec<u32> = std::env::args().skip(3).map(|s| s.parse().expect("group dimension")).collect();
+    if !group.is_empty() {
+        let group: [u32; 3] = group.try_into().expect("three group dimensions");
+        assert_eq!(group.into_iter().try_fold(1u32, u32::checked_mul), Some(width));
+        assert!(width == 64 || group == [32, 1, 1]);
+        shader.psv_threads = Some(group);
+    }
     match std::env::args().nth(2).as_deref() {
         Some("literal") => { words.insert(cmp, 0xbe87_0381); } // s_mov_b32 s7, 1
         Some("chain") => {

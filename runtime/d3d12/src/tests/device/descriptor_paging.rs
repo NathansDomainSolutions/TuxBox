@@ -11,6 +11,7 @@ fn test_arena(count: u32, limit: u32) -> Arc<Arena> {
         inline: false,
         authored: Mutex::default(),
         tables: Mutex::new(Tables::default()),
+        strides: Mutex::default(),
     })
 }
 
@@ -271,6 +272,7 @@ fn inline_stride_mismatch_eviction_cleans_only_evicted_resident_records() {
         inline: true,
         authored: Mutex::default(),
         tables: Mutex::new(Tables::default()),
+        strides: Mutex::default(),
     });
     let mut leases = DescriptorLeases::default();
     arena.gpu_table(addr_of(&arena, 0), 3, &[], &mut leases).unwrap();
@@ -360,6 +362,7 @@ fn inline_arena_uses_32_byte_guest_stride_on_64_byte_native_heap() {
             inline: true,
             authored: Mutex::default(),
             tables: Mutex::new(Tables::default()),
+            strides: Mutex::default(),
         });
         {
             let mut entries = registry.arenas.lock().unwrap();
